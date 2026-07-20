@@ -1,0 +1,23 @@
+# Build output
+bin/
+obj/
+generated/
+[Bb]enchmark[Dd]ot[Nn]et.Artifacts/
+nupkgs/
+artifacts/
+
+# Test / coverage
+TestResults/
+CoverageReport/
+
+# IDE / editor
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.DotSettings.user
+
+# OS
+.DS_Store
+Thumbs.db
