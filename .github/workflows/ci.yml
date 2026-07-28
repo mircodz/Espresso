@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  version-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if version is already tagged
+        run: |
+          VERSION="$(tr -d '[:space:]' < version)"
+          git fetch --tags --force
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error file=version::Version $VERSION is already tagged. Bump the version file before merging." >&2
+            exit 1
+          fi
+          echo "Version $VERSION has no existing tag."
+
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: |
+          8.0.x
+          10.0.x
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --no-restore --configuration Release
+
+    - name: Test with coverage
+      run: |
+        dotnet test tests/Espresso.Tests/Espresso.Tests.csproj \
+          --no-build --configuration Release \
+          /p:CollectCoverage=true \
+          /p:CoverletOutputFormat=cobertura \
+          /p:CoverletOutput=./TestResults/
+
+    - name: Generate coverage report
+      uses: danielpalme/ReportGenerator-GitHub-Action@5.3.11
+      with:
+        reports: '**/TestResults/coverage.cobertura.xml'
+        targetdir: 'CoverageReport'
+        reporttypes: 'HtmlInline;Cobertura;MarkdownSummaryGithub;TextSummary'
+        tag: '${{ github.run_number }}_${{ github.run_id }}'
+
+    - name: Read coverage summary
+      id: coverage
+      if: always()
+      run: |
+        if [ -f CoverageReport/Summary.txt ]; then
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          cat CoverageReport/Summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          LINE_COVERAGE=$(grep "Line coverage:" CoverageReport/Summary.txt | grep -oP '\d+\.?\d*(?=%)')
+          echo "line_coverage=$LINE_COVERAGE" >> $GITHUB_OUTPUT
+
+          BRANCH_COVERAGE=$(grep "Branch coverage:" CoverageReport/Summary.txt | grep -oP '\d+\.?\d*(?=%)')
+          echo "branch_coverage=$BRANCH_COVERAGE" >> $GITHUB_OUTPUT
+        else
+          echo "summary=Coverage report not found" >> $GITHUB_OUTPUT
+          echo "line_coverage=0" >> $GITHUB_OUTPUT
+          echo "branch_coverage=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Add coverage summary to GitHub step summary
+      if: always()
+      run: |
+        echo "## Code Coverage Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f CoverageReport/SummaryGithub.md ]; then
+          cat CoverageReport/SummaryGithub.md >> $GITHUB_STEP_SUMMARY
+        else
+          echo "Coverage report not generated" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Post coverage comment on PR
+      if: github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: coverage
+        message: |
+          ## Code Coverage Report
+
+          **Line Coverage:** ${{ steps.coverage.outputs.line_coverage }}%
+          **Branch Coverage:** ${{ steps.coverage.outputs.branch_coverage }}%
+
+          <details>
+          <summary>View detailed coverage</summary>
+
+          ```
+          ${{ steps.coverage.outputs.summary }}
+          ```
+
+          </details>
+
+          ---
+          *Coverage report generated for commit ${{ github.sha }}*
+
+    - name: Upload coverage report artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: CoverageReport/
+        retention-days: 30
