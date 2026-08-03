@@ -295,4 +295,48 @@ public sealed class RefreshAfterWriteTest
         cache.GetIfPresent(1);
         Assert.Equal(1, loader.Calls);
     }
+
+    // A deferred executor holds the reload task without running it, so the refresh registration stays
+    // pending. Invalidating the key must discard that registration; otherwise a later access for a
+    // reinserted key is permanently debounced and never refreshes.
+    private sealed class DeferredExecutor : IExecutor
+    {
+        public Action? Pending;
+        public void Execute(Action command) => Pending = command;
+    }
+
+    [Fact]
+    public void Invalidate_DiscardsPendingRefreshRegistration()
+    {
+        var ticker = new FakeTicker();
+        int version = 1;
+        var loader = new CountingLoader(k => $"{k}-v{version}");
+        var executor = new DeferredExecutor();
+        var cache = Espresso.NewBuilder<int, string>()
+            .RefreshAfterWrite(OneMinute)
+            .Ticker(ticker)
+            .Executor(executor)
+            .Build(loader);
+
+        Assert.Equal("1-v1", cache.Get(1));
+
+        // Past the window: this access schedules a reload, but the deferred executor parks it, so the
+        // refresh registration for key 1 remains outstanding.
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        cache.GetIfPresent(1);
+        Assert.NotNull(executor.Pending);
+
+        // Remove the entry while its refresh is pending. If the stale registration is not discarded,
+        // it suppresses refreshes for the key forever.
+        cache.Invalidate(1);
+        executor.Pending = null;
+
+        // Reinsert and cross the window again: a fresh refresh must be scheduled.
+        version = 2;
+        cache.Put(1, "1-manual");
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        cache.GetIfPresent(1);
+
+        Assert.NotNull(executor.Pending); // a new reload was scheduled -> registration was discarded
+    }
 }

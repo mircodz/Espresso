@@ -1564,6 +1564,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             _timerWheel!.Deschedule(node);
         }
 
+        // Capture the key reference while the node is still alive; MakeDead swaps it for a sentinel.
+        object keyRef = node.KeyReference;
         lock (node)
         {
             MakeDead(node);
@@ -1571,7 +1573,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (removed)
         {
-            DiscardRefresh(node.KeyReference); // cancel any in-flight reload for the evicted key
+            DiscardRefresh(keyRef); // cancel any in-flight reload for the evicted key
             _statsCounter.RecordEviction(node.Weight, actualCause);
             NotifyRemoval(key, value, actualCause);
         }
@@ -2106,7 +2108,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (removed != null)
         {
-            DiscardRefresh(removed.KeyReference); // cancel any in-flight reload for the removed key
+            DiscardRefresh(key); // cancel any in-flight reload for the removed key
             AfterWrite(new RemovalTask(this, removed));
             if (value != null)
             {
@@ -2145,7 +2147,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (removed != null)
         {
-            DiscardRefresh(removed.KeyReference);
+            DiscardRefresh(key);
             AfterWrite(new RemovalTask(this, removed));
             NotifyRemoval(key, value, RemovalCause.Explicit);
             return true;
