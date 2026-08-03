@@ -92,4 +92,35 @@ public class MapBenchmarks
 
     [Benchmark, BenchmarkCategory("ComputeIfAbsent")]
     public void ComputeIfAbsent_Espresso() => Run(k => _chm.ComputeIfAbsent(k, static key => "v" + key));
+
+    // ---------------- Insert churn (isolates the striped size counter) ----------------
+    // Insert-then-remove of fresh keys keeps AddCount(+1)/AddCount(-1) hot on every op, unlike the
+    // Put benchmarks above which overwrite existing keys and never touch the counter.
+
+    [Benchmark, BenchmarkCategory("InsertChurn")]
+    public void InsertChurn_ConcurrentDictionary() => RunPerThread((t, k) =>
+    {
+        _cd[k] = _values[k % KeySpace];
+        _cd.TryRemove(k, out _);
+    });
+
+    [Benchmark, BenchmarkCategory("InsertChurn")]
+    public void InsertChurn_Espresso() => RunPerThread((t, k) =>
+    {
+        _chm.Put(k, _values[k % KeySpace]);
+        _chm.Remove(k);
+    });
+
+    // Disjoint per-thread key ranges so ops always insert a fresh key (no cross-thread key sharing).
+    private void RunPerThread(Action<int, int> body)
+    {
+        Parallel.For(0, Threads, t =>
+        {
+            int baseKey = KeySpace + t * OpsPerThread;
+            for (int i = 0; i < OpsPerThread; i++)
+            {
+                body(t, baseKey + i);
+            }
+        });
+    }
 }

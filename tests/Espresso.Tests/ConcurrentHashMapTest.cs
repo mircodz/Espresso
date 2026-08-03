@@ -306,6 +306,283 @@ public sealed class ConcurrentHashMapTest
         });
         Assert.Equal(threads * perThread, map.Count);
     }
+
+    // High-churn put/remove from a tiny table stresses the striped size counter under contention:
+    // the exact live count must survive probe collisions, rehashing, and resizes.
+    [Fact]
+    public void ConcurrentChurn_CountMatchesLiveEntries()
+    {
+        var map = new ConcurrentHashMap<int, string>(2);
+        const int threads = 16;
+        const int perThread = 40_000;
+
+        // Each thread owns a disjoint key range and ends with exactly the even keys still present.
+        Parallel.For(0, threads, t =>
+        {
+            int baseKey = t * perThread;
+            for (int i = 0; i < perThread; i++)
+            {
+                map.Put(baseKey + i, "v");
+            }
+            for (int i = 0; i < perThread; i += 2)
+            {
+                map.Remove(baseKey + i + 1);
+            }
+        });
+
+        long expected = (long)threads * (perThread / 2);
+        Assert.Equal(expected, map.Count);
+        Assert.Equal(expected, map.AsEnumerable().LongCount());
+    }
+
+    // Forces every key into a single bin so collision-chain handling is exercised.
+    private sealed class CollidingComparer : IEqualityComparer<int>
+    {
+        public bool Equals(int a, int b) => a == b;
+        public int GetHashCode(int _) => 0;
+    }
+
+    // Buckets keys into a few hash slots so bins grow long enough to treeify (and shrink to untreeify),
+    // while still spanning multiple bins so a resize must split tree bins into lo/hi.
+    private sealed class FewBucketComparer : IEqualityComparer<int>
+    {
+        public bool Equals(int a, int b) => a == b;
+        public int GetHashCode(int k) => k & 3; // 4 hash buckets
+    }
+
+    // Treeification gate: adversarial hashing drives bins well past the treeify threshold, under
+    // concurrent put/get/remove and repeated resizes (so tree bins must split). Every key inserted and
+    // not removed must be findable, the count exact, and enumeration duplicate-free. This test passes
+    // trivially on a list-only map and becomes a real red-black-tree stress once TreeBin lands.
+    [Fact]
+    public void Treeification_DeepBins_ConcurrentMutationAndResize()
+    {
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            var map = new ConcurrentHashMap<int, string>(4, 1, new FewBucketComparer());
+            const int threads = 8;
+            const int perThread = 3_000;
+            string? failure = null;
+
+            Parallel.For(0, threads, t =>
+            {
+                int baseKey = t * perThread;
+                for (int i = 0; i < perThread; i++)
+                {
+                    int key = baseKey + i;
+                    map.Put(key, "v");
+                    if (map.GetOrDefault(key) is null)
+                    {
+                        Interlocked.CompareExchange(ref failure, $"attempt {attempt}: key {key} missing after put", null);
+                    }
+                    if ((i & 1) == 0)
+                    {
+                        map.Remove(key); // even keys removed -> bins grow then shrink (treeify/untreeify)
+                    }
+                }
+            });
+
+            Assert.Null(failure);
+            long expected = (long)threads * (perThread / 2); // odd keys survive
+            Assert.Equal(expected, map.Count);
+            Assert.Equal(expected, map.AsEnumerable().LongCount());
+            // Every surviving (odd) key must be present with its value.
+            for (int t = 0; t < threads; t++)
+            {
+                Assert.Equal("v", map.GetOrDefault(t * perThread + 1));
+            }
+        }
+    }
+
+    // Put-then-remove from a tiny table forces many resizes concurrent with removals. Repeated many
+    // times because a lost-entry resize race is probabilistic per trial. A previous cooperative-resize
+    // attempt failed here (~1 trial in 8): Remove returned null for a key the same thread had inserted,
+    // and Count inflated. This is the permanent gate any resize rewrite must pass.
+    [Fact]
+    public void ConcurrentRemoveDuringResize_CountExact()
+    {
+        const int threads = 8;
+        const int perThread = 8_000;
+        for (int attempt = 0; attempt < 40; attempt++)
+        {
+            var map = new ConcurrentHashMap<int, string>(2);
+            string? failure = null;
+
+            Parallel.For(0, threads, t =>
+            {
+                int baseKey = t * perThread;
+                for (int i = 0; i < perThread; i++)
+                {
+                    map.Put(baseKey + i, "v");
+                }
+                for (int i = 1; i < perThread; i += 2)
+                {
+                    if (map.Remove(baseKey + i) is null)
+                    {
+                        Interlocked.CompareExchange(ref failure, $"attempt {attempt}: Remove({baseKey + i}) returned null", null);
+                    }
+                }
+            });
+
+            Assert.Null(failure);
+            long expected = (long)threads * ((perThread + 1) / 2);
+            Assert.Equal(expected, map.Count);
+            Assert.Equal(expected, map.AsEnumerable().LongCount());
+            for (int t = 0; t < threads; t++)
+            {
+                Assert.Equal("v", map.GetOrDefault(t * perThread));       // even -> present
+                Assert.Null(map.GetOrDefault(t * perThread + 1));         // odd  -> removed
+            }
+        }
+    }
+
+    // All keys collide into one bin; concurrent put/remove/compute walk and splice the same chain.
+    [Fact]
+    public void DeepCollisionChain_ConcurrentMutation()
+    {
+        var map = new ConcurrentHashMap<int, string>(16, 1, new CollidingComparer());
+        const int threads = 8;
+        const int perThread = 4_000;
+
+        Parallel.For(0, threads, t =>
+        {
+            int baseKey = t * perThread;
+            for (int i = 0; i < perThread; i++)
+            {
+                int key = baseKey + i;
+                map.Put(key, "v");
+                map.ComputeIfAbsent(key, _ => "w");
+                if ((i & 1) == 0)
+                {
+                    map.Remove(key);
+                }
+            }
+        });
+
+        long expected = (long)threads * (perThread / 2);
+        Assert.Equal(expected, map.Count);
+        Assert.Equal(expected, map.AsEnumerable().LongCount());
+    }
+
+    // Colliding keys route every ComputeIfAbsent through the same bin, exercising the locked
+    // null-placeholder handshake (which the distinct-key atomicity test never hits).
+    [Fact]
+    public void ComputeIfAbsent_SingleInvocation_UnderCollision()
+    {
+        var map = new ConcurrentHashMap<int, string>(16, 1, new CollidingComparer());
+        int factoryCalls = 0;
+        const int threads = 16;
+        const int keys = 500;
+        using var start = new Barrier(threads);
+
+        Parallel.For(0, threads, _ =>
+        {
+            start.SignalAndWait();
+            for (int k = 0; k < keys; k++)
+            {
+                map.ComputeIfAbsent(k, key =>
+                {
+                    Interlocked.Increment(ref factoryCalls);
+                    return "v" + key;
+                });
+            }
+        });
+
+        Assert.Equal(keys, factoryCalls);
+        Assert.Equal(keys, map.Count);
+    }
+
+    // Many threads race Replace(key, old, new) on one key; exactly one wins each generation, so the
+    // final value is well-defined and no update is lost.
+    [Fact]
+    public void ConditionalReplace_ExactlyOneWinnerPerGeneration()
+    {
+        var map = new ConcurrentHashMap<int, string>(16);
+        map.Put(0, "gen0");
+        const int gens = 2_000;
+
+        for (int g = 0; g < gens; g++)
+        {
+            string from = "gen" + g;
+            string to = "gen" + (g + 1);
+            int winners = 0;
+            Parallel.For(0, 8, _ =>
+            {
+                if (map.Replace(0, from, to))
+                {
+                    Interlocked.Increment(ref winners);
+                }
+            });
+            Assert.Equal(1, winners);
+            Assert.Equal(to, map.GetOrDefault(0));
+        }
+    }
+
+    // Remove(key, value) and Replace(key, old, new) compare by equality, not reference identity.
+    [Fact]
+    public void ConditionalOps_UseValueEquality_NotIdentity()
+    {
+        var map = new ConcurrentHashMap<int, string>(16);
+        map.Put(1, new string("abc".ToCharArray())); // distinct instance, equal value
+
+        Assert.True(map.Replace(1, "abc", "xyz"));    // matched by equality
+        Assert.Equal("xyz", map.GetOrDefault(1));
+        Assert.True(map.Remove(1, new string("xyz".ToCharArray())));
+        Assert.Null(map.GetOrDefault(1));
+    }
+
+    // Clear() interleaved with concurrent writers and resizes must leave a consistent, non-negative
+    // count that agrees with enumeration.
+    [Fact]
+    public void Clear_ConcurrentWithPutsAndResize()
+    {
+        var map = new ConcurrentHashMap<int, string>(2);
+        const int writers = 8;
+        const int perThread = 20_000;
+        using var start = new Barrier(writers + 1);
+
+        var writerTasks = Enumerable.Range(0, writers).Select(t => Task.Run(() =>
+        {
+            start.SignalAndWait();
+            int baseKey = t * perThread;
+            for (int i = 0; i < perThread; i++)
+            {
+                map.Put(baseKey + i, "v");
+            }
+        })).ToArray();
+
+        var clearer = Task.Run(() =>
+        {
+            start.SignalAndWait();
+            for (int i = 0; i < 50; i++)
+            {
+                map.Clear();
+            }
+        });
+
+        Task.WaitAll(writerTasks.Append(clearer).ToArray());
+
+        // Whatever remains, the counter must be non-negative and match a fresh enumeration.
+        long count = map.Count;
+        Assert.True(count >= 0);
+        Assert.Equal(map.AsEnumerable().LongCount(), count);
+    }
+
+    // .NET monitors are reentrant, so a mapping function that recurses into ComputeIfAbsent for the
+    // same key does not deadlock. Document the resulting behavior so a future change can't regress it
+    // silently: the inner call observes the bin mid-computation.
+    [Fact]
+    public void ComputeIfAbsent_ReentrantSameKey_DoesNotDeadlock()
+    {
+        var map = new ConcurrentHashMap<int, string>(16);
+        string? result = map.ComputeIfAbsent(1, k =>
+        {
+            map.ComputeIfAbsent(1, _ => "inner");
+            return "outer";
+        });
+        Assert.NotNull(result);
+        Assert.NotNull(map.GetOrDefault(1));
+    }
 }
 
 internal static class ChmEnumerableExtensions

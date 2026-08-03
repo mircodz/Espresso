@@ -57,24 +57,62 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     }
 
     private readonly IEqualityComparer<TKey>? _comparer; // null => use the devirtualizable default
-    private readonly object _resizeLock = new();
 
     private volatile Node?[] _table;
-    private int _threshold;
 
-    // LongAdder-style striped size counter. Cells are strided by CounterCellStride longs so each
-    // active counter owns a 128-byte cache sector (avoids false sharing between adjacent counters).
+    // Faithful port of JDK ConcurrentHashMap's cooperative resize protocol.
+    //
+    // _sizeCtl encodes both the grow threshold and the resize state:
+    //   * positive => the element-count threshold at which the table grows (0.75 * capacity);
+    //   * negative => a resize is in progress. The high 16 bits are the resize stamp for the
+    //     current oldCap (identifies the generation); the low bits count active resizers + 1.
+    //     The initiator installs (rs << RESIZE_STAMP_SHIFT) + 2; each helper adds 1; each worker
+    //     that runs out of bins to claim subtracts 1; the worker that decrements it back to the
+    //     "+2" base is the last one and performs the final sweep + publish.
+    private int _sizeCtl;
+
+    // The staging table being built during a resize (null except mid-resize). Published as _table
+    // by the last finisher, then cleared.
+    private volatile Node?[]? _nextTable;
+
+    // Next bin index a worker may claim, counting DOWN from oldCap toward 0. Workers claim a stride
+    // via CAS; <= 0 means all bins have been handed out.
+    private int _transferIndex;
+
+    private const int MinTransferStride = 16;
+    private const int ResizeStampBits = 16;
+    private const int ResizeStampShift = 32 - ResizeStampBits;
+    private const int MaxResizers = (1 << (32 - ResizeStampBits)) - 1;
+    private static readonly int NCpu = Environment.ProcessorCount;
+
+    /// <summary>
+    /// The stamp identifying a resize of a table of size <paramref name="n"/>. The top bit is set so
+    /// that <c>stamp &lt;&lt; RESIZE_STAMP_SHIFT</c> is negative (marks _sizeCtl as "resizing").
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ResizeStamp(int n)
+        => System.Numerics.BitOperations.LeadingZeroCount((uint)n) | (1 << (ResizeStampBits - 1));
+
+    // Striped size counter: threads add into per-thread cells to avoid a single hot counter. Cells are
+    // strided by CounterCellStride longs so each active counter owns a 128-byte cache sector.
     private const int CounterCellStride = 16;
     private long _baseCount;
-    private long[]? _counterCells;
+    private volatile long[]? _counterCells;
     private int _cellsBusy;
 
-    /// <summary>Returns this thread's slot (a strided index) into the counter-cell array.</summary>
-    private static int CounterSlot(long[] cells)
+    // Per-thread hash into the counter cells. Seeded lazily; advanced (xorshift) on CAS contention so
+    // colliding threads migrate to different cells.
+    [ThreadStatic] private static int _cellProbe;
+
+    private static int AdvanceProbe(int probe)
     {
-        int logicalCells = cells.Length / CounterCellStride;
-        return (Environment.CurrentManagedThreadId & (logicalCells - 1)) * CounterCellStride;
+        probe ^= probe << 13;
+        probe ^= probe >>> 17;
+        probe ^= probe << 5;
+        return probe;
     }
+
+    private static int LogicalCell(long[] cells, int probe) => (probe & (cells.Length / CounterCellStride - 1)) * CounterCellStride;
 
     /// <summary>
     /// Creates the map. <paramref name="initialCapacity"/> presizes the bin array (fewer resizes).
@@ -94,7 +132,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         _comparer = ReferenceEquals(comparer, EqualityComparer<TKey>.Default) ? null : comparer;
         int cap = TableSizeFor(Math.Max(initialCapacity, concurrencyLevel));
         _table = new Node?[cap];
-        _threshold = cap - (cap >>> 2); // 0.75 load factor
+        _sizeCtl = cap - (cap >>> 2); // 0.75 load factor threshold
     }
 
     /// <summary>Hashes a key without boxing; uses the intrinsifiable default path when possible.</summary>
@@ -124,19 +162,41 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private static Node? TabAt(Node?[] tab, int i) => Volatile.Read(ref tab[i]);
 
     /// <summary>
-    /// Called by a writer that encountered a <see cref="ForwardingNode"/>. A writer must not mutate
-    /// the resize's half-built next table (that would race the resizer's unsynchronized bin
-    /// construction and lose the write); instead it waits for the resize to finish — the resizer
-    /// holds <see cref="_resizeLock"/> for the whole operation and publishes <c>_table</c> last — and
-    /// then returns the now-published table to retry against. Readers, by contrast, may safely follow
-    /// the forward pointer because a bin is fully migrated before it is marked as forwarded.
+    /// Called by a writer that encountered a <see cref="ForwardingNode"/> <paramref name="f"/>. The
+    /// writer joins the in-progress transfer (helping migrate bins) and returns <c>f.NextTable</c> for
+    /// the caller to retry against — the writer's target bin is fully migrated before the forward is
+    /// installed, so it can make progress on the new table without waiting for the whole resize.
+    /// Mirrors JDK's <c>helpTransfer</c>: it registers as a resizer in <see cref="_sizeCtl"/> and runs
+    /// <see cref="Transfer"/>. Callers re-read the volatile <see cref="_table"/> at the top of their
+    /// loop, so a stale table is never used across a help.
     /// </summary>
-    private Node?[] AwaitResize()
+    private Node?[] HelpTransfer(Node?[] tab, ForwardingNode f)
     {
-        lock (_resizeLock)
+        Node?[] nextTab = f.NextTable;
+        int rs = ResizeStamp(tab.Length);
+        while (nextTab == _nextTable && _table == tab)
         {
-            return _table; // resize complete; _table now points at the finished new table
+            int sc = Volatile.Read(ref _sizeCtl);
+            if (sc >= 0)
+            {
+                break; // resize finished
+            }
+            // Stop helping if the stamp no longer matches this generation, the resizer count is
+            // saturated/drained, or all bins have been claimed.
+            if ((sc >>> ResizeStampShift) != rs
+                || sc == (rs << ResizeStampShift) + 1
+                || sc == (rs << ResizeStampShift) + MaxResizers
+                || Volatile.Read(ref _transferIndex) <= 0)
+            {
+                break;
+            }
+            if (Interlocked.CompareExchange(ref _sizeCtl, sc + 1, sc) == sc)
+            {
+                Transfer(tab, nextTab);
+                break;
+            }
         }
+        return nextTab;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -215,6 +275,9 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
     private TValue? PutVal(TKey key, TValue value, bool onlyIfAbsent)
     {
+        // A null value would increment Count for an entry that GetOrDefault treats as absent,
+        // permanently desyncing the size counter.
+        ArgumentNullException.ThrowIfNull(value);
         int h = HashOf(key);
         Node?[] tab = _table;
         while (true)
@@ -226,14 +289,14 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             {
                 if (CasTabAt(tab, i, null, new Node(h, key, value, null)))
                 {
-                    AddCount(1);
+                    AddCount(1, 0);
                     return null;
                 }
                 continue; // lost the empty-bin race, retry
             }
             if (f is ForwardingNode fwd)
             {
-                tab = AwaitResize();
+                tab = HelpTransfer(tab, fwd);
                 continue;
             }
 
@@ -271,7 +334,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             if (inserted)
             {
-                AddCount(1);
+                AddCount(1, 2);
             }
             return oldVal;
         }
@@ -301,7 +364,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
             if (f is ForwardingNode fwd)
             {
-                tab = AwaitResize();
+                tab = HelpTransfer(tab, fwd);
                 continue;
             }
 
@@ -353,7 +416,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             if (removed)
             {
-                AddCount(-1);
+                AddCount(-1, -1);
             }
             return oldVal;
         }
@@ -384,7 +447,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         val = mappingFunction(key);
                         if (val != null)
                         {
-                            node.Value = val;
+                            Volatile.Write(ref node.Value, val);
                             added = true;
                         }
                     }
@@ -398,13 +461,13 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 }
                 if (val != null)
                 {
-                    AddCount(1);
+                    AddCount(1, 2);
                 }
                 return val;
             }
             if (f is ForwardingNode fwd)
             {
-                tab = AwaitResize();
+                tab = HelpTransfer(tab, fwd);
                 continue;
             }
 
@@ -464,7 +527,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
             if (inserted)
             {
-                AddCount(1);
+                AddCount(1, 2);
             }
             return result;
         }
@@ -505,7 +568,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         computed = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
                         if (computed != null)
                         {
-                            node.Value = computed;
+                            Volatile.Write(ref node.Value, computed);
                             added = true;
                         }
                     }
@@ -519,13 +582,13 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 }
                 if (computed != null)
                 {
-                    AddCount(1);
+                    AddCount(1, 2);
                 }
                 return computed;
             }
             if (f is ForwardingNode fwd)
             {
-                tab = AwaitResize();
+                tab = HelpTransfer(tab, fwd);
                 continue;
             }
 
@@ -586,7 +649,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             if (delta != 0)
             {
-                AddCount(delta);
+                AddCount(delta, -1);
             }
             return val;
         }
@@ -609,7 +672,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
             if (f is ForwardingNode fwd)
             {
-                tab = AwaitResize();
+                tab = HelpTransfer(tab, fwd);
                 i = 0;
                 continue;
             }
@@ -628,7 +691,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         }
         if (delta != 0)
         {
-            AddCount(delta);
+            AddCount(delta, -1);
         }
     }
 
@@ -727,116 +790,302 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
     // ----- size counter + resize -----
 
-    private void AddCount(long x)
+    // check is the length of the bin the caller just touched: it gates the resize check so a short
+    // bin (<= 1, the common case) skips the SumCount scan entirely. A negative check (deletes) never
+    // triggers a resize.
+    private void AddCount(long x, int check)
     {
         long[]? cells = _counterCells;
+        long s;
         if (cells != null)
         {
-            Interlocked.Add(ref cells[CounterSlot(cells)], x);
+            int probe = _cellProbe;
+            ref long cell = ref cells[LogicalCell(cells, probe)];
+            long v = Interlocked.Read(ref cell);
+            if (Interlocked.CompareExchange(ref cell, v + x, v) != v)
+            {
+                FullAddCount(x);
+            }
+            if (check <= 1)
+            {
+                return;
+            }
+            s = SumCount();
         }
         else
         {
             long b = Interlocked.Read(ref _baseCount);
             if (Interlocked.CompareExchange(ref _baseCount, b + x, b) != b)
             {
-                InflateCounterAndAdd(x);
+                FullAddCount(x);
+                if (check <= 1)
+                {
+                    return;
+                }
+                s = SumCount();
             }
-            else if (x > 0 && b + x >= Volatile.Read(ref _threshold))
+            else
             {
-                // Uncontended common case: threshold check needs no cell scan.
-                TryResize(b + x);
+                s = b + x;
             }
+        }
+
+        // Only an add can push the table over its threshold. Mirror JDK's addCount tail: while the
+        // count is at/over the resize threshold and the table is not maxed out, either help an
+        // ongoing resize (register + Transfer) or initiate a new one.
+        if (x <= 0)
+        {
             return;
         }
-
-        if (x > 0)
+        while (true)
         {
-            long s = SumCount();
-            if (s >= Volatile.Read(ref _threshold))
+            int sc = Volatile.Read(ref _sizeCtl);
+            if (s < sc)
             {
-                TryResize(s);
+                break;
             }
-        }
-    }
-
-    private void InflateCounterAndAdd(long x)
-    {
-        if (Interlocked.CompareExchange(ref _cellsBusy, 1, 0) == 0)
-        {
-            try
+            Node?[] tab = _table;
+            int n = tab.Length;
+            if (n >= MaximumCapacity)
             {
-                if (_counterCells == null)
+                break;
+            }
+            int rs = ResizeStamp(n);
+            if (sc < 0)
+            {
+                // A resize is already running for some generation; join it if it matches ours.
+                Node?[]? nt = _nextTable;
+                if ((sc >>> ResizeStampShift) != rs
+                    || sc == (rs << ResizeStampShift) + 1
+                    || sc == (rs << ResizeStampShift) + MaxResizers
+                    || nt == null
+                    || Volatile.Read(ref _transferIndex) <= 0)
                 {
-                    int logicalCells = Math.Max(2, Common.CeilingPowerOfTwo(Environment.ProcessorCount));
-                    // Allocate CounterCellStride longs per logical counter so each lands on its own
-                    // cache line (padding slots between counters stay zero).
-                    _counterCells = new long[logicalCells * CounterCellStride];
+                    break;
+                }
+                if (Interlocked.CompareExchange(ref _sizeCtl, sc + 1, sc) == sc)
+                {
+                    Transfer(tab, nt);
                 }
             }
-            finally
+            else if (Interlocked.CompareExchange(ref _sizeCtl, (rs << ResizeStampShift) + 2, sc) == sc)
             {
-                Volatile.Write(ref _cellsBusy, 0);
+                // We are the initiator: install a fresh staging table and start the transfer.
+                Transfer(tab, null);
             }
-        }
-        long[]? c = _counterCells;
-        if (c != null)
-        {
-            Interlocked.Add(ref c[CounterSlot(c)], x);
-        }
-        else
-        {
-            Interlocked.Add(ref _baseCount, x);
+            s = SumCount();
         }
     }
 
-    private void TryResize(long knownSize)
+    // Retry a rehashed cell on collision. The cell array is allocated once at the NCPU cap, so there
+    // is nothing to grow into.
+    private void FullAddCount(long x)
     {
-        lock (_resizeLock)
+        int probe = _cellProbe;
+        if (probe == 0)
         {
-            Node?[] oldTab = _table;
-            int oldCap = oldTab.Length;
-            // Re-check under the lock using the caller's already-computed size to avoid a second scan.
-            if (knownSize < _threshold || oldCap >= MaximumCapacity)
+            probe = InitProbe();
+        }
+        while (true)
+        {
+            long[]? cells = _counterCells;
+            if (cells != null)
             {
-                return;
-            }
-            int newCap = oldCap << 1;
-            var newTab = new Node?[newCap];
-            var forward = new ForwardingNode(newTab);
-
-            for (int i = 0; i < oldCap; i++)
-            {
-                while (true)
+                ref long cell = ref cells[LogicalCell(cells, probe)];
+                long v = Interlocked.Read(ref cell);
+                if (Interlocked.CompareExchange(ref cell, v + x, v) == v)
                 {
-                    Node? f = TabAt(oldTab, i);
-                    if (f == null)
+                    break;
+                }
+                probe = AdvanceProbe(probe);
+            }
+            else if (Interlocked.CompareExchange(ref _cellsBusy, 1, 0) == 0)
+            {
+                try
+                {
+                    if (_counterCells == null)
                     {
-                        // Claim the empty bin so a late writer sees the forward marker.
-                        if (CasTabAt(oldTab, i, null, forward))
-                        {
-                            break;
-                        }
-                        continue;
+                        int logicalCells = Math.Max(2, Common.CeilingPowerOfTwo(Environment.ProcessorCount));
+                        _counterCells = new long[logicalCells * CounterCellStride];
                     }
-                    lock (f)
-                    {
-                        if (TabAt(oldTab, i) != f)
-                        {
-                            continue;
-                        }
-                        for (Node? e = f; e != null; e = e.Next)
-                        {
-                            int j = (newCap - 1) & e.Hash;
-                            newTab[j] = new Node(e.Hash, e.Key, Volatile.Read(ref e.Value), newTab[j]);
-                        }
-                        SetTabAt(oldTab, i, forward);
-                    }
+                }
+                finally
+                {
+                    Volatile.Write(ref _cellsBusy, 0);
+                }
+            }
+            else
+            {
+                long b = Interlocked.Read(ref _baseCount);
+                if (Interlocked.CompareExchange(ref _baseCount, b + x, b) == b)
+                {
                     break;
                 }
             }
+        }
+        _cellProbe = probe;
+    }
 
-            _table = newTab;
-            Volatile.Write(ref _threshold, newCap - (newCap >>> 2));
+    private static int InitProbe()
+    {
+        int probe = Environment.CurrentManagedThreadId * unchecked((int)0x9E3779B1);
+        probe = AdvanceProbe(probe == 0 ? 1 : probe);
+        _cellProbe = probe;
+        return probe;
+    }
+
+    /// <summary>
+    /// Faithful port of JDK's <c>transfer(tab, nextTab)</c>. Moves bins from <paramref name="oldTab"/>
+    /// into a doubled table cooperatively: workers claim descending strides of bins via CAS on
+    /// <see cref="_transferIndex"/>, migrate each claimed bin (splitting its chain into a lo half that
+    /// stays at index <c>i</c> and a hi half that moves to <c>i + n</c>, using the lastRun reuse
+    /// optimization), and mark the migrated bin with a <see cref="ForwardingNode"/>. The worker that
+    /// runs out of claims decrements <see cref="_sizeCtl"/>; the one that brings it back to the "+2"
+    /// base performs the final full recheck sweep and publishes <see cref="_table"/>.
+    /// </summary>
+    private void Transfer(Node?[] oldTab, Node?[]? nextTab)
+    {
+        int n = oldTab.Length;
+        int stride = NCpu > 1 ? (n >>> 3) / NCpu : n;
+        if (stride < MinTransferStride)
+        {
+            stride = MinTransferStride;
+        }
+
+        if (nextTab == null)
+        {
+            // Initiating worker allocates the staging table and resets the claim cursor.
+            var nt = new Node?[n << 1];
+            nextTab = nt;
+            _nextTable = nt;
+            Volatile.Write(ref _transferIndex, n);
+        }
+
+        var forward = new ForwardingNode(nextTab);
+        bool advance = true;
+        bool finishing = false;
+        int i = 0;
+        int bound = 0;
+
+        while (true)
+        {
+            // Claim the next bin (i) within the current stride [bound, i]; grab a new stride when done.
+            while (advance)
+            {
+                if (--i >= bound || finishing)
+                {
+                    advance = false;
+                }
+                else
+                {
+                    int nextIndex = Volatile.Read(ref _transferIndex);
+                    if (nextIndex <= 0)
+                    {
+                        i = -1;
+                        advance = false;
+                    }
+                    else
+                    {
+                        int nextBound = nextIndex > stride ? nextIndex - stride : 0;
+                        if (Interlocked.CompareExchange(ref _transferIndex, nextBound, nextIndex) == nextIndex)
+                        {
+                            bound = nextBound;
+                            i = nextIndex - 1;
+                            advance = false;
+                        }
+                    }
+                }
+            }
+
+            if (i < 0 || i >= n)
+            {
+                // This worker is out of bins. Decrement the resizer count; the last one publishes.
+                int sc;
+                if (finishing)
+                {
+                    _nextTable = null;
+                    _table = nextTab;
+                    Volatile.Write(ref _sizeCtl, (n << 1) - (n >>> 1)); // 0.75 * newCap
+                    return;
+                }
+                sc = Volatile.Read(ref _sizeCtl);
+                if (Interlocked.CompareExchange(ref _sizeCtl, sc - 1, sc) == sc)
+                {
+                    int rs = ResizeStamp(n);
+                    if ((sc - 2) != (rs << ResizeStampShift))
+                    {
+                        return; // not the last worker
+                    }
+                    // Last worker: sweep every bin once more to confirm full migration before publish.
+                    finishing = true;
+                    advance = true;
+                    i = n;
+                }
+                continue;
+            }
+
+            Node? f = TabAt(oldTab, i);
+            if (f == null)
+            {
+                // Empty bin: mark forwarded so a late writer follows to nextTab (retries via HelpTransfer).
+                advance = CasTabAt(oldTab, i, null, forward);
+            }
+            else if (f is ForwardingNode)
+            {
+                advance = true; // already migrated (by the finishing sweep or another worker)
+            }
+            else
+            {
+                lock (f)
+                {
+                    if (TabAt(oldTab, i) != f)
+                    {
+                        continue; // head changed under us; re-read
+                    }
+                    int runBit = f.Hash & n;
+                    Node lastRun = f;
+                    for (Node? p = f.Next; p != null; p = p.Next)
+                    {
+                        int b = p.Hash & n;
+                        if (b != runBit)
+                        {
+                            runBit = b;
+                            lastRun = p;
+                        }
+                    }
+                    Node? lo;
+                    Node? hi;
+                    if (runBit == 0)
+                    {
+                        lo = lastRun;
+                        hi = null;
+                    }
+                    else
+                    {
+                        hi = lastRun;
+                        lo = null;
+                    }
+                    for (Node? p = f; p != lastRun; p = p.Next)
+                    {
+                        int ph = p!.Hash;
+                        TKey pk = p.Key;
+                        TValue pv = Volatile.Read(ref p.Value);
+                        if ((ph & n) == 0)
+                        {
+                            lo = new Node(ph, pk, pv, lo);
+                        }
+                        else
+                        {
+                            hi = new Node(ph, pk, pv, hi);
+                        }
+                    }
+                    SetTabAt(nextTab, i, lo);
+                    SetTabAt(nextTab, i + n, hi);
+                    SetTabAt(oldTab, i, forward);
+                    advance = true;
+                }
+            }
         }
     }
 }
+
