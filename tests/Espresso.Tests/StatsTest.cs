@@ -61,7 +61,7 @@ public sealed class StatsTest
     [Fact]
     public void ConcurrentStatsCounter_RecordsEverything()
     {
-        var counter = new ConcurrentStatsCounter();
+        var counter = StatsCounter.CreateEnabled();
         counter.RecordHits(3);
         counter.RecordMisses(2);
         counter.RecordLoadSuccess(50);
@@ -81,7 +81,7 @@ public sealed class StatsTest
     [Fact]
     public void DisabledStatsCounter_RecordsNothing()
     {
-        var counter = DisabledStatsCounter.Instance;
+        var counter = StatsCounter.Disabled;
         counter.RecordHits(5);
         counter.RecordMisses(5);
         counter.RecordLoadSuccess(100);

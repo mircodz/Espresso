@@ -6,7 +6,7 @@ namespace Espresso.Tests;
 
 public sealed class RefreshAfterWriteTest
 {
-    private sealed class FakeTicker : ITicker
+    private sealed class FakeTicker
     {
         private long _nanos;
         public long Read() => _nanos;
@@ -29,9 +29,9 @@ public sealed class RefreshAfterWriteTest
         var ticker = new FakeTicker();
         int version = 1;
         var loader = new CountingLoader(k => $"{k}-v{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance) // background reload runs inline
             .Build(loader);
 
@@ -56,9 +56,9 @@ public sealed class RefreshAfterWriteTest
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "new");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -73,9 +73,9 @@ public sealed class RefreshAfterWriteTest
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "reloaded");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -93,9 +93,9 @@ public sealed class RefreshAfterWriteTest
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "v");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -113,9 +113,9 @@ public sealed class RefreshAfterWriteTest
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => null); // reload yields nothing
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -132,10 +132,10 @@ public sealed class RefreshAfterWriteTest
         var ticker = new FakeTicker();
         int version = 1;
         var loader = new CountingLoader(k => $"{k}.{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(100)
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -155,9 +155,9 @@ public sealed class RefreshAfterWriteTest
         var ticker = new FakeTicker();
         int version = 1;
         var loader = new CountingLoader(k => $"{k}-v{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -179,9 +179,9 @@ public sealed class RefreshAfterWriteTest
         var ticker = new FakeTicker();
         bool shouldThrow = false;
         var loader = new CountingLoader(k => shouldThrow ? throw new InvalidOperationException("boom") : "v1");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .Build(loader);
@@ -205,11 +205,11 @@ public sealed class RefreshAfterWriteTest
         // Each key refreshes to a heavier value than it started with.
         int version = 1;
         var loader = new CountingLoader(k => version == 1 ? "x" : "xxxxxxxxxx"); // 1 -> 10
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumWeight(40)
             .Weigher(new FuncWeigher<int, string>((_, v) => v.Length))
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -240,9 +240,9 @@ public sealed class RefreshAfterWriteTest
         string? removedValue = null;
         int version = 1;
         var loader = new CountingLoader(k => $"v{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RemovalListener(new CaptureListener((k, v, c) => { cause = c; removedValue = v; }))
             .Build(loader);
@@ -272,9 +272,9 @@ public sealed class RefreshAfterWriteTest
         var ticker = new FakeTicker();
         int version = 1;
         var loader = new CountingLoader(k => $"{k}-v{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build(loader);
 
@@ -312,9 +312,9 @@ public sealed class RefreshAfterWriteTest
         int version = 1;
         var loader = new CountingLoader(k => $"{k}-v{version}");
         var executor = new DeferredExecutor();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(executor)
             .Build(loader);
 

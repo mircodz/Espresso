@@ -19,7 +19,7 @@ public sealed class LoadingCacheTest
     private static ILoadingCache<string, string> NewLoading(Func<string, string?> fn, out CountingLoader loader)
     {
         loader = new CountingLoader(fn);
-        return Espresso.NewBuilder<string, string>().RecordStats().Build(loader);
+        return Cache.NewBuilder<string, string>().RecordStats().Build(loader);
     }
 
     [Fact]
@@ -79,7 +79,7 @@ public sealed class LoadingCacheTest
     [Fact]
     public void ManualCache_Get_Throws()
     {
-        var cache = (ILoadingCache<string, string>)Espresso.NewBuilder<string, string>().Build();
+        var cache = (ILoadingCache<string, string>)Cache.NewBuilder<string, string>().Build();
         Assert.Throws<InvalidOperationException>(() => cache.Get("a"));
     }
 }

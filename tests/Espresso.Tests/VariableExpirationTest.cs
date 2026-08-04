@@ -5,7 +5,7 @@ namespace Espresso.Tests;
 
 public sealed class VariableExpirationTest
 {
-    private sealed class FakeTicker : ITicker
+    private sealed class FakeTicker
     {
         private long _nanos;
         public long Read() => _nanos;
@@ -33,9 +33,9 @@ public sealed class VariableExpirationTest
     }
 
     private static ICache<int, string> New(IExpiry<int, string> expiry, FakeTicker ticker)
-        => Espresso.NewBuilder<int, string>()
+        => Cache.NewBuilder<int, string>()
             .ExpireAfter(expiry)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .Build();
@@ -121,9 +121,9 @@ public sealed class VariableExpirationTest
     {
         var ticker = new FakeTicker();
         RemovalCause? cause = null;
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfter(new ControllableExpiry { CreateNanos = TimeSpan.FromSeconds(10).Ticks * 100L })
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RemovalListener(new Listener((k, v, c) => cause = c))
             .Build();
@@ -140,10 +140,10 @@ public sealed class VariableExpirationTest
     public void CombinedWithMaximumSize()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfter(new ControllableExpiry { CreateNanos = TimeSpan.FromMinutes(10).Ticks * 100L })
             .MaximumSize(10)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -173,9 +173,9 @@ public sealed class VariableExpirationTest
     public void FuncExpiry_UniformDuration()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfter(new FuncExpiry<int, string>((_, _) => TimeSpan.FromSeconds(30)))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -190,7 +190,7 @@ public sealed class VariableExpirationTest
     public void CannotCombineExpireAfterWithFixedExpiry()
     {
         Assert.Throws<InvalidOperationException>(() =>
-            Espresso.NewBuilder<int, string>()
+            Cache.NewBuilder<int, string>()
                 .ExpireAfterWrite(TimeSpan.FromMinutes(1))
                 .ExpireAfter(new FuncExpiry<int, string>((_, _) => TimeSpan.FromSeconds(30))));
     }
@@ -201,7 +201,7 @@ public sealed class VariableExpirationTest
         // With a real scheduler, an expired entry is evicted by a background maintenance tick even
         // though nothing ever touches the cache after the write. Uses the system clock (not a fake
         // ticker) so the pacer's timer fires against wall-clock time.
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfter(new FuncExpiry<int, string>((_, _) => TimeSpan.FromMilliseconds(50)))
             .Scheduler(Schedulers.System)
             .Build();

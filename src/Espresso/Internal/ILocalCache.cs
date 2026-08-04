@@ -61,8 +61,8 @@ internal interface ILocalCache<K, V> : IDisposable
 
     // ----- collaborators -----
 
-    IStatsCounter StatsCounter { get; }
+    StatsCounter StatsCounter { get; }
     IExecutor Executor { get; }
-    ITicker Ticker { get; }
+    Ticker Ticker { get; }
     bool IsRecordingStats { get; }
 }

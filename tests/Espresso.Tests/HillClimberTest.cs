@@ -7,7 +7,7 @@ namespace Espresso.Tests;
 public sealed class HillClimberTest
 {
     private static ICache<int, string> NewCache(long maximumSize)
-        => Espresso.NewBuilder<int, string>()
+        => Cache.NewBuilder<int, string>()
             .MaximumSize(maximumSize)
             .Executor(DirectExecutor.Instance)
             .RecordStats()

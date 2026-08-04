@@ -22,6 +22,9 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
     /// <summary>The bound on the table size.</summary>
     private static readonly int MaximumTableSize = 4 * Common.CeilingPowerOfTwo(NCpu);
 
+    /// <summary>Initial stripe count: one per CPU (power-of-two) so producers spread out immediately.</summary>
+    private static readonly int InitialTableSize = Common.CeilingPowerOfTwo(NCpu);
+
     /// <summary>The maximum number of attempts when trying to expand the table.</summary>
     private const int Attempts = 3;
 
@@ -31,16 +34,45 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
     /// <summary>Spinlock (locked via CAS) used when resizing and/or creating buffers.</summary>
     private int _tableBusy;
 
+    /// <summary>
+    /// Per-thread hash used to pick a stripe, cached so the common (uncontended) offer avoids recomputing
+    /// the thread-id mix on every read. Initialized lazily from the managed thread id and advanced by an
+    /// xorshift only when a stripe collision forces a rehash — the same scheme the counter-cell striping
+    /// in <see cref="ConcurrentHashMap{K,V}"/> uses. Zero means "not yet initialized".
+    /// </summary>
+    [ThreadStatic] private static int _probe;
+
     private bool CasTableBusy() => Interlocked.CompareExchange(ref _tableBusy, 1, 0) == 0;
 
     /// <summary>Creates a new buffer populated with a single element after resizing.</summary>
     protected abstract IBuffer<E> Create(E e);
 
+    /// <summary>Returns this thread's cached stripe probe, initializing it on first use (never zero).</summary>
+    private static int GetProbe()
+    {
+        int p = _probe;
+        if (p == 0)
+        {
+            p = (int)Mix64(Environment.CurrentManagedThreadId);
+            _probe = p == 0 ? 1 : p; // guard against a zero mix so the field stays "initialized"
+            p = _probe;
+        }
+        return p;
+    }
+
+    /// <summary>Advances the probe via xorshift (Marsaglia) and writes it back to the thread-local slot.</summary>
+    private static int AdvanceProbe(int probe)
+    {
+        probe ^= probe << 13;
+        probe ^= probe >>> 17;
+        probe ^= probe << 5;
+        _probe = probe;
+        return probe;
+    }
+
     public int Offer(E e)
     {
-        long z = Mix64(Environment.CurrentManagedThreadId);
-        int increment = ((int)(z >>> 32)) | 1;
-        int h = (int)z;
+        int h = GetProbe();
 
         bool uncontended = true;
         IBuffer<E>?[]? buffers = _table;
@@ -52,7 +84,7 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
             || (buffer = buffers[h & mask]) == null
             || !(uncontended = (result = buffer.Offer(e)) != BufferResult.Failed))
         {
-            return ExpandOrRetry(e, h, increment, uncontended);
+            return ExpandOrRetry(e, h, uncontended);
         }
         return result;
     }
@@ -60,7 +92,7 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
     /// <summary>
     /// Handles updates involving initialization, resizing, creating new buffers, and/or contention.
     /// </summary>
-    private int ExpandOrRetry(E e, int h, int increment, bool wasUncontended)
+    private int ExpandOrRetry(E e, int h, bool wasUncontended)
     {
         int result = BufferResult.Failed;
         bool collide = false; // whether the last slot was nonempty
@@ -134,7 +166,7 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
                     collide = false;
                     continue; // retry with expanded table
                 }
-                h += increment;
+                h = AdvanceProbe(h);
             }
             else if (_tableBusy == 0 && _table == buffers && CasTableBusy())
             {
@@ -143,8 +175,12 @@ internal abstract class StripedBuffer<E> : IBuffer<E> where E : class
                 {
                     if (_table == buffers)
                     {
-                        var rs = new IBuffer<E>?[1];
-                        rs[0] = Create(e);
+                        // Pre-size to one stripe per (power-of-two) CPU so concurrent producers land on
+                        // distinct stripes from the start, instead of contending on a single stripe and
+                        // growing reactively. Only the stripe this thread uses is populated eagerly; the
+                        // rest are created on first use.
+                        var rs = new IBuffer<E>?[InitialTableSize];
+                        rs[h & (InitialTableSize - 1)] = Create(e);
                         _table = rs;
                         init = true;
                     }

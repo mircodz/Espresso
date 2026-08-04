@@ -8,7 +8,7 @@ public sealed class EspressoBuilderTest
     [Fact]
     public void Build_ReturnsUsableCache()
     {
-        var cache = Espresso.NewBuilder<string, string>().Build();
+        var cache = Cache.NewBuilder<string, string>().Build();
         cache.Put("a", "1");
         Assert.Equal("1", cache.GetIfPresent("a"));
     }
@@ -16,20 +16,20 @@ public sealed class EspressoBuilderTest
     [Fact]
     public void InitialCapacity_Validated()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => Espresso.NewBuilder<string, string>().InitialCapacity(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Cache.NewBuilder<string, string>().InitialCapacity(-1));
     }
 
     [Fact]
     public void InitialCapacity_SetTwice_Throws()
     {
-        var b = Espresso.NewBuilder<string, string>().InitialCapacity(10);
+        var b = Cache.NewBuilder<string, string>().InitialCapacity(10);
         Assert.Throws<InvalidOperationException>(() => b.InitialCapacity(20));
     }
 
     [Fact]
     public void MaximumSize_And_Weight_AreMutuallyExclusive()
     {
-        var b = Espresso.NewBuilder<string, string>().MaximumSize(100);
+        var b = Cache.NewBuilder<string, string>().MaximumSize(100);
         Assert.Throws<InvalidOperationException>(() => b.MaximumWeight(100));
     }
 
@@ -37,25 +37,25 @@ public sealed class EspressoBuilderTest
     public void NegativeDuration_Throws()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            Espresso.NewBuilder<string, string>().ExpireAfterWrite(TimeSpan.FromSeconds(-1)));
+            Cache.NewBuilder<string, string>().ExpireAfterWrite(TimeSpan.FromSeconds(-1)));
     }
 
     [Fact]
     public void BoundedOptions_Build_Succeeds()
     {
-        Assert.NotNull(Espresso.NewBuilder<string, string>().MaximumSize(100).Build());
-        Assert.NotNull(Espresso.NewBuilder<string, string>()
+        Assert.NotNull(Cache.NewBuilder<string, string>().MaximumSize(100).Build());
+        Assert.NotNull(Cache.NewBuilder<string, string>()
             .MaximumWeight(100).Weigher(new FuncWeigher<string, string>((_, v) => v.Length)).Build());
     }
 
     [Fact]
     public void RecordStats_TogglesCounter()
     {
-        var withStats = Espresso.NewBuilder<string, string>().RecordStats().Build();
+        var withStats = Cache.NewBuilder<string, string>().RecordStats().Build();
         withStats.GetIfPresent("absent");
         Assert.Equal(1, withStats.Stats().MissCount);
 
-        var withoutStats = Espresso.NewBuilder<string, string>().Build();
+        var withoutStats = Cache.NewBuilder<string, string>().Build();
         withoutStats.GetIfPresent("absent");
         Assert.Equal(0, withoutStats.Stats().MissCount);
     }
@@ -63,7 +63,7 @@ public sealed class EspressoBuilderTest
     [Fact]
     public void Smoke_BuilderToGet()
     {
-        var cache = Espresso.NewBuilder<string, string>().RecordStats().Build();
+        var cache = Cache.NewBuilder<string, string>().RecordStats().Build();
         Assert.Equal("v", cache.Get("k", _ => "v"));
         Assert.Equal(1, cache.Stats().MissCount);
     }
@@ -73,7 +73,7 @@ public sealed class EspressoBuilderTest
     public void Weigher_WithoutMaximumWeight_ThrowsOnBuild()
     {
         Assert.Throws<InvalidOperationException>(() =>
-            Espresso.NewBuilder<string, string>()
+            Cache.NewBuilder<string, string>()
                 .Weigher(new FuncWeigher<string, string>((_, v) => v.Length))
                 .Build());
     }
@@ -83,7 +83,7 @@ public sealed class EspressoBuilderTest
     public void MaximumWeight_WithoutWeigher_ThrowsOnBuild()
     {
         Assert.Throws<InvalidOperationException>(() =>
-            Espresso.NewBuilder<string, string>().MaximumWeight(100).Build());
+            Cache.NewBuilder<string, string>().MaximumWeight(100).Build());
     }
 
     // refreshAfterWrite requires a loading cache: a non-loading Build() is rejected.
@@ -91,11 +91,11 @@ public sealed class EspressoBuilderTest
     public void RefreshAfterWrite_WithoutLoader_ThrowsOnBuild()
     {
         Assert.Throws<InvalidOperationException>(() =>
-            Espresso.NewBuilder<string, string>()
+            Cache.NewBuilder<string, string>()
                 .RefreshAfterWrite(TimeSpan.FromMinutes(1))
                 .Build());
         // But is accepted with a loader.
-        Assert.NotNull(Espresso.NewBuilder<string, string>()
+        Assert.NotNull(Cache.NewBuilder<string, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
             .Build(new FuncCacheLoader<string, string>(k => k)));
     }
@@ -104,7 +104,7 @@ public sealed class EspressoBuilderTest
     [Fact]
     public void NegativeWeigherResult_Throws()
     {
-        var cache = Espresso.NewBuilder<string, string>()
+        var cache = Cache.NewBuilder<string, string>()
             .MaximumWeight(100)
             .Weigher(new FuncWeigher<string, string>((_, _) => -1))
             .Build();
@@ -115,7 +115,7 @@ public sealed class EspressoBuilderTest
     [Fact]
     public void NullKey_ThrowsArgumentNullException()
     {
-        var cache = Espresso.NewBuilder<string, string>().MaximumSize(10).Build();
+        var cache = Cache.NewBuilder<string, string>().MaximumSize(10).Build();
         Assert.Throws<ArgumentNullException>(() => cache.GetIfPresent(null!));
         Assert.Throws<ArgumentNullException>(() => cache.Put(null!, "v"));
         Assert.Throws<ArgumentNullException>(() => cache.Invalidate(null!));

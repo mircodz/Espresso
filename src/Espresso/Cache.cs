@@ -7,7 +7,7 @@ using Espresso.Stats;
 namespace Espresso;
 
 /// <summary>Entry point for building caches.</summary>
-public static class Espresso
+public static class Cache
 {
     /// <summary>Creates a new cache builder for the given key and value types.</summary>
     public static EspressoBuilder<K, V> NewBuilder<K, V>()
@@ -37,7 +37,7 @@ public sealed class EspressoBuilder<K, V>
     private TimeSpan? _refreshAfterWrite;
     private IExpiry<K, V>? _expiry;
     private IRemovalListener<K, V>? _removalListener;
-    private ITicker? _ticker;
+    private Ticker? _ticker;
     private IExecutor? _executor;
     private IWeigher<K, V>? _weigher;
     private IScheduler? _scheduler;
@@ -143,7 +143,7 @@ public sealed class EspressoBuilder<K, V>
     }
 
     /// <summary>Sets the ticker source used for expiration and load timing.</summary>
-    public EspressoBuilder<K, V> Ticker(ITicker ticker)
+    public EspressoBuilder<K, V> Ticker(Ticker ticker)
     {
         Common.RequireState(_ticker == null);
         ArgumentNullException.ThrowIfNull(ticker);
@@ -155,7 +155,7 @@ public sealed class EspressoBuilder<K, V>
     public EspressoBuilder<K, V> Ticker(Func<long> ticker)
     {
         ArgumentNullException.ThrowIfNull(ticker);
-        return Ticker(new FuncTicker(ticker));
+        return Ticker(Espresso.Ticker.FromFunc(ticker));
     }
 
     /// <summary>Enables the accumulation of cache statistics.</summary>
@@ -230,10 +230,10 @@ public sealed class EspressoBuilder<K, V>
     internal CacheConfiguration<K, V> ToConfiguration() => new()
     {
         InitialCapacity = _initialCapacity == Unset ? DefaultInitialCapacity : _initialCapacity,
-        StatsCounter = _recordStats ? new ConcurrentStatsCounter() : DisabledStatsCounter.Instance,
+        StatsCounter = _recordStats ? StatsCounter.CreateEnabled() : StatsCounter.Disabled,
         RemovalListener = _removalListener,
         Executor = _executor ?? ThreadPoolExecutor.Instance,
-        Ticker = _ticker ?? (UsesTiming ? SystemTicker.Instance : DisabledTicker.Instance),
+        Ticker = _ticker ?? (UsesTiming ? Espresso.Ticker.System : Espresso.Ticker.Disabled),
         Weigher = _weigher ?? SingletonWeigher<K, V>.Instance,
         Expiry = _expiry,
         Scheduler = _scheduler == null || ReferenceEquals(_scheduler, Schedulers.Disabled) ? null : _scheduler,

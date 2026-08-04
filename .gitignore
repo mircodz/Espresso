@@ -21,3 +21,9 @@ CoverageReport/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local reference clone (not part of the package)
+BitFaster.Caching/
+
+# Benchmark output (generated)
+BenchmarkResults/

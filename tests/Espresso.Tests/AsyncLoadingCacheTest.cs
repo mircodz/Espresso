@@ -38,7 +38,7 @@ public sealed class AsyncLoadingCacheTest
     private static IAsyncLoadingCache<int, string> NewLoading(Func<int, string?> fn, out CountingLoader loader)
     {
         loader = new CountingLoader(fn);
-        return Espresso.NewBuilder<int, string>()
+        return Cache.NewBuilder<int, string>()
             .MaximumSize(1000)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
@@ -108,7 +108,7 @@ public sealed class AsyncLoadingCacheTest
         // must observe null (not an internal exception).
         var gate = new TaskCompletionSource<IReadOnlyDictionary<int, string>>();
         var loader = new GatedBulkLoader(gate.Task);
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(1000)
             .Executor(DirectExecutor.Instance)
             .BuildAsync(loader);
@@ -137,7 +137,7 @@ public sealed class AsyncLoadingCacheTest
     {
         // A loader that returns an empty (non-null) map for the misses → recorded as a failure.
         var loader = new EmptyBulkLoader();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(1000)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
@@ -161,7 +161,7 @@ public sealed class AsyncLoadingCacheTest
     public async Task GetAll_FailingBulkLoad_RemovesProxies()
     {
         var loader = new ThrowingBulkLoader();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(1000)
             .Executor(DirectExecutor.Instance)
             .BuildAsync(loader);
@@ -189,7 +189,7 @@ public sealed class AsyncLoadingCacheTest
         Assert.Equal("v1", all[1]);
     }
 
-    private sealed class FakeTicker : ITicker
+    private sealed class FakeTicker
     {
         private long _nanos;
         public long Read() => _nanos;
@@ -202,9 +202,9 @@ public sealed class AsyncLoadingCacheTest
         var ticker = new FakeTicker();
         int version = 1;
         var loader = new CountingLoader(k => $"{k}.v{version}");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync(loader);
@@ -230,9 +230,9 @@ public sealed class AsyncLoadingCacheTest
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "v");
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .BuildAsync(loader);
 
@@ -263,9 +263,9 @@ public sealed class AsyncLoadingCacheTest
         var ticker = new FakeTicker();
         var gate = new TaskCompletionSource<string?>();
         var loader = new GateLoader(gate.Task);
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfter(new FixedExpiry(TimeSpan.FromSeconds(30)))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync(loader);
@@ -322,9 +322,9 @@ public sealed class AsyncLoadingCacheTest
         var loader = new RefreshLoader(k => failReload
             ? Task.FromException<string?>(new InvalidOperationException("reload boom"))
             : Task.FromResult<string?>("v1"));
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync(loader);
@@ -349,9 +349,9 @@ public sealed class AsyncLoadingCacheTest
         var ticker = new FakeTicker();
         bool nullReload = false;
         var loader = new RefreshLoader(k => Task.FromResult<string?>(nullReload ? null : "v1"));
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync(loader);
@@ -377,9 +377,9 @@ public sealed class AsyncLoadingCacheTest
         var gate = new TaskCompletionSource<string?>();
         bool gatedReload = false;
         var loader = new RefreshLoader(k => gatedReload ? gate.Task : Task.FromResult<string?>("v1"));
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync(loader);

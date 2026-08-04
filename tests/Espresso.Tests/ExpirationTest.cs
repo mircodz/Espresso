@@ -5,7 +5,7 @@ namespace Espresso.Tests;
 
 public sealed class ExpirationTest
 {
-    private sealed class FakeTicker : ITicker
+    private sealed class FakeTicker
     {
         private long _nanos;
         public long Read() => _nanos;
@@ -18,9 +18,9 @@ public sealed class ExpirationTest
     public void ExpireAfterWrite_EvictsAfterDuration()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .Build();
@@ -41,9 +41,9 @@ public sealed class ExpirationTest
     public void ExpireAfterWrite_NotResetByReads()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -61,9 +61,9 @@ public sealed class ExpirationTest
     public void ExpireAfterWrite_ResetByUpdate()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -78,9 +78,9 @@ public sealed class ExpirationTest
     public void ExpireAfterAccess_ResetByReads()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterAccess(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -99,9 +99,9 @@ public sealed class ExpirationTest
     public void ExpireAfterAccess_EvictsIdleEntries()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterAccess(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -116,9 +116,9 @@ public sealed class ExpirationTest
     {
         var ticker = new FakeTicker();
         RemovalCause? observed = null;
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RemovalListener(new Listener((_, _, cause) => observed = cause))
             .Build();
@@ -133,10 +133,10 @@ public sealed class ExpirationTest
     public void Expiration_WithMaximumSize_BothApply()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(100)
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -155,9 +155,9 @@ public sealed class ExpirationTest
     public void ExpireAfterWrite_ReAddAfterExpiry()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -173,9 +173,9 @@ public sealed class ExpirationTest
     public void Get_RecomputesExpiredEntry()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -192,9 +192,9 @@ public sealed class ExpirationTest
     {
         var ticker = new FakeTicker();
         RemovalCause? cause = null;
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RemovalListener(new Listener((_, _, c) => cause = c))
             .Build();
@@ -214,9 +214,9 @@ public sealed class ExpirationTest
     public void Remove_ExpiredEntry_ReturnsNull()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 
@@ -232,9 +232,9 @@ public sealed class ExpirationTest
     public void GetAllPresent_SkipsExpiredEntries()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .Build();
@@ -264,9 +264,9 @@ public sealed class ExpirationTest
     public void GetAllPresent_ExtendsAccessedEntries()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterAccess(OneMinute)
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .Build();
 

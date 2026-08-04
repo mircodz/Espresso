@@ -13,9 +13,9 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     where V : class
 {
     private readonly ConcurrentHashMap<K, V> _data;
-    private readonly IStatsCounter _statsCounter;
+    private readonly StatsCounter _statsCounter;
     private readonly IRemovalListener<K, V>? _removalListener;
-    private readonly ITicker _ticker;
+    private readonly Ticker _ticker;
     private readonly ICacheLoader<K, V>? _loader;
 
     internal UnboundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)

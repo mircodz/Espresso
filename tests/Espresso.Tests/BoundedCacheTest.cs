@@ -7,7 +7,7 @@ public sealed class BoundedCacheTest
 {
     // A direct-executor bounded cache makes maintenance observable via CleanUp().
     private static ICache<int, string> NewSizeCache(long maximumSize)
-        => Espresso.NewBuilder<int, string>()
+        => Cache.NewBuilder<int, string>()
             .MaximumSize(maximumSize)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
@@ -94,7 +94,7 @@ public sealed class BoundedCacheTest
     public void WeightedEviction_RespectsMaximumWeight()
     {
         const int maxWeight = 1000;
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumWeight(maxWeight)
             .Weigher(new FuncWeigher<int, string>((_, v) => v.Length))
             .Executor(DirectExecutor.Instance)
@@ -114,7 +114,7 @@ public sealed class BoundedCacheTest
     [Fact]
     public void ZeroWeight_PinsEntry()
     {
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumWeight(100)
             .Weigher(new FuncWeigher<int, string>((k, _) => k == 0 ? 0 : 10))
             .Executor(DirectExecutor.Instance)
@@ -161,7 +161,7 @@ public sealed class BoundedCacheTest
     {
         const int max = 500;
         // Real thread-pool executor: exercises the async drain/maintenance path under contention.
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(max)
             .RecordStats()
             .Build();

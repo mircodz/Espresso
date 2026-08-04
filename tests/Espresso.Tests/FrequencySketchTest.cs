@@ -62,7 +62,7 @@ public sealed class FrequencySketchTest
         int size = int.MaxValue / 10 + 1;
         sketch.EnsureCapacity(size);
         Assert.Equal(int.MaxValue, sketch.sampleSize);
-        Assert.Equal(Internal.Common.CeilingPowerOfTwo(size), sketch.table!.Length);
+        Assert.Equal(Common.CeilingPowerOfTwo(size), sketch.table!.Length);
         Assert.Equal((sketch.table!.Length >> 3) - 1, sketch.blockMask);
     }
 

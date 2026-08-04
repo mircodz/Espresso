@@ -7,7 +7,7 @@ namespace Espresso.Tests;
 
 public sealed class AsyncCacheTest
 {
-    private sealed class FakeTicker : ITicker
+    private sealed class FakeTicker
     {
         private long _nanos;
         public long Read() => _nanos;
@@ -15,7 +15,7 @@ public sealed class AsyncCacheTest
     }
 
     private static IAsyncCache<int, string> NewCache()
-        => Espresso.NewBuilder<int, string>()
+        => Cache.NewBuilder<int, string>()
             .MaximumSize(1000)
             .Executor(DirectExecutor.Instance)
             .RecordStats()
@@ -106,9 +106,9 @@ public sealed class AsyncCacheTest
     public async Task CompletionResetsExpiryTimer_FromCompletionNotInsert()
     {
         var ticker = new FakeTicker();
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .ExpireAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker)
+            .Ticker(ticker.Read)
             .Executor(DirectExecutor.Instance)
             .BuildAsync();
 
@@ -146,7 +146,7 @@ public sealed class AsyncCacheTest
     [Fact]
     public void SlowLoad_PinnedAgainstSizeEviction()
     {
-        var cache = Espresso.NewBuilder<int, string>()
+        var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(10)
             .Executor(DirectExecutor.Instance)
             .BuildAsync();

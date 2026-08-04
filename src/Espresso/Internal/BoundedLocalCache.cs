@@ -57,10 +57,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private const int ProcessingToRequired = 3;
 
     private readonly ConcurrentHashMap<K, Node<K, V>> _data;
-    private readonly IStatsCounter _statsCounter;
+    private readonly StatsCounter _statsCounter;
     private readonly IRemovalListener<K, V>? _removalListener;
     private readonly IExecutor _executor;
-    private readonly ITicker _ticker;
+    private readonly Ticker _ticker;
     private readonly IWeigher<K, V> _weigher;
     private readonly ICacheLoader<K, V>? _loader;
 
@@ -186,10 +186,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     // ----- ILocalCache collaborators -----
 
-    public IStatsCounter StatsCounter => _statsCounter;
+    public StatsCounter StatsCounter => _statsCounter;
     public IExecutor Executor => _executor;
-    public ITicker Ticker => _ticker;
-    public bool IsRecordingStats => !ReferenceEquals(_statsCounter, DisabledStatsCounter.Instance);
+    public Ticker Ticker => _ticker;
+    public bool IsRecordingStats => _statsCounter.IsEnabled;
 
     // ----- sizing -----
 

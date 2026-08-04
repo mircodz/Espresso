@@ -16,8 +16,12 @@ namespace Espresso.Internal;
 /// </summary>
 internal sealed class BoundedBuffer<E> : StripedBuffer<E> where E : class
 {
-    /// <summary>The maximum number of elements per buffer.</summary>
-    internal const int BufferSize = 16;
+    /// <summary>
+    /// The maximum number of elements per stripe. A larger buffer fills less often under contention,
+    /// so the read path reaches the drain-scheduling (and its Monitor.TryEnter on the eviction lock)
+    /// far less frequently — the key to read scaling past a handful of threads.
+    /// </summary>
+    internal const int BufferSize = 128;
     internal const int Mask = BufferSize - 1;
 
     protected override IBuffer<E> Create(E e) => new RingBuffer(e);
@@ -51,7 +55,9 @@ internal sealed class BoundedBuffer<E> : StripedBuffer<E> where E : class
         public int Offer(E e)
         {
             long head = Volatile.Read(ref _readCounter);
-            long tail = Volatile.Read(ref _writeCounter);
+            // Plain read of the write counter: the CAS below is the linearization point and re-validates
+            // it, so a stale value only ever yields a (lossy-safe) Failed, never a corrupt slot.
+            long tail = _writeCounter;
             long size = tail - head;
             if (size >= BufferSize)
             {

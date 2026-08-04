@@ -9,7 +9,7 @@ public sealed class UnboundedCacheTest
 {
     private static ICache<string, string> NewCache(bool stats = true)
     {
-        var builder = Espresso.NewBuilder<string, string>();
+        var builder = Cache.NewBuilder<string, string>();
         if (stats) builder.RecordStats();
         return builder.Build();
     }
@@ -56,7 +56,7 @@ public sealed class UnboundedCacheTest
     public void Put_Replace_NotifiesRemoval()
     {
         var listener = new RecordingListener();
-        var cache = Espresso.NewBuilder<string, string>()
+        var cache = Cache.NewBuilder<string, string>()
             .RemovalListener(listener)
             .Build();
 
@@ -72,7 +72,7 @@ public sealed class UnboundedCacheTest
     public void Invalidate_NotifiesExplicit()
     {
         var listener = new RecordingListener();
-        var cache = Espresso.NewBuilder<string, string>()
+        var cache = Cache.NewBuilder<string, string>()
             .RemovalListener(listener)
             .Build();
 

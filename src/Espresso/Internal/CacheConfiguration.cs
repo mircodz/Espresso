@@ -12,10 +12,10 @@ internal readonly struct CacheConfiguration<K, V>
     where V : class
 {
     public int InitialCapacity { get; init; }
-    public IStatsCounter StatsCounter { get; init; }
+    public StatsCounter StatsCounter { get; init; }
     public IRemovalListener<K, V>? RemovalListener { get; init; }
     public IExecutor Executor { get; init; }
-    public ITicker Ticker { get; init; }
+    public Ticker Ticker { get; init; }
     public IWeigher<K, V> Weigher { get; init; }
     public IExpiry<K, V>? Expiry { get; init; }
     public IScheduler? Scheduler { get; init; }
