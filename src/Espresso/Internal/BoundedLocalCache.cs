@@ -26,7 +26,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private const double PercentMain = 0.99;
     private const double PercentMainProtected = 0.80;
     private const int AdmitHashDosThreshold = 6;
-    private const int WriteBufferMax = 128 - 1;
+    private const int WriteBufferMin = 4;
+    // Per-CPU cap so writers rarely fill the buffer; also bounds tasks drained per maintenance cycle.
+    private static readonly int WriteBufferMax = 128 * Common.CeilingPowerOfTwo(Environment.ProcessorCount);
     private const int MaxPutSpinWaitAttempts = 1024 - 1;
     private const long MaximumCapacity = long.MaxValue - int.MaxValue;
 
@@ -113,7 +115,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly object _evictionLock = new();
     private readonly FrequencySketch _sketch = new();
     private readonly BoundedBuffer<Node<K, V>> _readBuffer = new();
-    private readonly MpscGrowableArrayQueue<IWriteTask> _writeBuffer = new(4, 128);
+    private readonly MpscGrowableArrayQueue<IWriteTask> _writeBuffer = new(WriteBufferMin, WriteBufferMax);
     private readonly AccessOrderDeque<Node<K, V>> _windowDeque = new();
     private readonly AccessOrderDeque<Node<K, V>> _probationDeque = new();
     private readonly AccessOrderDeque<Node<K, V>> _protectedDeque = new();
@@ -577,18 +579,16 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     private void AfterWrite(IWriteTask task)
     {
-        for (int i = 0; i < 100; i++)
+        if (_writeBuffer.Offer(task))
         {
-            if (_writeBuffer.Offer(task))
-            {
-                ScheduleAfterWrite();
-                return;
-            }
-            // Buffer full: help drain, then retry.
-            ScheduleDrainBuffers();
+            ScheduleAfterWrite();
+            return;
         }
 
-        // Fallback: apply inline under the lock so the task is never lost.
+        // The buffer is full, so the writer performs the maintenance itself rather than dropping the
+        // task. This keeps writers making progress when the scheduled drain is stalled — the executor's
+        // threads are all busy (perhaps writing into this cache), the write rate outpaces the drain, or
+        // the maintenance task was silently discarded.
         lock (_evictionLock)
         {
             try { Maintenance(task); }
