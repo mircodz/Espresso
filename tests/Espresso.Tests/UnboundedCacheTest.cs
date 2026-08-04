@@ -5,7 +5,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class UnboundedCacheTest
+public sealed class UnboundedCacheTest : CacheTestBase
 {
     private static ICache<string, string> NewCache(bool stats = true)
     {
@@ -15,9 +15,10 @@ public sealed class UnboundedCacheTest
     }
 
     [Fact]
-    public void GetIfPresent_HitAndMiss()
+    public void GetIfPresent_MissThenHit_RecordsStats()
     {
         var cache = NewCache();
+
         Assert.Null(cache.GetIfPresent("a"));
         cache.Put("a", "1");
         Assert.Equal("1", cache.GetIfPresent("a"));
@@ -28,32 +29,33 @@ public sealed class UnboundedCacheTest
     }
 
     [Fact]
-    public void Get_WithMappingFunction_ComputesOnMiss()
+    public void Get_WithMappingFunction_ComputesOnMissThenReturnsCached()
     {
         var cache = NewCache();
         int calls = 0;
-        string? v = cache.Get("k", _ => { calls++; return "loaded"; });
-        Assert.Equal("loaded", v);
+
+        Assert.Equal("loaded", cache.Get("k", _ => { calls++; return "loaded"; }));
         Assert.Equal(1, calls);
 
-        v = cache.Get("k", _ => { calls++; return "again"; });
-        Assert.Equal("loaded", v); // present, function not called
+        Assert.Equal("loaded", cache.Get("k", _ => { calls++; return "again"; })); // present, function not called
         Assert.Equal(1, calls);
     }
 
     [Fact]
-    public void Get_NullResult_NotCached()
+    public void Get_NullResult_NotCachedAndRecordsFailure()
     {
         var cache = NewCache();
+
         Assert.Null(cache.Get("k", _ => null));
         Assert.Equal(0, cache.EstimatedSize());
+
         var stats = cache.Stats();
         Assert.Equal(1, stats.MissCount);
         Assert.Equal(1, stats.LoadFailureCount);
     }
 
     [Fact]
-    public void Put_Replace_NotifiesRemoval()
+    public void Put_Replace_NotifiesRemovalWithReplacedCause()
     {
         var listener = new RecordingListener();
         var cache = Cache.NewBuilder<string, string>()
@@ -64,12 +66,12 @@ public sealed class UnboundedCacheTest
         cache.Put("a", "2");
         Assert.Equal("2", cache.GetIfPresent("a"));
 
-        Assert.Single(listener.Events);
-        Assert.Equal(("a", "1", RemovalCause.Replaced), listener.Events[0]);
+        var evt = Assert.Single(listener.Events);
+        Assert.Equal(("a", "1", RemovalCause.Replaced), evt);
     }
 
     [Fact]
-    public void Invalidate_NotifiesExplicit()
+    public void Invalidate_NotifiesRemovalWithExplicitCause()
     {
         var listener = new RecordingListener();
         var cache = Cache.NewBuilder<string, string>()
@@ -78,17 +80,20 @@ public sealed class UnboundedCacheTest
 
         cache.Put("a", "1");
         cache.Invalidate("a");
+
         Assert.Null(cache.GetIfPresent("a"));
-        Assert.Single(listener.Events);
-        Assert.Equal(("a", "1", RemovalCause.Explicit), listener.Events[0]);
+        var evt = Assert.Single(listener.Events);
+        Assert.Equal(("a", "1", RemovalCause.Explicit), evt);
     }
 
     [Fact]
-    public void PutAll_And_GetAllPresent()
+    public void GetAllPresent_ReturnsOnlyKnownKeys()
     {
         var cache = NewCache(stats: false);
         cache.PutAll(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2", ["c"] = "3" });
+
         var present = cache.GetAllPresent(new[] { "a", "c", "x" });
+
         Assert.Equal(2, present.Count);
         Assert.Equal("1", present["a"]);
         Assert.Equal("3", present["c"]);
@@ -100,7 +105,9 @@ public sealed class UnboundedCacheTest
         var cache = NewCache(stats: false);
         cache.Put("a", "1");
         cache.Put("b", "2");
+
         cache.InvalidateAll();
+
         Assert.Equal(0, cache.EstimatedSize());
     }
 
@@ -108,6 +115,7 @@ public sealed class UnboundedCacheTest
     public void EstimatedSize_TracksEntries()
     {
         var cache = NewCache(stats: false);
+
         Assert.Equal(0, cache.EstimatedSize());
         cache.Put("a", "1");
         cache.Put("b", "2");
@@ -115,7 +123,7 @@ public sealed class UnboundedCacheTest
     }
 
     [Fact]
-    public void Get_IsAtomic_FactoryRunsAtMostOncePerKey()
+    public void Get_UnderContention_RunsFactoryAtMostOncePerKey()
     {
         var cache = NewCache(stats: false);
         int factoryCalls = 0;

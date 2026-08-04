@@ -17,7 +17,7 @@ internal sealed class WriteOrderDeque<E> : AbstractLinkedDeque<E> where E : clas
     public override E? GetNext(E e) => e.GetNextInWriteOrder();
     public override void SetNext(E e, E? next) => e.SetNextInWriteOrder(next);
 
-    /// <summary>Fast-path containment: an element is present iff it is linked or is the head.</summary>
+    /// <summary>An element is present iff it is linked or is the head.</summary>
     public override bool Contains(E e)
         => e.GetPreviousInWriteOrder() != null
            || e.GetNextInWriteOrder() != null

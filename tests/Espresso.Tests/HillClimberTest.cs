@@ -4,15 +4,8 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class HillClimberTest
+public sealed class HillClimberTest : CacheTestBase
 {
-    private static ICache<int, string> NewCache(long maximumSize)
-        => Cache.NewBuilder<int, string>()
-            .MaximumSize(maximumSize)
-            .Executor(DirectExecutor.Instance)
-            .RecordStats()
-            .Build();
-
     private static long Field(ICache<int, string> cache, string name)
     {
         FieldInfo f = cache.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)
@@ -24,19 +17,20 @@ public sealed class HillClimberTest
     private static long MainProtectedMaximum(ICache<int, string> c) => Field(c, "_mainProtectedMaximum");
 
     [Fact]
-    public void InitialWindowRatio_IsOnePercent()
+    public void Build_InitialPartition_UsesOnePercentWindowRatio()
     {
-        var cache = NewCache(10_000);
+        var cache = SizeCache(10_000);
+
         // window = max - 0.99*max = 1% of max; mainProtected = 0.80*(max-window).
         Assert.Equal(100, WindowMaximum(cache));
         Assert.Equal((long)(0.80 * (10_000 - 100)), MainProtectedMaximum(cache));
     }
 
     [Fact]
-    public void WindowPlusMain_InvariantHoldsAfterClimbing()
+    public void Climb_AfterMixedWorkload_KeepsPartitionInvariant()
     {
         const int max = 1_000;
-        var cache = NewCache(max);
+        var cache = SizeCache(max);
 
         var rng = new Random(42);
         for (int round = 0; round < 40; round++)
@@ -54,17 +48,19 @@ public sealed class HillClimberTest
 
         long window = WindowMaximum(cache);
         long mainProtected = MainProtectedMaximum(cache);
+
         Assert.True(window >= 0, $"window {window} negative");
         Assert.True(mainProtected >= 0, $"mainProtected {mainProtected} negative");
         Assert.True(window <= max, $"window {window} exceeds max {max}");
-        Assert.True(window + mainProtected <= max, $"window+protected {window + mainProtected} exceeds max {max}");
+        Assert.True(window + mainProtected <= max,
+            $"window+protected {window + mainProtected} exceeds max {max}");
     }
 
     [Fact]
-    public void Workload_AdaptsTheWindow_FromInitialRatio()
+    public void Climb_UnderRecencyFrequencyWorkload_AdaptsWindowFromInitialRatio()
     {
         const int max = 500;
-        var cache = NewCache(max);
+        var cache = SizeCache(max);
         long initialWindow = WindowMaximum(cache);
 
         // Drive a mixed recency/frequency workload for many sample periods. The climber must move the
@@ -86,17 +82,20 @@ public sealed class HillClimberTest
         }
 
         long window = WindowMaximum(cache);
+
         Assert.True(window != initialWindow,
             $"window {window} did not adapt from its initial {initialWindow}");
         // The adapted partition must remain valid.
-        Assert.True(window >= 0 && window + MainProtectedMaximum(cache) <= max);
+        Assert.True(window >= 0);
+        Assert.True(window + MainProtectedMaximum(cache) <= max);
     }
 
     [Fact]
-    public void Climbing_DoesNotBreakEviction_SizeStaysBounded()
+    public void Climb_UnderHeavyChurn_KeepsSizeBounded()
     {
         const int max = 400;
-        var cache = NewCache(max);
+        var cache = SizeCache(max);
+
         var rng = new Random(7);
         for (int i = 0; i < 200_000; i++)
         {
@@ -107,15 +106,17 @@ public sealed class HillClimberTest
             }
         }
         cache.CleanUp();
+
         Assert.True(cache.EstimatedSize() <= max,
             $"size {cache.EstimatedSize()} exceeded bound {max} after climbing");
     }
 
     [Fact]
-    public void SmallCache_ClimberDoesNotCrash()
+    public void Climb_OnSmallCache_UsesAlternatePathWithoutCrashing()
     {
         // Small caches (<= 512) use the alternate step-decay / sample-ratio path.
-        var cache = NewCache(64);
+        var cache = SizeCache(64);
+
         for (int round = 0; round < 100; round++)
         {
             for (int i = 0; i < 200; i++)
@@ -128,6 +129,7 @@ public sealed class HillClimberTest
             }
             cache.CleanUp();
         }
+
         Assert.True(cache.EstimatedSize() <= 64);
     }
 }

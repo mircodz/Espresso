@@ -1,75 +1,73 @@
 using System;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class BoundedCacheTest
+public sealed class BoundedCacheTest : CacheTestBase
 {
-    // A direct-executor bounded cache makes maintenance observable via CleanUp().
-    private static ICache<int, string> NewSizeCache(long maximumSize)
-        => Cache.NewBuilder<int, string>()
-            .MaximumSize(maximumSize)
-            .Executor(DirectExecutor.Instance)
-            .RecordStats()
-            .Build();
-
     [Fact]
-    public void Put_Get_Basic()
+    public void Put_ThenGet_ReturnsValue()
     {
-        var cache = NewSizeCache(100);
+        var cache = SizeCache(100);
+
         cache.Put(1, "a");
+
         Assert.Equal("a", cache.GetIfPresent(1));
         Assert.Null(cache.GetIfPresent(2));
     }
 
-    [Fact]
-    public void RespectsMaximumSize_AfterCleanUp()
+    [Theory]
+    [InlineData(50)]
+    [InlineData(100)]
+    [InlineData(1000)]
+    public void Put_BeyondMaximum_RespectsBoundAfterCleanUp(int max)
     {
-        const int max = 100;
-        var cache = NewSizeCache(max);
-        for (int i = 0; i < 10 * max; i++)
-        {
-            cache.Put(i, "v" + i);
-        }
+        var cache = SizeCache(max);
+
+        Fill(cache, 10 * max);
         cache.CleanUp();
-        Assert.True(cache.EstimatedSize() <= max,
-            $"size {cache.EstimatedSize()} should be <= {max}");
+
+        Assert.True(cache.EstimatedSize() <= max, $"size {cache.EstimatedSize()} exceeds {max}");
     }
 
     [Fact]
-    public void Get_ComputesAndCaches()
+    public void Get_WithFactory_ComputesOnceAndCaches()
     {
-        var cache = NewSizeCache(100);
+        var cache = SizeCache(100);
         int calls = 0;
+
         Assert.Equal("v1", cache.Get(1, k => { calls++; return "v" + k; }));
-        Assert.Equal("v1", cache.Get(1, k => { calls++; return "other"; }));
+        Assert.Equal("v1", cache.Get(1, _ => { calls++; return "other"; }));
         Assert.Equal(1, calls);
     }
 
     [Fact]
-    public void Invalidate_Removes()
+    public void Invalidate_RemovesEntry()
     {
-        var cache = NewSizeCache(100);
+        var cache = SizeCache(100);
         cache.Put(1, "a");
+
         cache.Invalidate(1);
+
         Assert.Null(cache.GetIfPresent(1));
         cache.CleanUp();
         Assert.Equal(0, cache.EstimatedSize());
     }
 
     [Fact]
-    public void FrequentKeys_SurviveEviction()
+    public void FrequentKeys_SurviveColdFlood()
     {
         const int max = 100;
-        var cache = NewSizeCache(max);
+        var cache = SizeCache(max);
 
-        // Establish a hot set and make it frequent.
+        // Establish a hot set and raise its frequency.
         for (int round = 0; round < 20; round++)
         {
             for (int i = 0; i < 10; i++)
             {
                 cache.Put(i, "hot" + i);
-                cache.GetIfPresent(i); // raise frequency
+                cache.GetIfPresent(i);
             }
         }
         cache.CleanUp();
@@ -81,7 +79,6 @@ public sealed class BoundedCacheTest
         }
         cache.CleanUp();
 
-        // Most of the hot set should survive TinyLFU admission.
         int survivors = 0;
         for (int i = 0; i < 10; i++)
         {
@@ -91,14 +88,10 @@ public sealed class BoundedCacheTest
     }
 
     [Fact]
-    public void WeightedEviction_RespectsMaximumWeight()
+    public void WeightedCache_RespectsMaximumWeight()
     {
         const int maxWeight = 1000;
-        var cache = Cache.NewBuilder<int, string>()
-            .MaximumWeight(maxWeight)
-            .Weigher(new FuncWeigher<int, string>((_, v) => v.Length))
-            .Executor(DirectExecutor.Instance)
-            .Build();
+        var cache = WeightCache(maxWeight, (_, v) => v.Length);
 
         for (int i = 0; i < 500; i++)
         {
@@ -106,19 +99,15 @@ public sealed class BoundedCacheTest
         }
         cache.CleanUp();
 
-        // Total weight must stay within bound: at most ~maxWeight/10 entries.
+        // Total weight stays bounded: at most ~maxWeight/10 entries.
         Assert.True(cache.EstimatedSize() <= (maxWeight / 10) + 1,
             $"size {cache.EstimatedSize()} exceeds weight bound");
     }
 
     [Fact]
-    public void ZeroWeight_PinsEntry()
+    public void ZeroWeightEntry_IsPinnedAgainstEviction()
     {
-        var cache = Cache.NewBuilder<int, string>()
-            .MaximumWeight(100)
-            .Weigher(new FuncWeigher<int, string>((k, _) => k == 0 ? 0 : 10))
-            .Executor(DirectExecutor.Instance)
-            .Build();
+        var cache = WeightCache(100, (k, _) => k == 0 ? 0 : 10);
 
         cache.Put(0, "pinned");
         for (int i = 1; i < 200; i++)
@@ -127,40 +116,36 @@ public sealed class BoundedCacheTest
         }
         cache.CleanUp();
 
-        // The zero-weight entry is skipped during eviction and must remain.
         Assert.Equal("pinned", cache.GetIfPresent(0));
     }
 
     [Fact]
-    public void Stats_RecordsEvictions()
+    public void Eviction_IsRecordedInStats()
     {
         const int max = 50;
-        var cache = NewSizeCache(max);
-        for (int i = 0; i < 10 * max; i++)
-        {
-            cache.Put(i, "v" + i);
-        }
+        var cache = SizeCache(max);
+
+        Fill(cache, 10 * max);
         cache.CleanUp();
+
         Assert.True(cache.Stats().EvictionCount > 0);
     }
 
     [Fact]
-    public void IntKeys_WorkWithoutIssue()
+    public void IntKeys_RoundTripThroughBoxedKeyPath()
     {
-        // Exercises the box-per-entry key path in the node.
-        var cache = NewSizeCache(1000);
-        for (int i = 0; i < 500; i++)
-        {
-            cache.Put(i, "v" + i);
-        }
+        var cache = SizeCache(1000);
+
+        Fill(cache, 500);
+
         Assert.Equal("v250", cache.GetIfPresent(250));
     }
 
     [Fact]
-    public void ConcurrentPutGet_StaysWithinBound_NoCorruption()
+    public void ConcurrentPutGet_StaysWithinBoundAndReadable()
     {
         const int max = 500;
-        // Real thread-pool executor: exercises the async drain/maintenance path under contention.
+        // Real thread-pool executor exercises the async drain/maintenance path under contention.
         var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(max)
             .RecordStats()
@@ -168,7 +153,7 @@ public sealed class BoundedCacheTest
 
         const int threads = 8;
         const int perThread = 50_000;
-        System.Threading.Tasks.Parallel.For(0, threads, t =>
+        Parallel.For(0, threads, t =>
         {
             var rng = new Random(t);
             for (int i = 0; i < perThread; i++)
@@ -186,10 +171,7 @@ public sealed class BoundedCacheTest
         });
 
         cache.CleanUp();
-        // The core invariant: after maintenance settles, the cache respects its bound and is readable.
-        Assert.True(cache.EstimatedSize() <= max,
-            $"size {cache.EstimatedSize()} should be <= {max} after cleanup");
-        // And it is still functional.
+        Assert.True(cache.EstimatedSize() <= max, $"size {cache.EstimatedSize()} exceeds {max}");
         cache.Put(999999, "final");
         Assert.Equal("final", cache.GetIfPresent(999999));
     }

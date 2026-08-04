@@ -68,14 +68,14 @@ public sealed class StatsTest
         counter.RecordLoadFailure(30);
         counter.RecordEviction(4, RemovalCause.Size);
 
-        var s = counter.Snapshot();
-        Assert.Equal(3, s.HitCount);
-        Assert.Equal(2, s.MissCount);
-        Assert.Equal(1, s.LoadSuccessCount);
-        Assert.Equal(1, s.LoadFailureCount);
-        Assert.Equal(80, s.TotalLoadTime);
-        Assert.Equal(1, s.EvictionCount);
-        Assert.Equal(4, s.EvictionWeight);
+        var stats = counter.Snapshot();
+        Assert.Equal(3, stats.HitCount);
+        Assert.Equal(2, stats.MissCount);
+        Assert.Equal(1, stats.LoadSuccessCount);
+        Assert.Equal(1, stats.LoadFailureCount);
+        Assert.Equal(80, stats.TotalLoadTime);
+        Assert.Equal(1, stats.EvictionCount);
+        Assert.Equal(4, stats.EvictionWeight);
     }
 
     [Fact]

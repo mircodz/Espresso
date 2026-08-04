@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Espresso.Internal;
 using Xunit;
 
@@ -164,7 +165,7 @@ public sealed class FrequencySketchTest
         }
         foreach (long slot in sketch.table!)
         {
-            Assert.Equal(64, System.Numerics.BitOperations.PopCount((ulong)slot));
+            Assert.Equal(64, BitOperations.PopCount((ulong)slot));
         }
 
         sketch.Reset();

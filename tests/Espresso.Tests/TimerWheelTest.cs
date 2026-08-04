@@ -9,15 +9,13 @@ namespace Espresso.Tests;
 
 public sealed class TimerWheelTest
 {
-    private static readonly long[] Spans =
-        (long[])typeof(TimerWheel<long, string>)
-            .GetField("Spans", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
-    private static readonly int[] Shift =
-        (int[])typeof(TimerWheel<long, string>)
-            .GetField("Shift", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
-    private static readonly int[] Buckets =
-        (int[])typeof(TimerWheel<long, string>)
-            .GetField("Buckets", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
+    private static T StaticField<T>(string name)
+        => (T)typeof(TimerWheel<long, string>)
+            .GetField(name, BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
+
+    private static readonly long[] Spans = StaticField<long[]>("Spans");
+    private static readonly int[] Shift = StaticField<int[]>("Shift");
+    private static readonly int[] Buckets = StaticField<int[]>("Buckets");
     private const int ExpirationThreshold = 1_000;
 
     private static Node<long, string>[][] Wheel(TimerWheel<long, string> wheel)

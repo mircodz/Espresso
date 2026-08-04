@@ -55,23 +55,25 @@ public sealed class AsyncLoadingCacheTest
     }
 
     [Fact]
-    public async Task Get_LoadsViaLoader()
+    public async Task Get_SameKeyTwice_LoadsOnce()
     {
         var cache = NewLoading(k => "v" + k, out var loader);
+
         Assert.Equal("v1", await cache.Get(1));
         Assert.Equal("v1", await cache.Get(1)); // cached
+
         Assert.Equal(1, loader.LoadCalls);
     }
 
     [Fact]
-    public async Task GetAll_BulkLoadsMissingKeys_InOneCall()
+    public async Task GetAll_MissingKeys_BulkLoadedInOneCall()
     {
         var cache = NewLoading(k => "v" + k, out var loader);
-        // Pre-cache one key.
         await cache.Get(2);
         int loadsAfterWarmup = loader.LoadCalls;
 
         IReadOnlyDictionary<int, string> all = await cache.GetAll(new[] { 1, 2, 3, 4 });
+
         Assert.Equal(4, all.Count);
         Assert.Equal("v1", all[1]);
         Assert.Equal("v3", all[3]);
@@ -81,20 +83,24 @@ public sealed class AsyncLoadingCacheTest
     }
 
     [Fact]
-    public async Task GetAll_MixesCachedAndLoaded()
+    public async Task GetAll_CachedAndLoadedKeys_ReturnsAllValues()
     {
         var cache = NewLoading(k => "v" + k, out _);
         await cache.Get(1);
+
         var all = await cache.GetAll(new[] { 1, 2, 3 });
+
         Assert.Equal(new[] { "v1", "v2", "v3" }, new[] { all[1], all[2], all[3] });
     }
 
     [Fact]
-    public async Task GetAll_MissingKeyOmitted()
+    public async Task GetAll_LoaderReturnsNull_KeyOmittedAndNotCached()
     {
         // Loader returns null for key 2 → it is not in the result and not cached.
         var cache = NewLoading(k => k == 2 ? null : "v" + k, out _);
+
         var all = await cache.GetAll(new[] { 1, 2, 3 });
+
         Assert.False(all.ContainsKey(2));
         Assert.Equal(2, all.Count);
         await WaitUntil(() => cache.GetIfPresent(2) == null);
@@ -144,6 +150,7 @@ public sealed class AsyncLoadingCacheTest
             .BuildAsync(loader);
 
         var all = await cache.GetAll(new[] { 1, 2 });
+
         Assert.Empty(all);
         Assert.Equal(1, cache.Stats().LoadFailureCount);
         Assert.Equal(0, cache.Stats().LoadSuccessCount);
@@ -167,6 +174,7 @@ public sealed class AsyncLoadingCacheTest
             .BuildAsync(loader);
 
         await Assert.ThrowsAnyAsync<Exception>(async () => await cache.GetAll(new[] { 1, 2, 3 }));
+
         await WaitUntil(() => cache.GetIfPresent(1) == null);
         Assert.Null(cache.GetIfPresent(1));
         Assert.Null(cache.GetIfPresent(2));
@@ -181,10 +189,12 @@ public sealed class AsyncLoadingCacheTest
     }
 
     [Fact]
-    public async Task GetAll_DuplicateKeysIgnored()
+    public async Task GetAll_DuplicateKeys_Deduplicated()
     {
         var cache = NewLoading(k => "v" + k, out _);
+
         var all = await cache.GetAll(new[] { 1, 1, 1 });
+
         Assert.Single(all);
         Assert.Equal("v1", all[1]);
     }
@@ -226,7 +236,7 @@ public sealed class AsyncLoadingCacheTest
     }
 
     [Fact]
-    public async Task RefreshAfterWrite_Debounced_SingleReload()
+    public async Task RefreshAfterWrite_CoincidentAccesses_CoalesceIntoSingleReload()
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "v");
@@ -312,15 +322,19 @@ public sealed class AsyncLoadingCacheTest
             => Task.FromResult<IReadOnlyDictionary<int, string>>(new Dictionary<int, string>());
     }
 
-    // Regression (#6): a FAILED async refresh reload must preserve the last good value — refresh is
-    // best-effort and must never remove the entry on a transient reload error.
-    [Fact]
-    public async Task RefreshAfterWrite_FailingReload_PreservesOldValue()
+    // Regression (#6): a best-effort async refresh reload that FAILS or resolves to NULL must preserve
+    // the last good value — refresh must never remove the entry on a transient reload error.
+    [Theory]
+    [InlineData(false)] // reload faults
+    [InlineData(true)]  // reload resolves to null
+    public async Task RefreshAfterWrite_BadReload_PreservesOldValue(bool nullReload)
     {
         var ticker = new FakeTicker();
-        bool failReload = false;
-        var loader = new RefreshLoader(k => failReload
-            ? Task.FromException<string?>(new InvalidOperationException("reload boom"))
+        bool badReload = false;
+        var loader = new RefreshLoader(k => badReload
+            ? (nullReload
+                ? Task.FromResult<string?>(null)
+                : Task.FromException<string?>(new InvalidOperationException("reload boom")))
             : Task.FromResult<string?>("v1"));
         var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(TimeSpan.FromMinutes(1))
@@ -331,38 +345,12 @@ public sealed class AsyncLoadingCacheTest
 
         Assert.Equal("v1", await cache.Get(1));
 
-        failReload = true;
+        badReload = true;
         ticker.Advance(TimeSpan.FromSeconds(61));
-        _ = cache.GetIfPresent(1); // triggers a reload that faults
+        _ = cache.GetIfPresent(1); // triggers a reload that faults / resolves to null
         await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
 
         // The entry must still be present with the old value (not removed).
-        Task<string>? present = cache.GetIfPresent(1);
-        Assert.NotNull(present);
-        Assert.Equal("v1", await present!);
-    }
-
-    // Regression (#6): a NULL async refresh reload must likewise preserve the old value.
-    [Fact]
-    public async Task RefreshAfterWrite_NullReload_PreservesOldValue()
-    {
-        var ticker = new FakeTicker();
-        bool nullReload = false;
-        var loader = new RefreshLoader(k => Task.FromResult<string?>(nullReload ? null : "v1"));
-        var cache = Cache.NewBuilder<int, string>()
-            .RefreshAfterWrite(TimeSpan.FromMinutes(1))
-            .Ticker(ticker.Read)
-            .Executor(DirectExecutor.Instance)
-            .RecordStats()
-            .BuildAsync(loader);
-
-        Assert.Equal("v1", await cache.Get(1));
-
-        nullReload = true;
-        ticker.Advance(TimeSpan.FromSeconds(61));
-        _ = cache.GetIfPresent(1); // triggers a reload that resolves to null
-        await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
-
         Task<string>? present = cache.GetIfPresent(1);
         Assert.NotNull(present);
         Assert.Equal("v1", await present!);

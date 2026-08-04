@@ -1882,7 +1882,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 if (onlyIfAbsent)
                 {
-                    // Optimistic fast path: a live existing value short-circuits without locking.
+                    // A live existing value short-circuits without locking.
                     V? currentValue = prior.Value;
                     long readNow = _ticker.Read();
                     if (currentValue != null && !HasExpired(prior, readNow))

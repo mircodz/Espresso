@@ -37,8 +37,8 @@ public sealed class BoundedBufferTest
         var buffer = new BoundedBuffer<string>();
         for (int i = 0; i < BoundedBuffer<string>.BufferSize; i++)
         {
-            int r = buffer.Offer(Item);
-            Assert.True(r == BufferResult.Success || r == BufferResult.Full);
+            int result = buffer.Offer(Item);
+            Assert.True(result == BufferResult.Success || result == BufferResult.Full);
         }
         long read = 0;
         buffer.DrainTo(_ => read++);

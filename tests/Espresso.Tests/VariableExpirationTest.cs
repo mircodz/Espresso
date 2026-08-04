@@ -1,9 +1,10 @@
 using System;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class VariableExpirationTest
+public sealed class VariableExpirationTest : CacheTestBase
 {
     private sealed class FakeTicker
     {
@@ -41,7 +42,7 @@ public sealed class VariableExpirationTest
             .Build();
 
     [Fact]
-    public void ExpiresAfterCreateDuration()
+    public void Get_AfterCreateDurationElapses_ReturnsNull()
     {
         var ticker = new FakeTicker();
         var cache = New(new ControllableExpiry { CreateNanos = TimeSpan.FromMinutes(1).Ticks * 100L }, ticker);
@@ -56,7 +57,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void ReadExtendsDuration()
+    public void Read_ResetsExpirationDuration()
     {
         var ticker = new FakeTicker();
         var expiry = new ControllableExpiry
@@ -84,7 +85,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void UpdateChangesDuration()
+    public void Update_ChangesExpirationDuration()
     {
         var ticker = new FakeTicker();
         var expiry = new ControllableExpiry
@@ -106,7 +107,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void MaxValueDurationNeverExpires()
+    public void Get_WithMaxValueDuration_NeverExpires()
     {
         var ticker = new FakeTicker();
         var cache = New(new ControllableExpiry { CreateNanos = long.MaxValue }, ticker);
@@ -117,7 +118,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void ExpiredEntryFiresRemovalWithExpiredCause()
+    public void Expiration_FiresRemovalWithExpiredCause()
     {
         var ticker = new FakeTicker();
         RemovalCause? cause = null;
@@ -137,7 +138,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void CombinedWithMaximumSize()
+    public void Expiry_CombinedWithMaximumSize_RespectsBound()
     {
         var ticker = new FakeTicker();
         var cache = Cache.NewBuilder<int, string>()
@@ -152,11 +153,11 @@ public sealed class VariableExpirationTest
             cache.Put(i, "v" + i);
         }
         cache.CleanUp();
-        Assert.True(cache.EstimatedSize() <= 10, $"size {cache.EstimatedSize()} should be bounded by 10");
+        Assert.True(cache.EstimatedSize() <= 10, $"size {cache.EstimatedSize()} exceeds 10");
     }
 
     [Fact]
-    public void EagerMaintenanceEvictsWithoutAccess()
+    public void CleanUp_ExpiresEntriesWithoutAccess()
     {
         var ticker = new FakeTicker();
         var cache = New(new ControllableExpiry { CreateNanos = TimeSpan.FromSeconds(5).Ticks * 100L }, ticker);
@@ -170,7 +171,7 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void FuncExpiry_UniformDuration()
+    public void FuncExpiry_UniformDuration_ExpiresAfterDuration()
     {
         var ticker = new FakeTicker();
         var cache = Cache.NewBuilder<int, string>()
@@ -187,16 +188,18 @@ public sealed class VariableExpirationTest
     }
 
     [Fact]
-    public void CannotCombineExpireAfterWithFixedExpiry()
+    public void ExpireAfter_CombinedWithExpireAfterWrite_Throws()
     {
-        Assert.Throws<InvalidOperationException>(() =>
+        Action act = () =>
             Cache.NewBuilder<int, string>()
                 .ExpireAfterWrite(TimeSpan.FromMinutes(1))
-                .ExpireAfter(new FuncExpiry<int, string>((_, _) => TimeSpan.FromSeconds(30))));
+                .ExpireAfter(new FuncExpiry<int, string>((_, _) => TimeSpan.FromSeconds(30)));
+
+        Assert.Throws<InvalidOperationException>(act);
     }
 
     [Fact]
-    public async System.Threading.Tasks.Task Scheduler_ProactivelyEvictsWithoutAccess()
+    public async Task Scheduler_ProactivelyEvictsWithoutAccess()
     {
         // With a real scheduler, an expired entry is evicted by a background maintenance tick even
         // though nothing ever touches the cache after the write. Uses the system clock (not a fake
@@ -212,7 +215,7 @@ public sealed class VariableExpirationTest
         // Do NOT access the entry; the pacer must drive its removal on its own.
         for (int i = 0; i < 100 && cache.EstimatedSize() > 0; i++)
         {
-            await System.Threading.Tasks.Task.Delay(50);
+            await Task.Delay(50);
         }
         Assert.Equal(0, cache.EstimatedSize());
     }
@@ -233,7 +236,8 @@ public sealed class VariableExpirationTest
         Assert.Equal("original", cache.GetIfPresent(1));
 
         throwOnUpdate = true;
-        Assert.Throws<InvalidOperationException>(() => cache.Put(1, "replacement"));
+        Action act = () => cache.Put(1, "replacement");
+        Assert.Throws<InvalidOperationException>(act);
 
         // The failed update must not have committed the new value.
         Assert.Equal("original", cache.GetIfPresent(1));

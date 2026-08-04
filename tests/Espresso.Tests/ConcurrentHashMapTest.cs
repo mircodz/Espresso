@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Espresso.Internal;
@@ -380,9 +381,9 @@ public sealed class ConcurrentHashMapTest
     private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
         where TKey : notnull where TValue : class
     {
-        var f = typeof(ConcurrentHashMap<TKey, TValue>).GetField(
-            "_table", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        return (Array)f.GetValue(map)!;
+        var field = typeof(ConcurrentHashMap<TKey, TValue>).GetField(
+            "_table", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Array)field.GetValue(map)!;
     }
 
     private static int BinIndexOf<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map, TKey key)

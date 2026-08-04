@@ -4,7 +4,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class RefreshAfterWriteTest
+public sealed class RefreshAfterWriteTest : CacheTestBase
 {
     private sealed class FakeTicker
     {
@@ -64,6 +64,7 @@ public sealed class RefreshAfterWriteTest
 
         cache.Put(1, "old");
         ticker.Advance(TimeSpan.FromSeconds(61));
+
         // The triggering access still returns the old value.
         Assert.Equal("old", cache.GetIfPresent(1));
     }
@@ -85,6 +86,7 @@ public sealed class RefreshAfterWriteTest
             ticker.Advance(TimeSpan.FromSeconds(10));
             cache.GetIfPresent(1);
         }
+
         Assert.Equal(0, loader.Calls); // 50s < 60s, never refreshed
     }
 
@@ -101,6 +103,7 @@ public sealed class RefreshAfterWriteTest
 
         cache.Put(1, "a");
         ticker.Advance(TimeSpan.FromSeconds(61));
+
         // Multiple accesses at the same instant should coalesce into one reload.
         cache.GetIfPresent(1);
         cache.GetIfPresent(1);
@@ -122,6 +125,7 @@ public sealed class RefreshAfterWriteTest
         cache.Put(1, "old");
         ticker.Advance(TimeSpan.FromSeconds(61));
         cache.GetIfPresent(1);
+
         // A null reload removes the entry (does not keep the stale value).
         Assert.Null(cache.GetIfPresent(1));
     }
@@ -192,7 +196,7 @@ public sealed class RefreshAfterWriteTest
         cache.GetIfPresent(1); // triggers a reload that throws
 
         Assert.Equal("v1", cache.GetIfPresent(1)); // stale value preserved
-        Assert.True(cache.Stats().LoadFailureCount >= 1);
+        Assert.True(cache.Stats().LoadFailureCount >= 1, $"LoadFailureCount {cache.Stats().LoadFailureCount} should be >= 1");
     }
 
     // Regression: a weighted sync refresh that changes the entry weight must propagate the weight
@@ -227,7 +231,7 @@ public sealed class RefreshAfterWriteTest
             string? v = cache.GetIfPresent(i);
             if (v != null) totalWeight += v.Length;
         }
-        Assert.True(totalWeight <= 40, $"live weight {totalWeight} exceeded bound 40 (weightedSize drift)");
+        Assert.True(totalWeight <= 40, "live weight must respect bound 40 (no weightedSize drift)");
     }
 
     // Regression: when an EXPIRED entry is refreshed in place on the loader path, the old value's

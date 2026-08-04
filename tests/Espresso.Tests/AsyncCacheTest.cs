@@ -21,26 +21,36 @@ public sealed class AsyncCacheTest
             .RecordStats()
             .BuildAsync();
 
+    private static async Task WaitUntil(Func<bool> condition)
+    {
+        for (int i = 0; i < 200; i++)
+        {
+            if (condition()) return;
+            await Task.Delay(5);
+        }
+    }
+
     [Fact]
-    public async Task Get_CompletesWithValue()
+    public async Task Get_WithLoader_CompletesWithValue()
     {
         var cache = NewCache();
+
         Task<string> future = cache.Get(1, k => "v" + k);
+
         Assert.Equal("v1", await future);
     }
 
     [Fact]
-    public void Get_ConcurrentSameKey_ReturnsSameFuture_CoalescesLoad()
+    public void Get_ConcurrentSameKey_ReturnsSameFutureAndCoalescesLoad()
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
         int loaderCalls = 0;
 
-        // Use the Task-returning overload so we control completion timing.
-        Task<string> f1 = cache.Get(1, (k, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
-        Task<string> f2 = cache.Get(1, (k, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
+        // Task-returning overload lets the test control completion timing.
+        Task<string> f1 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
+        Task<string> f2 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
 
-        // Same in-flight future returned; the second Get did not start a new load.
         Assert.Same(f1, f2);
         Assert.Equal(1, loaderCalls);
 
@@ -49,11 +59,11 @@ public sealed class AsyncCacheTest
     }
 
     [Fact]
-    public void InFlightFuture_IsVisible_AndCounted()
+    public void Get_WhileLoading_FutureIsVisibleAndCounted()
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (k, _) => gate.Task!);
+        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
 
         // While loading, the entry is present and counted.
         Assert.NotNull(cache.GetIfPresent(1));
@@ -65,11 +75,11 @@ public sealed class AsyncCacheTest
     }
 
     [Fact]
-    public async Task FailedLoad_RemovesEntry()
+    public async Task Get_FailedLoad_RemovesEntry()
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (k, _) => gate.Task!);
+        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
 
         Assert.NotNull(cache.GetIfPresent(1)); // present while loading
         gate.SetException(new InvalidOperationException("boom"));
@@ -83,27 +93,30 @@ public sealed class AsyncCacheTest
     }
 
     [Fact]
-    public async Task NullLoad_RemovesEntry()
+    public async Task Get_NullLoad_RemovesEntry()
     {
         var cache = NewCache();
-        // A synchronous mapping returning null.
+
         Task<string> f = cache.Get(1, k => null);
+
         await Assert.ThrowsAnyAsync<Exception>(async () => await f);
         Assert.Null(cache.GetIfPresent(1));
     }
 
     [Fact]
-    public async Task Put_StoresCompletedFuture()
+    public async Task Put_CompletedFuture_IsStored()
     {
         var cache = NewCache();
+
         cache.Put(1, Task.FromResult("v"));
+
         Task<string>? f = cache.GetIfPresent(1);
         Assert.NotNull(f);
         Assert.Equal("v", await f!);
     }
 
     [Fact]
-    public async Task CompletionResetsExpiryTimer_FromCompletionNotInsert()
+    public async Task Get_LongRunningLoad_ExpiryTimerStartsFromCompletionNotInsert()
     {
         var ticker = new FakeTicker();
         var cache = Cache.NewBuilder<int, string>()
@@ -113,15 +126,14 @@ public sealed class AsyncCacheTest
             .BuildAsync();
 
         var gate = new TaskCompletionSource<string>();
-        cache.Get(1, (k, _) => gate.Task!);
+        cache.Get(1, (_, _) => gate.Task!);
 
-        // Loads for a long time — longer than the expiry duration. The in-flight entry must NOT expire.
+        // Loads for longer than the expiry duration. The in-flight entry must NOT expire.
         ticker.Advance(TimeSpan.FromMinutes(5));
         Assert.NotNull(cache.GetIfPresent(1));
 
         // Completion happens at t=5m; the 1-minute timer starts NOW, not from insertion.
         gate.SetResult("v");
-        // Wait for the completion continuation (Replace resets the timers) to run.
         Task<string> stored = cache.GetIfPresent(1)!;
         Assert.Equal("v", await stored);
         await WaitUntil(() => cache.Stats().LoadSuccessCount == 1);
@@ -134,17 +146,8 @@ public sealed class AsyncCacheTest
         Assert.Null(cache.GetIfPresent(1));       // now expired (from completion time)
     }
 
-    private static async Task WaitUntil(Func<bool> condition)
-    {
-        for (int i = 0; i < 200; i++)
-        {
-            if (condition()) return;
-            await Task.Delay(5);
-        }
-    }
-
     [Fact]
-    public void SlowLoad_PinnedAgainstSizeEviction()
+    public void Get_SlowLoad_PinnedAgainstSizeEviction()
     {
         var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(10)
@@ -152,7 +155,7 @@ public sealed class AsyncCacheTest
             .BuildAsync();
 
         var gate = new TaskCompletionSource<string>();
-        cache.Get(0, (k, _) => gate.Task!); // in-flight, weight 0 → pinned
+        cache.Get(0, (_, _) => gate.Task!); // in-flight, weight 0 → pinned
 
         // Flood far past the size bound with completed entries.
         for (int i = 1; i < 500; i++)
@@ -175,10 +178,10 @@ public sealed class AsyncCacheTest
         await f;
         await WaitUntil(() => cache.Stats().LoadSuccessCount == 1);
 
-        var s = cache.Stats();
-        Assert.Equal(1, s.LoadSuccessCount);   // not double-counted
-        Assert.Equal(0, s.LoadFailureCount);
-        Assert.Equal(1, s.MissCount);
+        var stats = cache.Stats();
+        Assert.Equal(1, stats.LoadSuccessCount);   // not double-counted
+        Assert.Equal(0, stats.LoadFailureCount);
+        Assert.Equal(1, stats.MissCount);
     }
 
     [Fact]
@@ -186,13 +189,14 @@ public sealed class AsyncCacheTest
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (k, _) => gate.Task!);
+        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
         gate.SetException(new InvalidOperationException("x"));
+
         await Assert.ThrowsAnyAsync<Exception>(async () => await f);
         await WaitUntil(() => cache.Stats().LoadFailureCount == 1);
 
-        var s = cache.Stats();
-        Assert.Equal(0, s.LoadSuccessCount);   // a failed load must NOT record a success
-        Assert.Equal(1, s.LoadFailureCount);
+        var stats = cache.Stats();
+        Assert.Equal(0, stats.LoadSuccessCount);   // a failed load must NOT record a success
+        Assert.Equal(1, stats.LoadFailureCount);
     }
 }

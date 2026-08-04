@@ -17,7 +17,7 @@ internal sealed class AccessOrderDeque<E> : AbstractLinkedDeque<E> where E : cla
     public override E? GetNext(E e) => e.GetNextInAccessOrder();
     public override void SetNext(E e, E? next) => e.SetNextInAccessOrder(next);
 
-    /// <summary>Fast-path containment: an element is present iff it is linked or is the head.</summary>
+    /// <summary>An element is present iff it is linked or is the head.</summary>
     public override bool Contains(E e)
         => e.GetPreviousInAccessOrder() != null
            || e.GetNextInAccessOrder() != null

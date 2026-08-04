@@ -3,7 +3,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class LoadingCacheTest
+public sealed class LoadingCacheTest : CacheTestBase
 {
     private sealed class CountingLoader(Func<string, string?> fn) : ICacheLoader<string, string>
     {
@@ -23,29 +23,33 @@ public sealed class LoadingCacheTest
     }
 
     [Fact]
-    public void Get_LoadsViaLoader()
+    public void Get_MissingKey_LoadsOnceThenCaches()
     {
         var cache = NewLoading(k => "v-" + k, out var loader);
+
         Assert.Equal("v-a", cache.Get("a"));
-        Assert.Equal("v-a", cache.Get("a")); // cached now
+        Assert.Equal("v-a", cache.Get("a"));
         Assert.Equal(1, loader.Calls);
     }
 
     [Fact]
-    public void Get_NullLoad_LeavesAbsent()
+    public void Get_LoaderReturnsNull_LeavesKeyAbsentAndRecordsFailure()
     {
         var cache = NewLoading(_ => null, out _);
+
         Assert.Null(cache.Get("a"));
         Assert.Equal(0, cache.EstimatedSize());
         Assert.Equal(1, cache.Stats().LoadFailureCount);
     }
 
     [Fact]
-    public void GetAll_LoadsMissingKeys()
+    public void GetAll_MixedPresence_LoadsOnlyMissingKeys()
     {
         var cache = NewLoading(k => "v-" + k, out var loader);
         cache.Put("a", "existing");
+
         var all = cache.GetAll(new[] { "a", "b", "c" });
+
         Assert.Equal("existing", all["a"]);
         Assert.Equal("v-b", all["b"]);
         Assert.Equal("v-c", all["c"]);
@@ -53,19 +57,20 @@ public sealed class LoadingCacheTest
     }
 
     [Fact]
-    public void Refresh_ReloadsAndReplaces()
+    public void Refresh_LoaderReturnsNewValue_ReplacesExisting()
     {
         int version = 1;
-        var cache = NewLoading(k => $"{k}-v{version}", out var loader);
+        var cache = NewLoading(k => $"{k}-v{version}", out _);
         Assert.Equal("a-v1", cache.Get("a"));
 
         version = 2;
         cache.Refresh("a");
+
         Assert.Equal("a-v2", cache.GetIfPresent("a"));
     }
 
     [Fact]
-    public void Refresh_NullLoad_KeepsPrevious()
+    public void Refresh_LoaderReturnsNull_KeepsPreviousValue()
     {
         bool returnNull = false;
         var cache = NewLoading(k => returnNull ? null : "v-" + k, out _);
@@ -73,13 +78,17 @@ public sealed class LoadingCacheTest
 
         returnNull = true;
         cache.Refresh("a");
-        Assert.Equal("v-a", cache.GetIfPresent("a")); // unchanged
+
+        Assert.Equal("v-a", cache.GetIfPresent("a"));
     }
 
     [Fact]
-    public void ManualCache_Get_Throws()
+    public void Get_OnManualCacheWithoutLoader_Throws()
     {
         var cache = (ILoadingCache<string, string>)Cache.NewBuilder<string, string>().Build();
-        Assert.Throws<InvalidOperationException>(() => cache.Get("a"));
+
+        var act = () => cache.Get("a");
+
+        Assert.Throws<InvalidOperationException>(act);
     }
 }

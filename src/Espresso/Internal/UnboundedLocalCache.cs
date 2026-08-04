@@ -47,7 +47,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     {
         ArgumentNullException.ThrowIfNull(mappingFunction);
 
-        // Fast path: a present value is a hit and never runs the function.
+        // A present value is a hit and never runs the function.
         V? current = _data.GetOrDefault(key);
         if (current != null)
         {

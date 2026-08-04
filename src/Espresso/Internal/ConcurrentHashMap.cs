@@ -1703,8 +1703,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     /// Weakly-consistent enumeration over live entries. On
     /// encountering a <see cref="ForwardingNode"/> (a bin already migrated by a concurrent resize) it
     /// descends into the new table and saves the current position on a small stack, so every entry is
-    /// visited at most once. (The previous implementation restarted from bin 0 of the doubled table,
-    /// re-yielding every already-visited entry.)
+    /// visited at most once.
     /// </summary>
     public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator()
     {

@@ -184,14 +184,13 @@ public sealed class LinkedDequeTest
     [Fact]
     public void Enumerator_FailsFast_OnStructuralModification()
     {
-        var (deque, items) = Populate(3);
+        var (deque, _) = Populate(3);
         Assert.Throws<InvalidOperationException>(() =>
         {
             foreach (var _ in deque)
             {
-                deque.OfferLast(new Element(100)); // structural mod mid-iteration
+                deque.OfferLast(new Element(100));
             }
         });
-        GC.KeepAlive(items);
     }
 }

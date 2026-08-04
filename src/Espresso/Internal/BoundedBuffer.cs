@@ -31,7 +31,6 @@ internal sealed class BoundedBuffer<E> where E : class
     internal const int BufferSize = 128;
     internal const int Mask = BufferSize - 1;
 
-    /// <summary>Number of CPUs.</summary>
     private static readonly int NCpu = Environment.ProcessorCount;
 
     /// <summary>The bound on the table size.</summary>

@@ -142,7 +142,7 @@ public sealed class CacheStats
         return result;
     }
 
-    /// <summary>Returns a string representation of these statistics.</summary>
+    /// <inheritdoc/>
     public override string ToString()
         => $"CacheStats{{hitCount={_hitCount}, missCount={_missCount}, "
            + $"loadSuccessCount={_loadSuccessCount}, loadFailureCount={_loadFailureCount}, "

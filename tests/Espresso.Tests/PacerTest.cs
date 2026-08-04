@@ -124,10 +124,10 @@ public sealed class PacerTest
         var scheduler = new RecordingScheduler();
         var pacer = new Pacer(scheduler);
         pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
-        var f = scheduler.Futures[0];
+        var future = scheduler.Futures[0];
 
         pacer.Cancel();
-        Assert.True(f.Cancelled);
+        Assert.True(future.Cancelled);
         Assert.Equal(0L, pacer.NextFireTime);
         Assert.False(pacer.IsScheduled);
     }

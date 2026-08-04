@@ -3,7 +3,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-public sealed class ExpirationTest
+public sealed class ExpirationTest : CacheTestBase
 {
     private sealed class FakeTicker
     {
@@ -32,9 +32,10 @@ public sealed class ExpirationTest
         Assert.Equal("a", cache.GetIfPresent(1)); // not yet expired
 
         ticker.Advance(TimeSpan.FromSeconds(31)); // total 61s > 60s
-        Assert.Null(cache.GetIfPresent(1));       // logically expired -> absent
+        Assert.Null(cache.GetIfPresent(1)); // logically expired -> absent
+
         cache.CleanUp();
-        Assert.Equal(0, cache.EstimatedSize());   // physically evicted
+        Assert.Equal(0, cache.EstimatedSize()); // physically evicted
     }
 
     [Fact]
@@ -53,6 +54,7 @@ public sealed class ExpirationTest
             ticker.Advance(TimeSpan.FromSeconds(15));
             cache.GetIfPresent(1); // reads must NOT extend a write-based expiry
         }
+
         // 75s elapsed since write -> expired despite the reads.
         Assert.Null(cache.GetIfPresent(1));
     }
@@ -71,6 +73,7 @@ public sealed class ExpirationTest
         ticker.Advance(TimeSpan.FromSeconds(45));
         cache.Put(1, "b"); // re-write resets the clock
         ticker.Advance(TimeSpan.FromSeconds(45)); // 45s since the update
+
         Assert.Equal("b", cache.GetIfPresent(1));
     }
 
@@ -90,6 +93,7 @@ public sealed class ExpirationTest
             ticker.Advance(TimeSpan.FromSeconds(30));
             Assert.Equal("a", cache.GetIfPresent(1)); // each read extends the access expiry
         }
+
         // Now idle past the duration.
         ticker.Advance(TimeSpan.FromSeconds(61));
         Assert.Null(cache.GetIfPresent(1));
@@ -107,6 +111,7 @@ public sealed class ExpirationTest
 
         cache.Put(1, "a");
         ticker.Advance(TimeSpan.FromSeconds(61));
+
         cache.CleanUp();
         Assert.Equal(0, cache.EstimatedSize());
     }
@@ -126,6 +131,7 @@ public sealed class ExpirationTest
         cache.Put(1, "a");
         ticker.Advance(TimeSpan.FromSeconds(61));
         cache.CleanUp();
+
         Assert.Equal(RemovalCause.Expired, observed);
     }
 
@@ -147,8 +153,10 @@ public sealed class ExpirationTest
         Assert.Equal("v10", cache.GetIfPresent(10));
 
         ticker.Advance(TimeSpan.FromSeconds(61));
+
+        // all expired despite being under the size bound
         cache.CleanUp();
-        Assert.Equal(0, cache.EstimatedSize()); // all expired despite being under the size bound
+        Assert.Equal(0, cache.EstimatedSize());
     }
 
     [Fact]
@@ -182,6 +190,7 @@ public sealed class ExpirationTest
         int calls = 0;
         Assert.Equal("v1", cache.Get(1, k => { calls++; return "v" + calls; }));
         ticker.Advance(TimeSpan.FromSeconds(61));
+
         // Expired -> the mapping function runs again.
         Assert.Equal("v2", cache.Get(1, k => { calls++; return "v" + calls; }));
         Assert.Equal(2, calls);
@@ -201,10 +210,8 @@ public sealed class ExpirationTest
 
         cache.Put(1, "old");
         ticker.Advance(TimeSpan.FromSeconds(61)); // expired
-        string? returned = ((ICache<int, string>)cache).GetIfPresent(1); // sanity: absent
-        Assert.Null(returned);
+        Assert.Null(cache.GetIfPresent(1));
 
-        // Put over the expired entry.
         cache.Put(1, "new");
         Assert.Equal("new", cache.GetIfPresent(1));
         Assert.NotEqual(RemovalCause.Replaced, cause); // expired, not replaced
@@ -222,7 +229,8 @@ public sealed class ExpirationTest
 
         cache.Put(1, "old");
         ticker.Advance(TimeSpan.FromSeconds(61));
-        cache.Invalidate(1); // just verify no throw and entry gone
+        cache.Invalidate(1);
+
         Assert.Null(cache.GetIfPresent(1));
     }
 

@@ -275,8 +275,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         Dictionary<K, TaskCompletionSource<V>> proxies, IReadOnlyDictionary<K, V> result, long startTime)
     {
         long loadTime = Cache.Ticker.Read() - startTime;
-        // An empty result means no requested key was loaded — recorded as a failure (matches the
-        // an empty result is booked as a load failure).
+        // An empty result means no requested key was loaded: booked as a load failure.
         if (result.Count == 0)
         {
             Cache.StatsCounter.RecordLoadFailure(loadTime);
