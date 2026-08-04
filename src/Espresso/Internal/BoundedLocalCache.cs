@@ -66,6 +66,15 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly IWeigher<K, V> _weigher;
     private readonly ICacheLoader<K, V>? _loader;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ThrowIfKeyNull(K key, [CallerArgumentExpression(nameof(key))] string? param = null)
+    {
+        if (default(K) is null && key is null)
+        {
+            throw new ArgumentNullException(param);
+        }
+    }
+
     /// <summary>Weighs an entry and validates the weigher's contract (weight must be non-negative).</summary>
     private int WeighEntry(K key, V value)
     {
@@ -230,7 +239,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public V? GetIfPresent(K key, bool recordStats)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         Node<K, V>? node = _data.GetOrDefault(key);
         if (node == null)
         {
@@ -1829,7 +1838,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     private V? PutInternal(K key, V value, bool onlyIfAbsent)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(value);
 
         int newWeight = -1;
@@ -1993,7 +2002,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public V? ComputeIfAbsent(K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad = true)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(mappingFunction);
 
         Node<K, V>? existing = _data.GetOrDefault(key);
@@ -2094,7 +2103,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public V? Remove(K key)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         Node<K, V>? removed = null;
         V? value = null;
         bool expired = false;
@@ -2133,7 +2142,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>Removes the key only if it currently maps to <paramref name="value"/>.</summary>
     public bool Remove(K key, V value)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(value);
         Node<K, V>? removed = null;
         _data.Compute(key, (_, node) =>
@@ -2172,7 +2181,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// </summary>
     public bool Replace(K key, V oldValue, V newValue)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(oldValue);
         ArgumentNullException.ThrowIfNull(newValue);
         int weight = WeighEntry(key, newValue);
