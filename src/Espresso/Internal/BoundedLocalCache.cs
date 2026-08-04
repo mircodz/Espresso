@@ -67,6 +67,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>Weighs an entry and validates the weigher's contract (weight must be non-negative).</summary>
     private int WeighEntry(K key, V value)
     {
+        // Unweighted caches use the singleton weigher (always 1); skip the interface dispatch entirely so
+        // the common case does not pay a vtable call on every insert/update.
+        if (!_isWeighted)
+        {
+            return 1;
+        }
         int weight = _weigher.Weigh(key, value);
         if (weight < 0)
         {
@@ -1310,7 +1316,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         node.MakeMainProtected();
     }
 
-    private static void Reorder(ILinkedDeque<Node<K, V>> deque, Node<K, V> node)
+    // Generic over the concrete deque type so the JIT specializes each call site instead of dispatching
+    // through ILinkedDeque on every buffered read during a maintenance drain.
+    private static void Reorder<TDeque>(TDeque deque, Node<K, V> node)
+        where TDeque : ILinkedDeque<Node<K, V>>
     {
         if (deque.Contains(node))
         {
@@ -2279,13 +2288,31 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     private void NotifyRemoval(K? key, V? value, RemovalCause cause)
     {
-        if (_removalListener == null)
+        IRemovalListener<K, V>? listener = _removalListener;
+        if (listener == null)
         {
             return;
         }
+        // Fast path for the default thread-pool executor: dispatch via a state-passing work item with a
+        // static callback, avoiding the display-class + delegate a capturing closure would allocate on
+        // every eviction/replacement. Custom executors keep the closure so their scheduling (and the
+        // inline, deterministic DirectExecutor used by tests) is honored unchanged.
+        if (ReferenceEquals(_executor, ThreadPoolExecutor.Instance))
+        {
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static s =>
+                {
+                    try { s.listener.OnRemoval(s.key, s.value, s.cause); }
+                    catch { /* a misbehaving listener must not disrupt the cache */ }
+                },
+                (listener, key, value, cause),
+                preferLocal: false);
+            return;
+        }
+
         void Run()
         {
-            try { _removalListener.OnRemoval(key, value, cause); }
+            try { listener.OnRemoval(key, value, cause); }
             catch { /* a misbehaving listener must not disrupt the cache */ }
         }
         try
