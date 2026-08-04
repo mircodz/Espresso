@@ -29,6 +29,14 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private const int MaximumCapacity = 1 << 30;
     private const int HashBits = 0x7fffffff;
 
+    // Treeification thresholds (mirrors JDK ConcurrentHashMap). A bin whose chain grows to
+    // TreeifyThreshold nodes converts to a red-black tree, but only once the table is at least
+    // MinTreeifyCapacity (below that we resize instead — spreading the collisions is preferred).
+    // A tree bin that shrinks to UntreeifyThreshold nodes converts back to a plain list.
+    private const int TreeifyThreshold = 8;
+    private const int UntreeifyThreshold = 6;
+    private const int MinTreeifyCapacity = 64;
+
     /// <summary>A key/value entry in a bin chain.</summary>
     internal class Node
     {
@@ -54,6 +62,741 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     {
         internal readonly Node?[] NextTable;
         internal ForwardingNode(Node?[] nextTable) : base(0, default!, default!, null) => NextTable = nextTable;
+    }
+
+    /// <summary>
+    /// A red-black tree node. Extends <see cref="Node"/> so its inherited <see cref="Node.Next"/> stays
+    /// threaded through the bin as a singly-linked list (used by the resize split and the lock-free
+    /// reader fallback). Adds tree links (<see cref="Parent"/>/<see cref="Left"/>/<see cref="Right"/>),
+    /// a backward <see cref="Prev"/> link for O(1) unlink, and the red/black colour flag.
+    /// </summary>
+    private sealed class TreeNode : Node
+    {
+        internal TreeNode? Parent;
+        internal TreeNode? Left;
+        internal TreeNode? Right;
+        internal TreeNode? Prev; // needed to unlink Next on deletion
+        internal bool Red;
+
+        internal TreeNode(int hash, TKey key, TValue value, Node? next, TreeNode? parent)
+            : base(hash, key, value, next) => Parent = parent;
+
+        /// <summary>
+        /// Finds the node matching (<paramref name="h"/>,<paramref name="k"/>) in the subtree rooted at
+        /// this node. Walks by hash, then by comparable order, then searches both subtrees when hashes
+        /// tie and keys are not comparable. Read-only; safe to run under a read lock.
+        /// </summary>
+        internal TreeNode? FindTreeNode(int h, TKey k, ConcurrentHashMap<TKey, TValue> map)
+        {
+            TreeNode? p = this;
+            bool comparable = k is IComparable<TKey>;
+            do
+            {
+                TreeNode? pl = p.Left, pr = p.Right;
+                int ph = p.Hash;
+                if (ph > h)
+                {
+                    p = pl;
+                }
+                else if (ph < h)
+                {
+                    p = pr;
+                }
+                else if (map.KeyEquals(p.Key, k))
+                {
+                    return p;
+                }
+                else if (pl == null)
+                {
+                    p = pr;
+                }
+                else if (pr == null)
+                {
+                    p = pl;
+                }
+                else if (comparable && ((IComparable<TKey>)k).CompareTo(p.Key) is var dir && dir != 0)
+                {
+                    p = dir < 0 ? pl : pr;
+                }
+                else
+                {
+                    TreeNode? q = pr.FindTreeNode(h, k, map);
+                    if (q != null)
+                    {
+                        return q;
+                    }
+                    p = pl;
+                }
+            }
+            while (p != null);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// A bin head that holds a red-black tree of colliding keys. It keeps the entries also threaded as a
+    /// linked list (<see cref="First"/> + <see cref="Node.Next"/>) so the resize traverser, the split,
+    /// and lock-free readers can scan it linearly. A CAS-based read/write lock (<see cref="_lockState"/>)
+    /// lets any number of readers traverse the tree concurrently while at most one writer restructures;
+    /// a reader that arrives while a writer holds (or is waiting for) the lock falls back to a lock-free
+    /// linear scan over the threaded <c>Next</c> links instead of touching the mutating tree shape.
+    /// </summary>
+    private sealed class TreeBin : Node
+    {
+        internal TreeNode? Root;
+        internal volatile TreeNode? First;
+        private int _lockState;
+
+        private const int Writer = 1; // set while a writer holds the lock
+        private const int Waiter = 2; // set while a writer is waiting for readers to drain
+        private const int Reader = 4; // increment per active reader
+
+        /// <summary>Builds a tree from an already-threaded list of tree nodes (its <c>First</c>).</summary>
+        internal TreeBin(TreeNode b, ConcurrentHashMap<TKey, TValue> map) : base(0, default!, default!, null)
+        {
+            First = b;
+            TreeNode? r = null;
+            for (TreeNode? x = b, next; x != null; x = next)
+            {
+                next = (TreeNode?)x.Next;
+                x.Left = x.Right = null;
+                if (r == null)
+                {
+                    x.Parent = null;
+                    x.Red = false;
+                    r = x;
+                }
+                else
+                {
+                    TKey k = x.Key;
+                    int h = x.Hash;
+                    bool comparable = k is IComparable<TKey>;
+                    for (TreeNode p = r;;)
+                    {
+                        int dir;
+                        int ph = p.Hash;
+                        if (ph > h)
+                        {
+                            dir = -1;
+                        }
+                        else if (ph < h)
+                        {
+                            dir = 1;
+                        }
+                        else
+                        {
+                            int c = comparable ? ((IComparable<TKey>)k).CompareTo(p.Key) : 0;
+                            dir = c != 0 ? c : TieBreakOrder(k, p.Key);
+                        }
+
+                        TreeNode xp = p;
+                        p = dir <= 0 ? p.Left! : p.Right!;
+                        if (p == null)
+                        {
+                            x.Parent = xp;
+                            if (dir <= 0)
+                            {
+                                xp.Left = x;
+                            }
+                            else
+                            {
+                                xp.Right = x;
+                            }
+                            r = BalanceInsertion(r, x);
+                            break;
+                        }
+                    }
+                }
+            }
+            Root = r;
+        }
+
+        // ----- CAS-based read/write lock -----
+
+        private void LockRoot()
+        {
+            if (Interlocked.CompareExchange(ref _lockState, Writer, 0) != 0)
+            {
+                ContendedLock();
+            }
+        }
+
+        private void UnlockRoot() => Volatile.Write(ref _lockState, 0);
+
+        /// <summary>Writer slow path: register the waiter bit and spin until readers drain.</summary>
+        private void ContendedLock()
+        {
+            var spin = new SpinWait();
+            while (true)
+            {
+                int s = Volatile.Read(ref _lockState);
+                if ((s & ~Waiter) == 0) // no writer, no readers (a lingering waiter bit is fine)
+                {
+                    // Grabbing WRITER also clears WAITER.
+                    if (Interlocked.CompareExchange(ref _lockState, Writer, s) == s)
+                    {
+                        return;
+                    }
+                }
+                else if ((s & Waiter) == 0)
+                {
+                    Interlocked.CompareExchange(ref _lockState, s | Waiter, s);
+                }
+                else
+                {
+                    spin.SpinOnce();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns the node for (<paramref name="h"/>,<paramref name="k"/>) or null. Uses the read lock
+        /// to traverse the tree; if a writer holds or is waiting for the lock, scans the threaded list
+        /// linearly instead so readers never observe a half-rotated tree.
+        /// </summary>
+        internal Node? Find(int h, TKey k, ConcurrentHashMap<TKey, TValue> map)
+        {
+            for (Node? e = First; e != null;)
+            {
+                int s = Volatile.Read(ref _lockState);
+                if ((s & (Waiter | Writer)) != 0)
+                {
+                    if (e.Hash == h && map.KeyEquals(e.Key, k))
+                    {
+                        return e;
+                    }
+                    e = Volatile.Read(ref e.Next);
+                }
+                else if (Interlocked.CompareExchange(ref _lockState, s + Reader, s) == s)
+                {
+                    TreeNode? p;
+                    try
+                    {
+                        TreeNode? r = Root;
+                        p = r?.FindTreeNode(h, k, map);
+                    }
+                    finally
+                    {
+                        Interlocked.Add(ref _lockState, -Reader);
+                    }
+                    return p;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Inserts (or finds) key <paramref name="k"/>. Returns the existing node if present (caller
+        /// updates its value), or null after inserting a new node. Tree rotations run under the write
+        /// lock so concurrent readers fall back to the linear scan while the shape changes.
+        /// </summary>
+        internal TreeNode? PutTreeVal(int h, TKey k, TValue v, ConcurrentHashMap<TKey, TValue> map)
+        {
+            bool comparable = k is IComparable<TKey>;
+            bool searched = false;
+            TreeNode? r = Root;
+            for (TreeNode? p = r;;)
+            {
+                if (p == null)
+                {
+                    First = Root = new TreeNode(h, k, v, null, null);
+                    break;
+                }
+                int dir;
+                int ph = p.Hash;
+                if (ph > h)
+                {
+                    dir = -1;
+                }
+                else if (ph < h)
+                {
+                    dir = 1;
+                }
+                else if (map.KeyEquals(p.Key, k))
+                {
+                    return p;
+                }
+                else
+                {
+                    int c = comparable ? ((IComparable<TKey>)k).CompareTo(p.Key) : 0;
+                    if (c == 0)
+                    {
+                        if (!searched)
+                        {
+                            searched = true;
+                            TreeNode? ch = p.Left;
+                            TreeNode? q = ch?.FindTreeNode(h, k, map);
+                            if (q == null)
+                            {
+                                ch = p.Right;
+                                q = ch?.FindTreeNode(h, k, map);
+                            }
+                            if (q != null)
+                            {
+                                return q;
+                            }
+                        }
+                        dir = TieBreakOrder(k, p.Key);
+                    }
+                    else
+                    {
+                        dir = c;
+                    }
+                }
+
+                TreeNode xp = p;
+                p = dir <= 0 ? p.Left : p.Right;
+                if (p == null)
+                {
+                    TreeNode f = First!;
+                    TreeNode x = new TreeNode(h, k, v, f, xp);
+                    First = x;
+                    if (f != null)
+                    {
+                        f.Prev = x;
+                    }
+                    if (dir <= 0)
+                    {
+                        xp.Left = x;
+                    }
+                    else
+                    {
+                        xp.Right = x;
+                    }
+                    if (!xp.Red)
+                    {
+                        x.Red = true;
+                    }
+                    else
+                    {
+                        LockRoot();
+                        try
+                        {
+                            Root = BalanceInsertion(Root!, x);
+                        }
+                        finally
+                        {
+                            UnlockRoot();
+                        }
+                    }
+                    break;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Removes tree node <paramref name="p"/>. Returns true if the tree became small enough that the
+        /// caller should convert the bin back to a plain list. Called under the bin lock; rotations run
+        /// under the write lock.
+        /// </summary>
+        internal bool RemoveTreeNode(TreeNode p)
+        {
+            TreeNode? next = (TreeNode?)p.Next;
+            TreeNode? pred = p.Prev;
+            if (pred == null)
+            {
+                First = next;
+            }
+            else
+            {
+                pred.Next = next;
+            }
+            if (next != null)
+            {
+                next.Prev = pred;
+            }
+            if (First == null)
+            {
+                Root = null;
+                return true;
+            }
+
+            TreeNode? r = Root;
+            if (r == null || r.Right == null || r.Left is not { Left: not null })
+            {
+                return true; // too small — untreeify
+            }
+
+            LockRoot();
+            try
+            {
+                TreeNode? replacement;
+                TreeNode? pl = p.Left;
+                TreeNode? pr = p.Right;
+                if (pl != null && pr != null)
+                {
+                    TreeNode s = pr;
+                    while (s.Left is { } sl2)
+                    {
+                        s = sl2;
+                    }
+                    (s.Red, p.Red) = (p.Red, s.Red); // swap colours
+                    TreeNode? sr = s.Right;
+                    TreeNode? pp = p.Parent;
+                    if (s == pr)
+                    {
+                        p.Parent = s;
+                        s.Right = p;
+                    }
+                    else
+                    {
+                        TreeNode? sp = s.Parent;
+                        if ((p.Parent = sp) != null)
+                        {
+                            if (s == sp!.Left)
+                            {
+                                sp.Left = p;
+                            }
+                            else
+                            {
+                                sp.Right = p;
+                            }
+                        }
+                        if ((s.Right = pr) != null)
+                        {
+                            pr.Parent = s;
+                        }
+                    }
+                    p.Left = null;
+                    if ((p.Right = sr) != null)
+                    {
+                        sr!.Parent = p;
+                    }
+                    if ((s.Left = pl) != null)
+                    {
+                        pl.Parent = s;
+                    }
+                    if ((s.Parent = pp) == null)
+                    {
+                        r = s;
+                    }
+                    else if (p == pp!.Left)
+                    {
+                        pp.Left = s;
+                    }
+                    else
+                    {
+                        pp.Right = s;
+                    }
+                    replacement = sr ?? p;
+                }
+                else
+                {
+                    replacement = pl ?? pr ?? p;
+                }
+
+                if (replacement != p)
+                {
+                    TreeNode? pp = replacement!.Parent = p.Parent;
+                    if (pp == null)
+                    {
+                        r = replacement;
+                    }
+                    else if (p == pp.Left)
+                    {
+                        pp.Left = replacement;
+                    }
+                    else
+                    {
+                        pp.Right = replacement;
+                    }
+                    p.Left = p.Right = p.Parent = null;
+                }
+
+                r = p.Red ? r : BalanceDeletion(r!, replacement!);
+
+                if (replacement == p) // detach
+                {
+                    TreeNode? pp = p.Parent;
+                    p.Parent = null;
+                    if (pp != null)
+                    {
+                        if (p == pp.Left)
+                        {
+                            pp.Left = null;
+                        }
+                        else if (p == pp.Right)
+                        {
+                            pp.Right = null;
+                        }
+                    }
+                }
+                Root = r;
+            }
+            finally
+            {
+                UnlockRoot();
+            }
+            return false;
+        }
+
+        // ----- static red-black helpers (ported from JDK) -----
+
+        private static TreeNode RotateLeft(TreeNode root, TreeNode p)
+        {
+            TreeNode? r = p.Right;
+            if (r != null)
+            {
+                TreeNode? rl = p.Right = r.Left;
+                if (rl != null)
+                {
+                    rl.Parent = p;
+                }
+                TreeNode? pp = r.Parent = p.Parent;
+                if (pp == null)
+                {
+                    (root = r).Red = false;
+                }
+                else if (pp.Left == p)
+                {
+                    pp.Left = r;
+                }
+                else
+                {
+                    pp.Right = r;
+                }
+                r.Left = p;
+                p.Parent = r;
+            }
+            return root;
+        }
+
+        private static TreeNode RotateRight(TreeNode root, TreeNode p)
+        {
+            TreeNode? l = p.Left;
+            if (l != null)
+            {
+                TreeNode? lr = p.Left = l.Right;
+                if (lr != null)
+                {
+                    lr.Parent = p;
+                }
+                TreeNode? pp = l.Parent = p.Parent;
+                if (pp == null)
+                {
+                    (root = l).Red = false;
+                }
+                else if (pp.Right == p)
+                {
+                    pp.Right = l;
+                }
+                else
+                {
+                    pp.Left = l;
+                }
+                l.Right = p;
+                p.Parent = l;
+            }
+            return root;
+        }
+
+        private static TreeNode BalanceInsertion(TreeNode root, TreeNode x)
+        {
+            x.Red = true;
+            for (TreeNode? xp, xpp, xppl, xppr;;)
+            {
+                if ((xp = x.Parent) == null)
+                {
+                    x.Red = false;
+                    return x;
+                }
+                if (!xp.Red || (xpp = xp.Parent) == null)
+                {
+                    return root;
+                }
+                if (xp == (xppl = xpp.Left))
+                {
+                    if ((xppr = xpp.Right) != null && xppr.Red)
+                    {
+                        xppr.Red = false;
+                        xp.Red = false;
+                        xpp.Red = true;
+                        x = xpp;
+                    }
+                    else
+                    {
+                        if (x == xp.Right)
+                        {
+                            root = RotateLeft(root, x = xp);
+                            xpp = (xp = x.Parent)?.Parent;
+                        }
+                        if (xp != null)
+                        {
+                            xp.Red = false;
+                            if (xpp != null)
+                            {
+                                xpp.Red = true;
+                                root = RotateRight(root, xpp);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    if (xppl != null && xppl.Red)
+                    {
+                        xppl.Red = false;
+                        xp.Red = false;
+                        xpp.Red = true;
+                        x = xpp;
+                    }
+                    else
+                    {
+                        if (x == xp.Left)
+                        {
+                            root = RotateRight(root, x = xp);
+                            xpp = (xp = x.Parent)?.Parent;
+                        }
+                        if (xp != null)
+                        {
+                            xp.Red = false;
+                            if (xpp != null)
+                            {
+                                xpp.Red = true;
+                                root = RotateLeft(root, xpp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static TreeNode BalanceDeletion(TreeNode root, TreeNode? x)
+        {
+            for (TreeNode? xp, xpl, xpr;;)
+            {
+                if (x == null || x == root)
+                {
+                    return root;
+                }
+                if ((xp = x.Parent) == null)
+                {
+                    x.Red = false;
+                    return x;
+                }
+                if (x.Red)
+                {
+                    x.Red = false;
+                    return root;
+                }
+                if ((xpl = xp.Left) == x)
+                {
+                    if ((xpr = xp.Right) != null && xpr.Red)
+                    {
+                        xpr.Red = false;
+                        xp.Red = true;
+                        root = RotateLeft(root, xp);
+                        xpr = (xp = x.Parent) == null ? null : xp.Right;
+                    }
+                    if (xpr == null)
+                    {
+                        x = xp;
+                    }
+                    else
+                    {
+                        TreeNode? sl = xpr.Left, sr = xpr.Right;
+                        if ((sr == null || !sr.Red) && (sl == null || !sl.Red))
+                        {
+                            xpr.Red = true;
+                            x = xp;
+                        }
+                        else
+                        {
+                            if (sr == null || !sr.Red)
+                            {
+                                if (sl != null)
+                                {
+                                    sl.Red = false;
+                                }
+                                xpr.Red = true;
+                                root = RotateRight(root, xpr);
+                                xpr = (xp = x.Parent) == null ? null : xp.Right;
+                            }
+                            if (xpr != null)
+                            {
+                                xpr.Red = xp != null && xp.Red;
+                                if ((sr = xpr.Right) != null)
+                                {
+                                    sr.Red = false;
+                                }
+                            }
+                            if (xp != null)
+                            {
+                                xp.Red = false;
+                                root = RotateLeft(root, xp);
+                            }
+                            x = root;
+                        }
+                    }
+                }
+                else // symmetric
+                {
+                    if (xpl != null && xpl.Red)
+                    {
+                        xpl.Red = false;
+                        xp.Red = true;
+                        root = RotateRight(root, xp);
+                        xpl = (xp = x.Parent) == null ? null : xp.Left;
+                    }
+                    if (xpl == null)
+                    {
+                        x = xp;
+                    }
+                    else
+                    {
+                        TreeNode? sl = xpl.Left, sr = xpl.Right;
+                        if ((sl == null || !sl.Red) && (sr == null || !sr.Red))
+                        {
+                            xpl.Red = true;
+                            x = xp;
+                        }
+                        else
+                        {
+                            if (sl == null || !sl.Red)
+                            {
+                                if (sr != null)
+                                {
+                                    sr.Red = false;
+                                }
+                                xpl.Red = true;
+                                root = RotateLeft(root, xpl);
+                                xpl = (xp = x.Parent) == null ? null : xp.Left;
+                            }
+                            if (xpl != null)
+                            {
+                                xpl.Red = xp != null && xp.Red;
+                                if ((sl = xpl.Left) != null)
+                                {
+                                    sl.Red = false;
+                                }
+                            }
+                            if (xp != null)
+                            {
+                                xp.Red = false;
+                                root = RotateRight(root, xp);
+                            }
+                            x = root;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Deterministic total-order tiebreak used when two keys collide on hash and are not comparable
+    /// (so the tree can still be built). Orders by type name, then by a stable identity hash. Never
+    /// reached on the value-type fast path where <c>TKey</c> is <see cref="IComparable{TKey}"/>.
+    /// </summary>
+    private static int TieBreakOrder(TKey a, TKey b)
+    {
+        int d = string.CompareOrdinal(a.GetType().Name, b.GetType().Name);
+        if (d == 0)
+        {
+            d = RuntimeHelpers.GetHashCode(a) <= RuntimeHelpers.GetHashCode(b) ? -1 : 1;
+        }
+        return d;
     }
 
     private readonly IEqualityComparer<TKey>? _comparer; // null => use the devirtualizable default
@@ -248,6 +991,11 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 tab = fwd.NextTable;
                 continue;
             }
+            if (e is TreeBin tb)
+            {
+                Node? found = tb.Find(h, key, this);
+                return found == null ? null : Volatile.Read(ref found.Value);
+            }
             while (e != null)
             {
                 if (e.Hash == h && KeyEquals(e.Key, key))
@@ -302,6 +1050,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             TValue? oldVal = null;
             bool inserted = false;
+            int binCount = 0;
             lock (f)
             {
                 if (TabAt(tab, i) != f)
@@ -309,29 +1058,55 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     tab = _table;
                     continue;
                 }
-                Node e = f;
-                while (true)
+                if (f is TreeBin tb)
                 {
-                    if (e.Hash == h && KeyEquals(e.Key, key))
+                    binCount = 2;
+                    TreeNode? p = tb.PutTreeVal(h, key, value, this);
+                    if (p != null)
                     {
-                        oldVal = e.Value;
+                        oldVal = p.Value;
                         if (!onlyIfAbsent)
                         {
-                            Volatile.Write(ref e.Value, value);
+                            Volatile.Write(ref p.Value, value);
                         }
-                        break;
                     }
-                    Node? next = e.Next;
-                    if (next == null)
+                    else
                     {
-                        Volatile.Write(ref e.Next, new Node(h, key, value, null));
                         inserted = true;
-                        break;
                     }
-                    e = next;
+                }
+                else
+                {
+                    binCount = 1;
+                    Node e = f;
+                    while (true)
+                    {
+                        if (e.Hash == h && KeyEquals(e.Key, key))
+                        {
+                            oldVal = e.Value;
+                            if (!onlyIfAbsent)
+                            {
+                                Volatile.Write(ref e.Value, value);
+                            }
+                            break;
+                        }
+                        Node? next = e.Next;
+                        if (next == null)
+                        {
+                            Volatile.Write(ref e.Next, new Node(h, key, value, null));
+                            inserted = true;
+                            break;
+                        }
+                        e = next;
+                        binCount++;
+                    }
                 }
             }
 
+            if (binCount >= TreeifyThreshold)
+            {
+                TreeifyBin(tab, i);
+            }
             if (inserted)
             {
                 AddCount(1, 2);
@@ -370,6 +1145,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             TValue? oldVal = null;
             bool removed = false;
+            bool untreeify = false;
             lock (f)
             {
                 if (TabAt(tab, i) != f)
@@ -377,40 +1153,72 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     tab = _table;
                     continue;
                 }
-                Node? pred = null;
-                Node e = f;
-                while (true)
+                if (f is TreeBin tb)
                 {
-                    if (e.Hash == h && KeyEquals(e.Key, key))
+                    TreeNode? root = tb.Root;
+                    TreeNode? p = root?.FindTreeNode(h, key, this);
+                    if (p != null)
                     {
-                        TValue ev = e.Value;
+                        TValue ev = p.Value;
                         if (expected == null || ReferenceEquals(expected, ev) || expected.Equals(ev))
                         {
                             oldVal = ev;
                             if (value != null)
                             {
-                                Volatile.Write(ref e.Value, value);
-                            }
-                            else if (pred != null)
-                            {
-                                Volatile.Write(ref pred.Next, e.Next);
-                                removed = true;
+                                Volatile.Write(ref p.Value, value);
                             }
                             else
                             {
-                                SetTabAt(tab, i, e.Next);
                                 removed = true;
+                                if (tb.RemoveTreeNode(p))
+                                {
+                                    untreeify = true;
+                                }
                             }
                         }
-                        break;
                     }
-                    pred = e;
-                    Node? next = e.Next;
-                    if (next == null)
+                }
+                else
+                {
+                    Node? pred = null;
+                    Node e = f;
+                    while (true)
                     {
-                        break;
+                        if (e.Hash == h && KeyEquals(e.Key, key))
+                        {
+                            TValue ev = e.Value;
+                            if (expected == null || ReferenceEquals(expected, ev) || expected.Equals(ev))
+                            {
+                                oldVal = ev;
+                                if (value != null)
+                                {
+                                    Volatile.Write(ref e.Value, value);
+                                }
+                                else if (pred != null)
+                                {
+                                    Volatile.Write(ref pred.Next, e.Next);
+                                    removed = true;
+                                }
+                                else
+                                {
+                                    SetTabAt(tab, i, e.Next);
+                                    removed = true;
+                                }
+                            }
+                            break;
+                        }
+                        pred = e;
+                        Node? next = e.Next;
+                        if (next == null)
+                        {
+                            break;
+                        }
+                        e = next;
                     }
-                    e = next;
+                }
+                if (untreeify)
+                {
+                    SetTabAt(tab, i, Untreeify(((TreeBin)f).First));
                 }
             }
 
@@ -470,26 +1278,42 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 tab = HelpTransfer(tab, fwd);
                 continue;
             }
-
-            // Lock-free fast path: if the key is already present with a published value, return it
-            // without locking. A node whose value is still null is an in-flight placeholder (another
-            // thread is computing under its lock); fall through to the lock and wait for it.
-            for (Node? e = f; e != null; e = Volatile.Read(ref e.Next))
+            if (f is TreeBin tbFast)
             {
-                if (e.Hash == h && KeyEquals(e.Key, key))
+                Node? found = tbFast.Find(h, key, this);
+                if (found != null)
                 {
-                    TValue? existing = Volatile.Read(ref e.Value);
+                    TValue? existing = Volatile.Read(ref found.Value);
                     if (existing != null)
                     {
                         return existing;
                     }
-                    break; // placeholder in progress — take the lock below
+                }
+            }
+
+            // Lock-free fast path: if the key is already present with a published value, return it
+            // without locking. A node whose value is still null is an in-flight placeholder (another
+            // thread is computing under its lock); fall through to the lock and wait for it.
+            if (f is not TreeBin)
+            {
+                for (Node? e = f; e != null; e = Volatile.Read(ref e.Next))
+                {
+                    if (e.Hash == h && KeyEquals(e.Key, key))
+                    {
+                        TValue? existing = Volatile.Read(ref e.Value);
+                        if (existing != null)
+                        {
+                            return existing;
+                        }
+                        break; // placeholder in progress — take the lock below
+                    }
                 }
             }
 
             TValue? result = null;
             bool inserted = false;
             bool present = false;
+            int binCount = 0;
             lock (f)
             {
                 if (TabAt(tab, i) != f)
@@ -497,30 +1321,59 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     tab = _table;
                     continue;
                 }
-                Node e = f;
-                while (true)
+                if (f is TreeBin tb)
                 {
-                    if (e.Hash == h && KeyEquals(e.Key, key))
+                    binCount = 2;
+                    TreeNode? root = tb.Root;
+                    TreeNode? p = root?.FindTreeNode(h, key, this);
+                    if (p != null)
                     {
-                        result = e.Value;
+                        result = p.Value;
                         present = true;
-                        break;
                     }
-                    Node? next = e.Next;
-                    if (next == null)
+                    else
                     {
                         result = mappingFunction(key);
                         if (result != null)
                         {
-                            Volatile.Write(ref e.Next, new Node(h, key, result, null));
+                            tb.PutTreeVal(h, key, result, this);
                             inserted = true;
                         }
-                        break;
                     }
-                    e = next;
+                }
+                else
+                {
+                    binCount = 1;
+                    Node e = f;
+                    while (true)
+                    {
+                        if (e.Hash == h && KeyEquals(e.Key, key))
+                        {
+                            result = e.Value;
+                            present = true;
+                            break;
+                        }
+                        Node? next = e.Next;
+                        if (next == null)
+                        {
+                            result = mappingFunction(key);
+                            if (result != null)
+                            {
+                                Volatile.Write(ref e.Next, new Node(h, key, result, null));
+                                inserted = true;
+                            }
+                            break;
+                        }
+                        e = next;
+                        binCount++;
+                    }
                 }
             }
 
+            if (binCount >= TreeifyThreshold)
+            {
+                TreeifyBin(tab, i);
+            }
             if (present)
             {
                 return result;
@@ -594,6 +1447,8 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
             TValue? val = null;
             int delta = 0;
+            int binCount = 0;
+            bool untreeify = false;
             lock (f)
             {
                 if (TabAt(tab, i) != f)
@@ -601,52 +1456,98 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     tab = _table;
                     continue;
                 }
-                Node? pred = null;
-                Node e = f;
-                while (true)
+                if (f is TreeBin tb)
                 {
-                    if (e.Hash == h && KeyEquals(e.Key, key))
+                    binCount = 2;
+                    TreeNode? root = tb.Root;
+                    TreeNode? p = root?.FindTreeNode(h, key, this);
+                    if (p != null)
                     {
                         val = onlyIfPresent
-                            ? ((Func<TKey, TValue, TValue?>)remapping)(key, e.Value)
-                            : ((Func<TKey, TValue?, TValue?>)remapping)(key, e.Value);
+                            ? ((Func<TKey, TValue, TValue?>)remapping)(key, p.Value)
+                            : ((Func<TKey, TValue?, TValue?>)remapping)(key, p.Value);
                         if (val != null)
                         {
-                            Volatile.Write(ref e.Value, val);
+                            Volatile.Write(ref p.Value, val);
                         }
                         else
                         {
                             delta = -1;
-                            if (pred != null)
+                            if (tb.RemoveTreeNode(p))
                             {
-                                Volatile.Write(ref pred.Next, e.Next);
+                                untreeify = true;
+                            }
+                        }
+                    }
+                    else if (!onlyIfPresent)
+                    {
+                        val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
+                        if (val != null)
+                        {
+                            delta = 1;
+                            tb.PutTreeVal(h, key, val, this);
+                        }
+                    }
+                }
+                else
+                {
+                    binCount = 1;
+                    Node? pred = null;
+                    Node e = f;
+                    while (true)
+                    {
+                        if (e.Hash == h && KeyEquals(e.Key, key))
+                        {
+                            val = onlyIfPresent
+                                ? ((Func<TKey, TValue, TValue?>)remapping)(key, e.Value)
+                                : ((Func<TKey, TValue?, TValue?>)remapping)(key, e.Value);
+                            if (val != null)
+                            {
+                                Volatile.Write(ref e.Value, val);
                             }
                             else
                             {
-                                SetTabAt(tab, i, e.Next);
+                                delta = -1;
+                                if (pred != null)
+                                {
+                                    Volatile.Write(ref pred.Next, e.Next);
+                                }
+                                else
+                                {
+                                    SetTabAt(tab, i, e.Next);
+                                }
                             }
+                            break;
                         }
-                        break;
-                    }
-                    pred = e;
-                    Node? next = e.Next;
-                    if (next == null)
-                    {
-                        if (!onlyIfPresent)
+                        pred = e;
+                        Node? next = e.Next;
+                        if (next == null)
                         {
-                            val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
-                            if (val != null)
+                            if (!onlyIfPresent)
                             {
-                                delta = 1;
-                                Volatile.Write(ref e.Next, new Node(h, key, val, null));
+                                val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
+                                if (val != null)
+                                {
+                                    delta = 1;
+                                    Volatile.Write(ref e.Next, new Node(h, key, val, null));
+                                }
                             }
+                            break;
                         }
-                        break;
+                        e = next;
+                        binCount++;
                     }
-                    e = next;
+                }
+                if (untreeify)
+                {
+                    SetTabAt(tab, i, Untreeify(((TreeBin)f).First));
                 }
             }
 
+            if (binCount >= TreeifyThreshold)
+            {
+                TreeifyBin(tab, i);
+            }
             if (delta != 0)
             {
                 AddCount(delta, -1);
@@ -680,7 +1581,8 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             {
                 if (TabAt(tab, i) == f)
                 {
-                    for (Node? p = f; p != null; p = p.Next)
+                    Node? p = f is TreeBin tb ? tb.First : f;
+                    for (; p != null; p = p.Next)
                     {
                         delta--;
                     }
@@ -750,6 +1652,11 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 s.Next = stack;
                 stack = s;
                 continue;
+            }
+            if (e is TreeBin tbin)
+            {
+                // Descend a tree bin via its threaded first/next linkage.
+                e = tbin.First;
             }
 
             // Compute the next bin index (recoverState pops saved tables as their ranges are done).
@@ -935,6 +1842,97 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     }
 
     /// <summary>
+    /// Replaces the linked list at bin <paramref name="index"/> with a <see cref="TreeBin"/> when the
+    /// table is large enough; otherwise triggers a resize (spreading collisions is preferred to
+    /// treeifying a small table). Re-checks the head under the bin lock before converting.
+    /// </summary>
+    private void TreeifyBin(Node?[] tab, int index)
+    {
+        int n = tab.Length;
+        if (n < MinTreeifyCapacity)
+        {
+            TryPresizeForTreeify(n);
+            return;
+        }
+        Node? b = TabAt(tab, index);
+        if (b == null || b is ForwardingNode || b is TreeBin)
+        {
+            return;
+        }
+        lock (b)
+        {
+            if (TabAt(tab, index) != b)
+            {
+                return; // head changed under us
+            }
+            TreeNode? head = null, tail = null;
+            for (Node? e = b; e != null; e = e.Next)
+            {
+                var p = new TreeNode(e.Hash, e.Key, Volatile.Read(ref e.Value), null, null);
+                p.Prev = tail;
+                if (tail == null)
+                {
+                    head = p;
+                }
+                else
+                {
+                    tail.Next = p;
+                }
+                tail = p;
+            }
+            SetTabAt(tab, index, new TreeBin(head!, this));
+        }
+    }
+
+    /// <summary>Converts a threaded tree-node list back into a plain <see cref="Node"/> list.</summary>
+    private static Node? Untreeify(Node? b)
+    {
+        Node? head = null, tail = null;
+        for (Node? q = b; q != null; q = q.Next)
+        {
+            var p = new Node(q.Hash, q.Key, Volatile.Read(ref q.Value), null);
+            if (tail == null)
+            {
+                head = p;
+            }
+            else
+            {
+                tail.Next = p;
+            }
+            tail = p;
+        }
+        return head;
+    }
+
+    /// <summary>
+    /// Kicks off (or joins) a resize when a bin wants to treeify but the table is below
+    /// <see cref="MinTreeifyCapacity"/>. Mirrors the initiate/join arms of <see cref="AddCount"/>'s tail
+    /// so it plugs into the same cooperative <see cref="Transfer"/>.
+    /// </summary>
+    private void TryPresizeForTreeify(int n)
+    {
+        if (n >= MaximumCapacity)
+        {
+            return;
+        }
+        int sc = Volatile.Read(ref _sizeCtl);
+        if (sc < 0)
+        {
+            return; // a resize is already in flight; it will grow the table
+        }
+        Node?[] tab = _table;
+        if (tab.Length != n)
+        {
+            return; // table changed; re-evaluate on the next insert
+        }
+        int rs = ResizeStamp(n);
+        if (Interlocked.CompareExchange(ref _sizeCtl, (rs << ResizeStampShift) + 2, sc) == sc)
+        {
+            Transfer(tab, null);
+        }
+    }
+
+    /// <summary>
     /// Faithful port of JDK's <c>transfer(tab, nextTab)</c>. Moves bins from <paramref name="oldTab"/>
     /// into a doubled table cooperatively: workers claim descending strides of bins via CAS on
     /// <see cref="_transferIndex"/>, migrate each claimed bin (splitting its chain into a lo half that
@@ -1041,6 +2039,55 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     if (TabAt(oldTab, i) != f)
                     {
                         continue; // head changed under us; re-read
+                    }
+                    if (f is TreeBin tb)
+                    {
+                        // Split the tree by (hash & n): each half becomes a fresh TreeBin (allocating
+                        // new tree nodes so the OLD bin stays intact for concurrent readers until the
+                        // ForwardingNode is published) or is converted back to a plain list when small.
+                        TreeNode? tlo = null, loTail = null;
+                        TreeNode? thi = null, hiTail = null;
+                        int lc = 0, hc = 0;
+                        for (Node? e = tb.First; e != null; e = e.Next)
+                        {
+                            int ph = e.Hash;
+                            var newNode = new TreeNode(ph, e.Key, Volatile.Read(ref e.Value), null, null);
+                            if ((ph & n) == 0)
+                            {
+                                newNode.Prev = loTail;
+                                if (loTail == null)
+                                {
+                                    tlo = newNode;
+                                }
+                                else
+                                {
+                                    loTail.Next = newNode;
+                                }
+                                loTail = newNode;
+                                lc++;
+                            }
+                            else
+                            {
+                                newNode.Prev = hiTail;
+                                if (hiTail == null)
+                                {
+                                    thi = newNode;
+                                }
+                                else
+                                {
+                                    hiTail.Next = newNode;
+                                }
+                                hiTail = newNode;
+                                hc++;
+                            }
+                        }
+                        Node? ln = lc <= UntreeifyThreshold ? Untreeify(tlo) : (lc != 0 ? new TreeBin(tlo!, this) : null);
+                        Node? hn = hc <= UntreeifyThreshold ? Untreeify(thi) : (hc != 0 ? new TreeBin(thi!, this) : null);
+                        SetTabAt(nextTab, i, ln);
+                        SetTabAt(nextTab, i + n, hn);
+                        SetTabAt(oldTab, i, forward);
+                        advance = true;
+                        continue;
                     }
                     int runBit = f.Hash & n;
                     Node lastRun = f;

@@ -335,6 +335,72 @@ public sealed class ConcurrentHashMapTest
         Assert.Equal(expected, map.AsEnumerable().LongCount());
     }
 
+    // Deterministic proof that treeify/untreeify actually happen. Uses reflection on the internal
+    // table to assert a bin becomes a TreeBin past the threshold and reverts to a plain Node list once
+    // it shrinks below UNTREEIFY_THRESHOLD. Capacity 64 clears MIN_TREEIFY_CAPACITY so treeify (not a
+    // resize) fires; the single-bucket comparer forces every key into one bin.
+    [Fact]
+    public void Treeify_And_Untreeify_SingleBucket_Deterministic()
+    {
+        var map = new ConcurrentHashMap<int, string>(64, 1, new CollidingComparer());
+
+        // Insert 20 colliding keys — well past TREEIFY_THRESHOLD (8).
+        for (int k = 0; k < 20; k++)
+        {
+            map.Put(k, "v" + k);
+        }
+
+        int bin = BinIndexOf(map, 0);
+        Assert.Equal("TreeBin", HeadTypeName(map, bin));
+        for (int k = 0; k < 20; k++)
+        {
+            Assert.Equal("v" + k, map.GetOrDefault(k));
+        }
+        Assert.Equal(20, map.Count);
+
+        // Remove down to 5 nodes (< UNTREEIFY_THRESHOLD 6): the bin must revert to a plain Node list.
+        for (int k = 0; k < 15; k++)
+        {
+            Assert.Equal("v" + k, map.Remove(k));
+        }
+
+        string head = HeadTypeName(map, bin);
+        Assert.Equal("Node", head); // reverted, not a TreeBin
+        Assert.Equal(5, map.Count);
+        for (int k = 15; k < 20; k++)
+        {
+            Assert.Equal("v" + k, map.GetOrDefault(k));
+        }
+        for (int k = 0; k < 15; k++)
+        {
+            Assert.Null(map.GetOrDefault(k));
+        }
+    }
+
+    private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
+        where TKey : notnull where TValue : class
+    {
+        var f = typeof(ConcurrentHashMap<TKey, TValue>).GetField(
+            "_table", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return (Array)f.GetValue(map)!;
+    }
+
+    private static int BinIndexOf<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map, TKey key)
+        where TKey : notnull where TValue : class
+    {
+        // Spread(hash) & (len-1); CollidingComparer hashes everything to 0 so the bin is index 0.
+        _ = key;
+        return 0;
+    }
+
+    private static string HeadTypeName<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map, int bin)
+        where TKey : notnull where TValue : class
+    {
+        Array tab = GetTable(map);
+        object? head = tab.GetValue(bin);
+        return head?.GetType().Name ?? "null";
+    }
+
     // Forces every key into a single bin so collision-chain handling is exercised.
     private sealed class CollidingComparer : IEqualityComparer<int>
     {
