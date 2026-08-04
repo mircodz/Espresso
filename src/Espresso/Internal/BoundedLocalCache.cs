@@ -1505,54 +1505,51 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now = 0L)
     {
         K? key = node.Key;
-        V? value = null;
-        bool removed = false;
-        bool resurrect = false;
-        RemovalCause actualCause = cause;
 
-        _data.ComputeIfPresent(key!, (_, n) =>
+        // State-passing remap so the eviction path allocates no closure (it fires once per insert past
+        // capacity and dominated the write-path allocation profile).
+        var s = new EvictState { Cache = this, Node = node, Cause = cause, Now = now, ActualCause = cause };
+        _data.ComputeIfPresent(key!, static (Node<K, V> current, ref EvictState st) =>
         {
-            if (!ReferenceEquals(n, node))
+            if (!ReferenceEquals(current, st.Node))
             {
-                return n; // a different node now occupies the key; leave it
+                return current; // a different node now occupies the key; leave it
             }
-            lock (node)
+            var n = st.Node;
+            lock (n)
             {
-                value = node.Value;
-                if (key == null || value == null)
-                {
-                    actualCause = RemovalCause.Collected;
-                }
-                else
-                {
-                    actualCause = cause;
-                }
+                st.Value = n.Value;
+                st.ActualCause = (n.Key == null || st.Value == null) ? RemovalCause.Collected : st.Cause;
 
-                if (actualCause == RemovalCause.Expired)
+                if (st.ActualCause == RemovalCause.Expired)
                 {
                     // Re-verify: the entry may have been touched since it was queued for expiration.
-                    if (!HasExpired(node, now))
+                    if (!st.Cache.HasExpired(n, st.Now))
                     {
-                        resurrect = true;
-                        return node;
+                        st.Resurrect = true;
+                        return n;
                     }
                 }
-                else if (actualCause == RemovalCause.Size)
+                else if (st.ActualCause == RemovalCause.Size)
                 {
-                    if (node.Weight == 0)
+                    if (n.Weight == 0)
                     {
-                        resurrect = true;
-                        return node; // pinned entry, keep it
+                        st.Resurrect = true;
+                        return n; // pinned entry, keep it
                     }
                 }
 
-                removed = true;
-                node.Retire();
+                st.Removed = true;
+                n.Retire();
                 return null; // remove from the map
             }
-        });
+        }, ref s);
 
-        if (resurrect)
+        V? value = s.Value;
+        bool removed = s.Removed;
+        RemovalCause actualCause = s.ActualCause;
+
+        if (s.Resurrect)
         {
             return false;
         }
@@ -1596,6 +1593,19 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             NotifyRemoval(key, value, actualCause);
         }
         return true;
+    }
+
+    // State threaded through the eviction remap: the caller sets the inputs, the remap writes outputs back.
+    private struct EvictState
+    {
+        public BoundedLocalCache<K, V> Cache;
+        public Node<K, V> Node;
+        public RemovalCause Cause;
+        public long Now;
+        public V? Value;
+        public bool Removed;
+        public bool Resurrect;
+        public RemovalCause ActualCause;
     }
 
     private void MakeDead(Node<K, V> node)
@@ -2302,10 +2312,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             return;
         }
-        // Fast path for the default thread-pool executor: dispatch via a state-passing work item with a
-        // static callback, avoiding the display-class + delegate a capturing closure would allocate on
-        // every eviction/replacement. Custom executors keep the closure so their scheduling (and the
-        // inline, deterministic DirectExecutor used by tests) is honored unchanged.
+        // Default executor: dispatch via a state-passing work item so no capturing closure is allocated
+        // per eviction/replacement.
         if (ReferenceEquals(_executor, ThreadPoolExecutor.Instance))
         {
             ThreadPool.UnsafeQueueUserWorkItem(
@@ -2319,6 +2327,13 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
 
+        // Custom executor: the closure lives in a separate method so it is not allocated on entry to the
+        // hot NotifyRemoval body (a captured local would hoist the display class ahead of the guards above).
+        NotifyRemovalViaExecutor(listener, key, value, cause);
+    }
+
+    private void NotifyRemovalViaExecutor(IRemovalListener<K, V> listener, K? key, V? value, RemovalCause cause)
+    {
         void Run()
         {
             try { listener.OnRemoval(key, value, cause); }

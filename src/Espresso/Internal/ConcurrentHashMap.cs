@@ -1389,6 +1389,108 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     public TValue? ComputeIfPresent(TKey key, Func<TKey, TValue, TValue?> remappingFunction)
         => ComputeInternal(key, remappingFunction, onlyIfPresent: true);
 
+    // Remap callback taking caller state by ref, so hot callers avoid allocating a capturing closure.
+    public delegate TValue? PresentRemapper<TState>(TValue current, ref TState state);
+
+    // Closure-free ComputeIfPresent: remaps the present value via a static callback with state threaded
+    // by ref. No-op if absent. Runs under the bin lock, like the delegate overload.
+    public TValue? ComputeIfPresent<TState>(TKey key, PresentRemapper<TState> remapper, ref TState state)
+    {
+        int h = HashOf(key);
+        Node?[] tab = _table;
+        while (true)
+        {
+            Node? f = TabAt(tab, (tab.Length - 1) & h);
+            if (f == null)
+            {
+                return null;
+            }
+            if (f is ForwardingNode fwd)
+            {
+                tab = HelpTransfer(tab, fwd);
+                continue;
+            }
+
+            int i = (tab.Length - 1) & h;
+            TValue? val = null;
+            int delta = 0;
+            bool untreeify = false;
+            lock (f)
+            {
+                if (TabAt(tab, i) != f)
+                {
+                    tab = _table;
+                    continue;
+                }
+                if (f is TreeBin tb)
+                {
+                    TreeNode? p = tb.Root?.FindTreeNode(h, key, this);
+                    if (p != null)
+                    {
+                        val = remapper(p.Value, ref state);
+                        if (val != null)
+                        {
+                            Volatile.Write(ref p.Value, val);
+                        }
+                        else
+                        {
+                            delta = -1;
+                            if (tb.RemoveTreeNode(p))
+                            {
+                                untreeify = true;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Node? pred = null;
+                    Node e = f;
+                    while (true)
+                    {
+                        if (e.Hash == h && KeyEquals(e.Key, key))
+                        {
+                            val = remapper(e.Value, ref state);
+                            if (val != null)
+                            {
+                                Volatile.Write(ref e.Value, val);
+                            }
+                            else
+                            {
+                                delta = -1;
+                                if (pred != null)
+                                {
+                                    Volatile.Write(ref pred.Next, e.Next);
+                                }
+                                else
+                                {
+                                    SetTabAt(tab, i, e.Next);
+                                }
+                            }
+                            break;
+                        }
+                        pred = e;
+                        Node? next = e.Next;
+                        if (next == null)
+                        {
+                            break;
+                        }
+                        e = next;
+                    }
+                }
+                if (untreeify)
+                {
+                    SetTabAt(tab, i, Untreeify(((TreeBin)f).First));
+                }
+            }
+            if (delta != 0)
+            {
+                AddCount(delta, -1);
+            }
+            return val;
+        }
+    }
+
     public TValue? Compute(TKey key, Func<TKey, TValue?, TValue?> remappingFunction)
         => ComputeInternal(key, remappingFunction, onlyIfPresent: false);
 
