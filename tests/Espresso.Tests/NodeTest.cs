@@ -114,14 +114,17 @@ public sealed class NodeTest
     }
 
     [Fact]
-    public void WriteTime_SeededWithLowBitCleared_AndCasWorks()
+    public void WriteTime_OrdinaryWritesClearLowBit_AndCasPreservesMarker()
     {
         var node = Make(NodeFeature.ExpireWrite, now: 0b1011);
         Assert.Equal(0b1010L, node.WriteTime); // now & ~1L
 
+        node.WriteTime = 0b1111;
+        Assert.Equal(0b1110L, node.WriteTime);
+
         Assert.False(node.CasWriteTime(999, 7)); // wrong expected
-        Assert.True(node.CasWriteTime(0b1010L, 500));
-        Assert.Equal(500L, node.WriteTime);
+        Assert.True(node.CasWriteTime(0b1110L, 0b1001));
+        Assert.Equal(0b1001L, node.WriteTime);
     }
 
     [Fact]

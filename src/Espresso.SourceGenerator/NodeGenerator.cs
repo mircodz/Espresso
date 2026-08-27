@@ -154,7 +154,7 @@ public sealed class NodeGenerator : IIncrementalGenerator
         {
             sb.AppendLine();
             sb.AppendLine("        private long _writeTime;");
-            sb.AppendLine("        public override long WriteTime { get => Volatile.Read(ref _writeTime); set => Volatile.Write(ref _writeTime, value); }");
+            sb.AppendLine("        public override long WriteTime { get => Volatile.Read(ref _writeTime); set => Volatile.Write(ref _writeTime, value & ~1L); }");
             sb.AppendLine("        public override bool CasWriteTime(long expect, long update)");
             sb.AppendLine("            => Interlocked.CompareExchange(ref _writeTime, update, expect) == expect;");
         }

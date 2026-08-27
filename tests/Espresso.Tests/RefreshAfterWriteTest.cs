@@ -11,6 +11,7 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         private long _nanos;
         public long Read() => _nanos;
         public void Advance(TimeSpan by) => _nanos += by.Ticks * 100L;
+        public void AdvanceNanos(long nanos) => _nanos += nanos;
     }
 
     private sealed class CountingLoader : ICacheLoader<int, string>
@@ -49,6 +50,34 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         cache.GetIfPresent(1); // triggers refresh (returns the stale value on this call)
         Assert.Equal(2, loader.Calls);
         Assert.Equal("1-v2", cache.GetIfPresent(1)); // now the refreshed value
+    }
+
+    [Fact]
+    public void Refresh_OddWriteTimes_DoNotBlockLaterRefreshes()
+    {
+        var ticker = new FakeTicker();
+        int version = 1;
+        var loader = new CountingLoader(k => $"{k}-v{version}");
+        var cache = Cache.NewBuilder<int, string>()
+            .RefreshAfterWrite(OneMinute)
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .Build(loader);
+
+        ticker.AdvanceNanos(1);
+        cache.Put(1, "initial");
+        cache.Put(1, "replacement");
+
+        version = 2;
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        cache.GetIfPresent(1);
+        Assert.Equal("1-v2", cache.GetIfPresent(1));
+
+        version = 3;
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        cache.GetIfPresent(1);
+        Assert.Equal("1-v3", cache.GetIfPresent(1));
+        Assert.Equal(2, loader.Calls);
     }
 
     [Fact]
