@@ -1727,17 +1727,19 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     c._sketch.Increment(_node.KeyReference);
                 }
-                if (_weight > c._maximum)
-                {
-                    c.EvictEntry(_node, RemovalCause.Size);
-                }
-                else if (_weight > c._windowMaximum)
+                // Link first so that a declined eviction (e.g. the node's weight dropped to zero
+                // before this task ran) leaves the live entry tracked by the policy.
+                if (_weight > c._windowMaximum)
                 {
                     c._windowDeque.OfferFirst(_node);
                 }
                 else
                 {
                     c._windowDeque.OfferLast(_node);
+                }
+                if (_weight > c._maximum)
+                {
+                    c.EvictEntry(_node, RemovalCause.Size);
                 }
             }
             else if (c.ExpiresAfterAccess)
