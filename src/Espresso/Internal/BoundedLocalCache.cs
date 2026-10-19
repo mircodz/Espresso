@@ -254,14 +254,22 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         if (node == null)
         {
             if (recordStats) _statsCounter.RecordMisses(1);
+            if (Volatile.Read(ref _drainStatus) == Required)
+            {
+                ScheduleDrainBuffers();
+            }
             return null;
         }
-        V? value = node.Value;
+        // Timestamps are sampled before the value so a concurrent rewrite (which stores the value
+        // before publishing its timestamps) can never pair an old value with a fresh timestamp.
         long now = _ticker.Read();
-        if (value == null || HasExpired(node, now))
+        bool expired = HasExpired(node, now);
+        V? value = node.Value;
+        if (value == null || (expired && !IsComputingAsync(value)))
         {
             if (recordStats) _statsCounter.RecordMisses(1);
-            return null; // absent or logically expired (physical eviction happens in maintenance)
+            ScheduleDrainBuffers(); // the dead/expired entry is reclaimed by maintenance
+            return null;
         }
         if (recordStats) _statsCounter.RecordHits(1);
         SetAccessTime(node, now);
@@ -583,8 +591,15 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public V? GetIfPresentQuietly(K key)
     {
+        ThrowIfKeyNull(key);
         Node<K, V>? node = _data.GetOrDefault(key);
-        return node?.Value;
+        if (node == null)
+        {
+            return null;
+        }
+        bool expired = HasExpired(node, _ticker.Read());
+        V? value = node.Value;
+        return (value == null || (expired && !IsComputingAsync(value))) ? null : value;
     }
 
     public IReadOnlyDictionary<K, V> GetAllPresent(IEnumerable<K> keys)
@@ -605,18 +620,24 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         foreach (K key in result.Keys)
         {
             Node<K, V>? node = _data.GetOrDefault(key);
-            V? value = node?.Value;
-            if (value == null || HasExpired(node!, now))
+            if (node == null)
             {
-                // Absent, or logically expired: treat as a miss (do not leak the stale value), and
-                // request a drain so an expired entry is reclaimed in the next maintenance cycle.
-                if (node != null && value != null) drain = true;
                 toRemove.Add(key);
                 continue;
             }
-            SetAccessTime(node!, now);
-            TryExpireAfterRead(node!, key, value, now);
-            AfterRead(node!, now);
+            bool expired = HasExpired(node, now);
+            V? value = node.Value;
+            if (value == null || (expired && !IsComputingAsync(value)))
+            {
+                // Dead or logically expired: treat as a miss (do not leak the stale value), and
+                // request a drain so the entry is reclaimed in the next maintenance cycle.
+                drain = true;
+                toRemove.Add(key);
+                continue;
+            }
+            SetAccessTime(node, now);
+            TryExpireAfterRead(node, key, value, now);
+            AfterRead(node, now);
             result[key] = value;
         }
         foreach (K key in toRemove)
@@ -1264,15 +1285,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     /// <summary>
-    /// Returns whether the node has expired by access, write, or variable time. An in-flight async
-    /// future never expires while it is still loading.
+    /// Returns whether the node's timestamps say it has expired by access, write, or variable time.
+    /// This reads timestamps only; callers that must not expire an in-flight async future combine it
+    /// with <see cref="IsComputingAsync(V)"/> on the value they captured <em>after</em> this check.
     /// </summary>
     private bool HasExpired(Node<K, V> node, long now)
     {
-        if (IsComputingAsync(node))
-        {
-            return false; // an in-flight future never expires while it is still loading
-        }
         return (_expiresAfterAccess && (now - node.AccessTime >= _expiresAfterAccessNanos))
             || (_expiresAfterWrite && (now - node.WriteTime >= _expiresAfterWriteNanos))
             || (_expiresVariable && (now - node.VariableTime >= 0));
@@ -1714,8 +1732,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
                 if (st.ActualCause == RemovalCause.Expired)
                 {
-                    // Re-verify: the entry may have been touched since it was queued for expiration.
-                    if (!st.Cache.HasExpired(n, st.Now))
+                    // Re-verify: the entry may have been touched since it was queued for expiration,
+                    // and an in-flight async load never expires.
+                    if (!st.Cache.HasExpired(n, st.Now) || st.Cache.IsComputingAsync(st.Value))
                     {
                         st.Resurrect = true;
                         return n;
@@ -2027,11 +2046,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 if (onlyIfAbsent)
                 {
                     // A live existing value short-circuits without locking.
-                    V? currentValue = prior.Value;
                     long readNow = _ticker.Read();
-                    if (currentValue != null && !HasExpired(prior, readNow))
+                    bool priorExpired = HasExpired(prior, readNow);
+                    V? currentValue = prior.Value;
+                    if (currentValue != null && (!priorExpired || IsComputingAsync(currentValue)))
                     {
-                        if (!IsComputingAsync(prior))
+                        if (!IsComputingAsync(currentValue))
                         {
                             TryExpireAfterRead(prior, key, currentValue, readNow);
                             SetAccessTime(prior, readNow);
@@ -2043,11 +2063,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             else if (onlyIfAbsent)
             {
-                V? currentValue = prior.Value;
                 long readNow = _ticker.Read();
-                if (currentValue != null && !HasExpired(prior, readNow))
+                bool priorExpired = HasExpired(prior, readNow);
+                V? currentValue = prior.Value;
+                if (currentValue != null && (!priorExpired || IsComputingAsync(currentValue)))
                 {
-                    if (!IsComputingAsync(prior))
+                    if (!IsComputingAsync(currentValue))
                     {
                         TryExpireAfterRead(prior, key, currentValue, readNow);
                         SetAccessTime(prior, readNow);
@@ -2091,7 +2112,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 oldValue = prior.Value;
                 oldWeight = prior.Weight;
                 now = _ticker.Read();
-                if (oldValue == null || HasExpired(prior, now))
+                if (oldValue == null || (HasExpired(prior, now) && !IsComputingAsync(oldValue)))
                 {
                     // The entry is expired (or being collected): treat this put as a re-creation.
                     expired = oldValue != null;
@@ -2113,12 +2134,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     bool writeExceeds = ExceedsWriteTimeTolerance(prior, now);
                     bool varExceeds = _expiresVariable && Math.Abs(varTime - oldVarTime) > ExpireTolerance;
                     exceedsTolerance = writeExceeds || varExceeds;
+                    // Publish the value and weight before the timestamps: a lock-free reader samples
+                    // the timestamps first, so it can never pair the old value with the new write time.
+                    prior.Value = value;
+                    prior.Weight = newWeight;
                     if (expired || exceedsTolerance)
                     {
                         if (_expiresAfterWrite || _refreshAfterWrite) prior.WriteTime = now;
                     }
-                    prior.Value = value;
-                    prior.Weight = newWeight;
                     DiscardRefresh(prior.KeyReference);
                 }
 
@@ -2163,10 +2186,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         long readNow = _ticker.Read();
         if (existing != null)
         {
-            // Read the value once: a concurrent removal may kill the node (clearing its value) at any
-            // point, and a hit must return the value it established rather than a later re-read.
+            // Sample the timestamps, then read the value once: a concurrent removal may kill the node
+            // (clearing its value) at any point, and a hit must return the value it established.
+            bool expired = HasExpired(existing, readNow);
             V? hitValue = existing.Value;
-            if (hitValue != null && !HasExpired(existing, readNow))
+            if (hitValue != null && (!expired || IsComputingAsync(hitValue)))
             {
                 if (recordStats) _statsCounter.RecordHits(1);
                 if (!IsComputingAsync(hitValue))
@@ -2227,7 +2251,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     cause = RemovalCause.Collected;
                 }
-                else if (HasExpired(n, now = _ticker.Read()))
+                else if (HasExpired(n, now = _ticker.Read()) && !IsComputingAsync(oldValue))
                 {
                     cause = RemovalCause.Expired;
                 }
@@ -2365,7 +2389,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     cause = RemovalCause.Collected;
                 }
-                else if (HasExpired(node, _ticker.Read()))
+                else if (HasExpired(node, _ticker.Read()) && !IsComputingAsync(oldValue))
                 {
                     cause = RemovalCause.Expired;
                 }
@@ -2421,7 +2445,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     cause = RemovalCause.Collected;
                 }
-                else if (HasExpired(node, _ticker.Read()))
+                else if (HasExpired(node, _ticker.Read()) && !IsComputingAsync(oldValue))
                 {
                     cause = RemovalCause.Expired;
                 }
@@ -2481,7 +2505,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 V? current = n.Value;
                 if (current == null
                     || (!ReferenceEquals(current, oldValue) && !oldValue.Equals(current))
-                    || HasExpired(n, now = _ticker.Read()))
+                    || (HasExpired(n, now = _ticker.Read()) && !IsComputingAsync(current)))
                 {
                     return n; // old value no longer present (or expired); leave it
                 }
