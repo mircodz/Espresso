@@ -47,7 +47,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             return present;
         }
 
-        long startTime = Cache.Ticker.Read();
+        long startTime = Cache.StatsTicker.Read();
         Task<V>? created = null;
         Task<V> future = Cache.ComputeIfAbsent(key, k =>
         {
@@ -70,7 +70,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     public void Put(K key, Task<V> valueFuture)
     {
         ArgumentNullException.ThrowIfNull(valueFuture);
-        long startTime = Cache.Ticker.Read();
+        long startTime = Cache.StatsTicker.Read();
         Task<V>? prior = Cache.Put(key, valueFuture);
         if (!ReferenceEquals(prior, valueFuture))
         {
@@ -87,7 +87,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         future.ContinueWith(t =>
         {
-            long loadTime = Cache.Ticker.Read() - startTime;
+            long loadTime = Cache.StatsTicker.Read() - startTime;
             V? value = t.IsCompletedSuccessfully ? t.Result : null;
             if (value == null)
             {
@@ -122,7 +122,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         refreshed.ContinueWith(t =>
         {
-            long loadTime = Cache.Ticker.Read() - startTime;
+            long loadTime = Cache.StatsTicker.Read() - startTime;
             V? value = t.IsCompletedSuccessfully ? t.Result : null;
             if (value == null)
             {
@@ -238,7 +238,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             return ComposeResult(futures);
         }
 
-        long startTime = Cache.Ticker.Read();
+        long startTime = Cache.StatsTicker.Read();
         var missing = new List<K>(proxies.Keys);
         Task<IReadOnlyDictionary<K, V>> loaded;
         try
@@ -274,7 +274,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     private void CompleteProxiesOnSuccess(
         Dictionary<K, TaskCompletionSource<V>> proxies, IReadOnlyDictionary<K, V> result, long startTime)
     {
-        long loadTime = Cache.Ticker.Read() - startTime;
+        long loadTime = Cache.StatsTicker.Read() - startTime;
         // An empty result means no requested key was loaded: booked as a load failure.
         if (result.Count == 0)
         {
@@ -320,7 +320,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     private void CompleteProxiesOnFailure(
         Dictionary<K, TaskCompletionSource<V>> proxies, long startTime, Exception failure)
     {
-        long loadTime = Cache.Ticker.Read() - startTime;
+        long loadTime = Cache.StatsTicker.Read() - startTime;
         Cache.StatsCounter.RecordLoadFailure(loadTime);
         foreach (KeyValuePair<K, TaskCompletionSource<V>> entry in proxies)
         {

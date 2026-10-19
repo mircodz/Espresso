@@ -16,6 +16,8 @@ internal readonly struct CacheConfiguration<K, V>
     public IRemovalListener<K, V>? RemovalListener { get; init; }
     public IExecutor Executor { get; init; }
     public Ticker Ticker { get; init; }
+    /// <summary>The ticker that times loads for statistics (disabled when stats are not recorded).</summary>
+    public Ticker StatsTicker { get; init; }
     public IWeigher<K, V> Weigher { get; init; }
     public IExpiry<K, V>? Expiry { get; init; }
     public IScheduler? Scheduler { get; init; }

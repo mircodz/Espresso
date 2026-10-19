@@ -63,6 +63,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly IRemovalListener<K, V>? _removalListener;
     private readonly IExecutor _executor;
     private readonly Ticker _ticker;
+    private readonly Ticker _statsTicker;
     private readonly IWeigher<K, V> _weigher;
     private readonly ICacheLoader<K, V>? _loader;
 
@@ -164,6 +165,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _removalListener = config.RemovalListener;
         _executor = config.Executor;
         _ticker = config.Ticker;
+        _statsTicker = config.StatsTicker;
         _weigher = config.Weigher;
         _loader = loader;
 
@@ -212,6 +214,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     public StatsCounter StatsCounter => _statsCounter;
     public IExecutor Executor => _executor;
     public Ticker Ticker => _ticker;
+    public Ticker StatsTicker => _statsTicker;
     public bool IsRecordingStats => _statsCounter.IsEnabled;
 
     // ----- sizing -----
@@ -421,7 +424,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     {
         _executor.Execute(() =>
         {
-            long start = _ticker.Read();
+            long start = _statsTicker.Read();
             V? newValue;
             try
             {
@@ -430,10 +433,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             catch
             {
                 _refreshes.Remove(keyRef, token);
-                _statsCounter.RecordLoadFailure(_ticker.Read() - start);
+                _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
                 return;
             }
-            long loadTime = _ticker.Read() - start;
+            long loadTime = _statsTicker.Read() - start;
 
             // Commit the reload only if the entry was not modified while in flight (ABA guard on
             // both the value identity AND the write-time). A null reload removes the mapping.
@@ -2110,6 +2113,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         // EXPIRED removal notification and eviction stat fire after the atomic section.
         V? expiredOldValue = null;
         int expiredOldWeight = 0;
+        long loadStart = 0L;
 
         _data.Compute(key, (k, node) =>
         {
@@ -2119,6 +2123,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 return node;
             }
             ran = true;
+            loadStart = _statsTicker.Read();
             computed = mappingFunction(k);
             if (computed == null)
             {
@@ -2157,12 +2162,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             if (recordStats) _statsCounter.RecordMisses(1);
             if (newNode != null)
             {
-                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_ticker.Read() - now);
+                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_statsTicker.Read() - loadStart);
                 AfterWrite(new AddTask(this, newNode, newNode.Weight));
             }
             else if (updatedNode != null)
             {
-                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_ticker.Read() - now);
+                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_statsTicker.Read() - loadStart);
                 // The replaced node had expired: report the eviction and propagate the weight delta.
                 if (expiredOldValue != null)
                 {
@@ -2173,7 +2178,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             else if (recordStats && recordLoad)
             {
-                _statsCounter.RecordLoadFailure(_ticker.Read() - now);
+                _statsCounter.RecordLoadFailure(_statsTicker.Read() - loadStart);
             }
         }
         else
@@ -2504,9 +2509,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     void ILoadingCache<K, V>.Refresh(K key)
     {
         RequireLoader();
-        long start = _ticker.Read();
+        long start = _statsTicker.Read();
         V? loaded = _loader!.Load(key);
-        long elapsed = _ticker.Read() - start;
+        long elapsed = _statsTicker.Read() - start;
         if (loaded == null)
         {
             _statsCounter.RecordLoadFailure(elapsed);

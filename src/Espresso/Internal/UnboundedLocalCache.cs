@@ -26,7 +26,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         _statsCounter = config.StatsCounter;
         _removalListener = config.RemovalListener;
         _executor = config.Executor;
-        _ticker = config.Ticker;
+        _ticker = config.StatsTicker; // used only to time loads
         _loader = loader;
     }
 

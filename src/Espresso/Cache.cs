@@ -234,6 +234,8 @@ public sealed class EspressoBuilder<K, V>
         RemovalListener = _removalListener,
         Executor = _executor ?? ThreadPoolExecutor.Instance,
         Ticker = _ticker ?? (UsesTiming ? Espresso.Ticker.System : Espresso.Ticker.Disabled),
+        // Load times are measured whenever stats are recorded, independent of the expiration features.
+        StatsTicker = _recordStats ? (_ticker ?? Espresso.Ticker.System) : Espresso.Ticker.Disabled,
         Weigher = _weigher ?? SingletonWeigher<K, V>.Instance,
         Expiry = _expiry,
         Scheduler = _scheduler == null || ReferenceEquals(_scheduler, Schedulers.Disabled) ? null : _scheduler,
