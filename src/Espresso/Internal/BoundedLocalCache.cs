@@ -109,6 +109,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly bool _expiresAfterWrite;
     private readonly bool _refreshAfterWrite;
     private readonly bool _expiresVariable;
+    // Whether the policy consumes recorded reads; when false, nothing drains the read buffer, so reads
+    // are not offered to it (otherwise it fills and every hit schedules a no-op maintenance cycle).
+    private readonly bool _tracksAccess;
     private readonly IExpiry<K, V>? _expiry;
     private readonly TimerWheel<K, V>? _timerWheel;
     private readonly Pacer? _pacer;
@@ -169,6 +172,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _expiresAfterWrite = config.ExpiresAfterWrite;
         _refreshAfterWrite = config.RefreshesAfterWrite;
         _expiresVariable = config.ExpiresVariable;
+        _tracksAccess = _evicts || _expiresAfterAccess || _expiresVariable;
         _expiry = config.Expiry;
         _timerWheel = _expiresVariable ? new TimerWheel<K, V>() : null;
         IScheduler? scheduler = config.Scheduler;
@@ -561,7 +565,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// </summary>
     private void AfterRead(Node<K, V> node, long now)
     {
-        bool delayable = _readBuffer.Offer(node) != BufferResult.Full;
+        bool delayable = !_tracksAccess || _readBuffer.Offer(node) != BufferResult.Full;
         if (ShouldDrainBuffers(delayable))
         {
             ScheduleDrainBuffers();
@@ -739,7 +743,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     private void DrainReadBuffer()
     {
-        if (Evicts || ExpiresAfterAccess || ExpiresVariable)
+        if (_tracksAccess)
         {
             _readBuffer.DrainTo(_onAccess);
         }
