@@ -23,7 +23,7 @@ public sealed class PolicyWeightWidthTest
     // positive delta is applied before the first writer's negative one and the transient sum
     // leaves the int range.
     [Fact]
-    public void ReorderedUpdates_LeaveNoRegionResidue()
+    public async Task ReorderedUpdates_LeaveNoRegionResidue()
     {
         const int big = int.MaxValue - 1;
         string original = big.ToString();
@@ -52,7 +52,7 @@ public sealed class PolicyWeightWidthTest
         finally
         {
             release.Set();
-            writer.GetAwaiter().GetResult();
+            await writer;
         }
         cache.CleanUp();
 
