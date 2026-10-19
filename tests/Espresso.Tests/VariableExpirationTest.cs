@@ -41,6 +41,42 @@ public sealed class VariableExpirationTest : CacheTestBase
             .RecordStats()
             .Build();
 
+    [Theory]
+    [InlineData(long.MinValue, long.MinValue)]
+    [InlineData(long.MinValue / 100L - 1L, long.MinValue)]
+    [InlineData(long.MinValue / 100L, long.MinValue / 100L * 100L)]
+    [InlineData(-1L, -100L)]
+    [InlineData(0L, 0L)]
+    [InlineData(1L, 100L)]
+    [InlineData(long.MaxValue / 100L, long.MaxValue / 100L * 100L)]
+    [InlineData(long.MaxValue / 100L + 1L, long.MaxValue)]
+    [InlineData(long.MaxValue, long.MaxValue)]
+    public void FuncExpiry_ConvertsDurationsWithoutOverflow(long ticks, long expected)
+    {
+        TimeSpan duration = TimeSpan.FromTicks(ticks);
+        var expiry = new FuncExpiry<int, string>((_, _) => duration, (_, _) => duration, (_, _) => duration);
+
+        Assert.Equal(expected, expiry.ExpireAfterCreate(1, "v", 0L));
+        Assert.Equal(expected, expiry.ExpireAfterUpdate(1, "v", 0L, 1L));
+        Assert.Equal(expected, expiry.ExpireAfterRead(1, "v", 0L, 1L));
+    }
+
+    [Theory]
+    [InlineData(long.MaxValue, true)]
+    [InlineData(long.MinValue, false)]
+    [InlineData(long.MinValue / 100L - 1L, false)]
+    public void FuncExpiry_LargeDurations_PreserveExpirationSign(long ticks, bool present)
+    {
+        using var cache = Cache.NewBuilder<int, string>()
+            .ExpireAfter((_, _) => TimeSpan.FromTicks(ticks))
+            .Ticker(() => 0L)
+            .Executor(DirectExecutor.Instance)
+            .Build();
+        cache.Put(1, "v");
+
+        Assert.Equal(present ? "v" : null, cache.GetIfPresent(1));
+    }
+
     [Fact]
     public void Get_AfterCreateDurationElapses_ReturnsNull()
     {

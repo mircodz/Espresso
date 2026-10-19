@@ -14,6 +14,24 @@ public sealed class ExpirationTest : CacheTestBase
 
     private static readonly TimeSpan OneMinute = TimeSpan.FromMinutes(1);
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FixedExpiration_MaxValueDuration_DoesNotExpireImmediately(bool access)
+    {
+        var builder = Cache.NewBuilder<int, string>()
+            .Ticker(() => 0L)
+            .Executor(DirectExecutor.Instance);
+        if (access) builder.ExpireAfterAccess(TimeSpan.MaxValue);
+        else builder.ExpireAfterWrite(TimeSpan.MaxValue);
+        using var cache = builder.Build();
+
+        cache.Put(1, "v");
+
+        Assert.Equal("v", cache.GetIfPresent(1));
+        Assert.Equal(1, cache.EstimatedSize());
+    }
+
     [Fact]
     public void ExpireAfterWrite_EvictsAfterDuration()
     {

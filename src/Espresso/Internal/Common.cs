@@ -9,6 +9,14 @@ namespace Espresso.Internal;
 /// </summary>
 internal static class Common
 {
+    internal static long SaturatedToNanos(TimeSpan duration)
+    {
+        long ticks = duration.Ticks;
+        return ticks > long.MaxValue / 100L ? long.MaxValue
+            : ticks < long.MinValue / 100L ? long.MinValue
+            : ticks * 100L;
+    }
+
     /// <summary>Throws <see cref="InvalidOperationException"/> when the state expression is false.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void RequireState(bool expression)
