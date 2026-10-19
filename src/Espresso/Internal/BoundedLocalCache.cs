@@ -37,14 +37,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private const int ExpirationThreshold = 1_000;      // max entries expired per maintenance cycle
     private const long ExpireTolerance = 1_000_000_000; // 1 second, in nanoseconds
 
-    // Adaptive hill-climber constants.
-    private const double HillClimberRestartThreshold = 0.05;
-    private const double HillClimberStepPercent = 0.0625;
-    private const double HillClimberStepDecayRate = 0.98;
-    private const double HillClimberMinInitialStep = 2.0;
-    private const long SmallCacheThreshold = 512L;
-    private const double SmallCacheSampleRatioCap = 4.0;
-    private const double SmallCacheStepDecayRate = 0.995;
+    // The maximum number of entries that can be transferred between queues per maintenance cycle.
     private const int QueueTransferThreshold = 1_000;
 
     // Async future-value sentinels. An in-flight future's expiry timestamp is pushed ~220 years out
@@ -141,11 +134,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private long _windowWeightedSize;
     private long _mainProtectedMaximum;
     private long _mainProtectedWeightedSize;
-    private long _hitsInSample;
-    private long _missesInSample;
-    private double _stepSize;
-    private long _adjustment;
-    private double _previousSampleHitRate;
+
+    // The adaptive window's hill climber; non-null iff the cache evicts (guarded by _evictionLock).
+    private readonly WindowClimber? _climber;
+
+    /// <summary>The adaptive window climber, or <c>null</c> when the cache does not evict (test hook).</summary>
+    internal WindowClimber? Climber => _climber;
 
     private int _drainStatus = Idle;
 
@@ -160,7 +154,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     internal BoundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)
     {
         _drainBuffersTask = new PerformCleanupTask(this).Run;
-        _onAccess = OnAccess;
+        _onAccess = OnAccessHit;
         _data = new ConcurrentHashMap<K, Node<K, V>>(config.InitialCapacity);
         _statsCounter = config.StatsCounter;
         _removalListener = config.RemovalListener;
@@ -196,6 +190,13 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _nodeFeatures = features;
 
         SetMaximum(config.Maximum);
+        if (_evicts)
+        {
+            // The climber does not exist during the initial sizing, so it is created afterwards and
+            // replays the resize for the configured maximum.
+            _climber = new WindowClimber();
+            _climber.Resized(_maximum);
+        }
     }
 
     // ----- feature predicates -----
@@ -227,17 +228,20 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return; // an expiration-only cache has no size bound
         }
         long max = Math.Min(maximum, MaximumCapacity);
+        if (max == _maximum)
+        {
+            return;
+        }
+
         long window = max - (long)(PercentMain * max);
         long mainProtected = (long)(PercentMainProtected * (max - window));
 
         _maximum = max;
         _windowMaximum = window;
         _mainProtectedMaximum = mainProtected;
-        _hitsInSample = 0;
-        _missesInSample = 0;
 
-        double stepSize = Math.Max(HillClimberStepPercent * max, HillClimberMinInitialStep);
-        _stepSize = max <= SmallCacheThreshold ? stepSize : -stepSize;
+        // null during the constructor's initial sizing; the constructor replays this once created
+        _climber?.Resized(_maximum);
 
         if (!_isWeighted && _weightedSize >= (max >>> 1))
         {
@@ -1124,14 +1128,31 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             return;
         }
-        DetermineAdjustment();
+
+        WindowClimber climber = _climber!;
+        if (_sketch.IsNotInitialized)
+        {
+            climber.ResetSample();
+        }
+        else if (_weightedSize >= (_maximum >>> 1))
+        {
+            climber.DetermineAdjustment(_maximum, _windowMaximum,
+                _mainProtectedMaximum, _sketch.sampleSize);
+        }
+        else
+        {
+            // A cache below half its maximum is not evicting, so its hit rate does not describe the
+            // window/main split; discard full samples, keeping the hit rate from before the gap.
+            climber.DiscardSample(_maximum, _sketch.sampleSize);
+        }
+
         DemoteFromMainProtected();
-        long amount = _adjustment;
+        long amount = climber.Adjustment();
         if (amount == 0)
         {
             return;
         }
-        if (amount > 0)
+        else if (amount > 0)
         {
             IncreaseWindow();
         }
@@ -1141,53 +1162,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
     }
 
-    /// <summary>Calculates how much to adapt the window by and stores it in <see cref="_adjustment"/>.</summary>
-    private void DetermineAdjustment()
-    {
-        if (_sketch.IsNotInitialized)
-        {
-            _previousSampleHitRate = 0.0;
-            _missesInSample = 0;
-            _hitsInSample = 0;
-            return;
-        }
-
-        long requestCount = _hitsInSample + _missesInSample;
-        double stepDecayRate = HillClimberStepDecayRate;
-        long effectiveSampleSize = _sketch.sampleSize;
-        if (_maximum <= SmallCacheThreshold)
-        {
-            // Grow the sample period as the step size decays to avoid converging near the initial ratio.
-            double initialStep = HillClimberStepPercent * _maximum;
-            double magnitude = Math.Max(initialStep / SmallCacheSampleRatioCap, Math.Abs(_stepSize));
-            double ratio = (magnitude == 0.0)
-                ? 1.0
-                : Math.Max(1.0, Math.Min(SmallCacheSampleRatioCap, initialStep / magnitude));
-            effectiveSampleSize = (long)(effectiveSampleSize * ratio);
-            stepDecayRate = SmallCacheStepDecayRate;
-        }
-        if (requestCount < effectiveSampleSize)
-        {
-            return;
-        }
-
-        double hitRate = (double)_hitsInSample / requestCount;
-        double hitRateChange = hitRate - _previousSampleHitRate;
-        double amount = (hitRateChange >= 0) ? _stepSize : -_stepSize;
-        double nextStepSize = (Math.Abs(hitRateChange) >= HillClimberRestartThreshold)
-            ? Math.CopySign(Math.Max(HillClimberStepPercent * _maximum, HillClimberMinInitialStep), amount)
-            : (stepDecayRate * amount);
-        _previousSampleHitRate = hitRate;
-        _adjustment = (long)amount;
-        _stepSize = nextStepSize;
-        _missesInSample = 0;
-        _hitsInSample = 0;
-    }
-
     /// <summary>
     /// Increases the admission window by shrinking the main space's protected region, transferring
     /// nodes from probation/protected into the window (up to the per-cycle transfer cap), and carries
-    /// any unfulfilled remainder over to the next cycle via <see cref="_adjustment"/>.
+    /// any unfulfilled remainder over to the next cycle via <see cref="WindowClimber.CarryOver"/>.
     /// </summary>
     private void IncreaseWindow()
     {
@@ -1196,7 +1174,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
 
-        long quota = Math.Min(_adjustment, _mainProtectedMaximum);
+        long quota = Math.Min(_climber!.Adjustment(), _mainProtectedMaximum);
         _mainProtectedMaximum -= quota;
         _windowMaximum += quota;
         DemoteFromMainProtected();
@@ -1238,7 +1216,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         _mainProtectedMaximum += quota;
         _windowMaximum -= quota;
-        _adjustment = quota;
+        _climber.CarryOver(quota);
     }
 
     /// <summary>Decreases the admission window and grows the main space's protected region.</summary>
@@ -1249,7 +1227,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
 
-        long quota = Math.Min(-_adjustment, Math.Max(0, _windowMaximum - 1));
+        long quota = Math.Min(-_climber!.Adjustment(), Math.Max(0, _windowMaximum - 1));
         _mainProtectedMaximum += quota;
         _windowMaximum -= quota;
 
@@ -1276,36 +1254,36 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         _mainProtectedMaximum -= quota;
         _windowMaximum += quota;
-        _adjustment = -quota;
+        _climber.CarryOver(-quota);
     }
 
-    /// <summary>Transfers nodes from the protected to the probation region when it exceeds its maximum.</summary>
+    /// <summary>
+    /// Transfers nodes from the protected to the probation region while it exceeds its maximum. The
+    /// transfer is bounded per maintenance cycle; a remaining backlog re-arms the drain so it is
+    /// processed across cycles rather than left until the next access.
+    /// </summary>
     private void DemoteFromMainProtected()
     {
         long mainProtectedMaximum = _mainProtectedMaximum;
-        long mainProtectedWeightedSize = _mainProtectedWeightedSize;
-        if (mainProtectedWeightedSize <= mainProtectedMaximum)
+        int remaining = QueueTransferThreshold;
+        while (_mainProtectedWeightedSize > mainProtectedMaximum)
         {
-            return;
-        }
-
-        for (int i = 0; i < QueueTransferThreshold; i++)
-        {
-            if (mainProtectedWeightedSize <= mainProtectedMaximum)
-            {
-                break;
-            }
-
-            Node<K, V>? demoted = _protectedDeque.PollFirst();
+            Node<K, V>? demoted = _protectedDeque.PeekFirst;
             if (demoted == null)
             {
                 break;
             }
-            demoted.MakeMainProbation();
+            if (remaining == 0)
+            {
+                Volatile.Write(ref _drainStatus, ProcessingToRequired);
+                break;
+            }
+            _mainProtectedWeightedSize -= demoted.PolicyWeight;
+            _protectedDeque.Remove(demoted);
             _probationDeque.OfferLast(demoted);
-            mainProtectedWeightedSize -= demoted.PolicyWeight;
+            demoted.MakeMainProbation();
+            remaining--;
         }
-        _mainProtectedWeightedSize = mainProtectedWeightedSize;
     }
 
     /// <summary>
@@ -1454,7 +1432,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     // ----- access policy -----
 
-    private void OnAccess(Node<K, V> node)
+    private void OnAccessHit(Node<K, V> node) => OnAccess(node, Access.Hit);
+
+    private void OnAccess(Node<K, V> node, Access access)
     {
         if (Evicts)
         {
@@ -1462,13 +1442,17 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 return;
             }
-            object keyRef = node.KeyReference;
-            _sketch.Increment(keyRef);
-            if (node.InWindow)
+            if (access.RecordsUsage())
+            {
+                _sketch.Increment(node.KeyReference);
+            }
+            bool inWindow = node.InWindow;
+            bool inProbation = !inWindow && node.InMainProbation;
+            if (inWindow)
             {
                 Reorder(_windowDeque, node);
             }
-            else if (node.InMainProbation)
+            else if (inProbation)
             {
                 ReorderProbation(node);
             }
@@ -1476,7 +1460,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Reorder(_protectedDeque, node);
             }
-            _hitsInSample++;
+            if (access.RecordsHit() && (node.PolicyWeight != 0))
+            {
+                // A zero-weight entry (an in-flight async load) earns hits with no capacity, so it must
+                // not steer the sizing; the sketch still observes the key.
+                _climber!.RecordHit(inWindow, inProbation);
+            }
         }
         else if (ExpiresAfterAccess)
         {
@@ -1876,7 +1865,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                         c._sketch.EnsureCapacity(capacity);
                     }
                 }
-                c._missesInSample++;
+                c._climber!.RecordMiss();
             }
 
             bool isAlive;
@@ -1970,12 +1959,19 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         private readonly BoundedLocalCache<K, V> _cache;
         private readonly Node<K, V> _node;
         private readonly int _weightDifference;
+        private readonly Access _access;
 
         public UpdateTask(BoundedLocalCache<K, V> cache, Node<K, V> node, int weightDifference)
+            : this(cache, node, weightDifference, Access.Hit)
+        {
+        }
+
+        public UpdateTask(BoundedLocalCache<K, V> cache, Node<K, V> node, int weightDifference, Access access)
         {
             _cache = cache;
             _node = node;
             _weightDifference = weightDifference;
+            _access = access;
         }
 
         // Deliberately no dead-guard: pairs with MakeDead's telescoping-sum subtraction.
@@ -1992,10 +1988,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             if (!c.Evicts)
             {
-                if (c.ExpiresAfterAccess) { c.OnAccess(_node); }
+                if (c.ExpiresAfterAccess) { c.OnAccess(_node, _access); }
                 return;
             }
 
+            if (_access.RecordsMiss())
+            {
+                c._climber!.RecordMiss();
+            }
             _node.PolicyWeight += _weightDifference;
             if (_node.InWindow)
             {
@@ -2006,7 +2006,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 else if (_node.PolicyWeight <= c._windowMaximum)
                 {
-                    c.OnAccess(_node);
+                    c.OnAccess(_node, _access);
                 }
                 else if (c._windowDeque.Contains(_node))
                 {
@@ -2017,7 +2017,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 if (_node.PolicyWeight <= c._maximum)
                 {
-                    c.OnAccess(_node);
+                    c.OnAccess(_node, _access);
                 }
                 else
                 {
@@ -2029,7 +2029,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 c._mainProtectedWeightedSize += _weightDifference;
                 if (_node.PolicyWeight <= c._maximum)
                 {
-                    c.OnAccess(_node);
+                    c.OnAccess(_node, _access);
                 }
                 else
                 {
@@ -2208,7 +2208,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             int weightedDifference = mayUpdate ? (newWeight - oldWeight) : 0;
             if (weightedDifference != 0 || expired)
             {
-                AfterWrite(new UpdateTask(this, prior, weightedDifference));
+                // An expired entry is reloaded in place: the climber takes the miss an insertion would
+                // have recorded, rather than crediting a hit.
+                Access access = expired ? Access.Reload : Access.Hit;
+                AfterWrite(new UpdateTask(this, prior, weightedDifference, access));
             }
             else if (!onlyIfAbsent && exceedsTolerance)
             {
@@ -2384,7 +2387,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         else
         {
-            AfterWrite(new UpdateTask(this, node, newWeight - oldWeight));
+            // An expired entry was reloaded in place: the climber takes the miss an insertion would
+            // have recorded, rather than crediting a hit.
+            AfterWrite(new UpdateTask(this, node, newWeight - oldWeight, Access.Reload));
         }
         return newValue;
     }
@@ -2835,4 +2840,35 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             throw new InvalidOperationException("this cache was built without a loader");
         }
     }
+}
+
+/// <summary>What an access records beyond the reorder.</summary>
+internal enum Access
+{
+    /// <summary>The sketch observes the key and the climber's sample earns a hit.</summary>
+    Hit,
+
+    /// <summary>
+    /// The sketch observes the key and the climber's sample takes the miss an insertion would have
+    /// recorded (an expired entry reloaded in place).
+    /// </summary>
+    Reload,
+
+    /// <summary>Neither the sketch nor the climber observes the access; only the reorder applies.</summary>
+    Quiet,
+}
+
+internal static class AccessExtensions
+{
+    /// <summary>Returns whether the admission filter observes the key.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool RecordsUsage(this Access access) => access != Access.Quiet;
+
+    /// <summary>Returns whether the climber's sample earns a hit.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool RecordsHit(this Access access) => access == Access.Hit;
+
+    /// <summary>Returns whether the climber's sample takes the miss an insertion would have recorded.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool RecordsMiss(this Access access) => access == Access.Reload;
 }
