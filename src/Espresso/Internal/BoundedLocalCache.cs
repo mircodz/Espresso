@@ -862,11 +862,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
         int remaining = ExpirationThreshold;
-        remaining = ExpireAfterAccessEntries(_windowDeque, now, remaining);
+        remaining = ExpireAfterAccessEntries(_windowDeque, Node<K, V>.Window, now, remaining);
         if (_evicts)
         {
-            remaining = ExpireAfterAccessEntries(_probationDeque, now, remaining);
-            remaining = ExpireAfterAccessEntries(_protectedDeque, now, remaining);
+            remaining = ExpireAfterAccessEntries(_probationDeque, Node<K, V>.Probation, now, remaining);
+            remaining = ExpireAfterAccessEntries(_protectedDeque, Node<K, V>.Protected, now, remaining);
         }
         if (remaining == 0)
         {
@@ -874,7 +874,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
     }
 
-    private int ExpireAfterAccessEntries(AccessOrderDeque<Node<K, V>> deque, long now, int remaining)
+    private int ExpireAfterAccessEntries(AccessOrderDeque<Node<K, V>> deque, int queueType, long now, int remaining)
     {
         Node<K, V>? head = deque.PeekFirst;
         if (head == null)
@@ -890,7 +890,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 // A stale position can arise from lock-free access-time updates; re-sort and continue.
                 bool stalePosition = (last.AccessTime - node.AccessTime) < 0;
-                if (stalePosition)
+                if (stalePosition || IsComputingAsync(node))
                 {
                     deque.MoveToBack(node);
                     node = next;
@@ -900,7 +900,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             EvictEntry(node, RemovalCause.Expired, now);
             remaining--;
-            node = next;
+
+            // Inline callbacks can unlink successors or transfer the captured tail to another queue.
+            node = ReferenceEquals(node, last) ? null : deque.PeekFirst;
+            bool bounded = last.QueueType == queueType && deque.Contains(last);
+            if (node != null && !bounded)
+            {
+                return 0;
+            }
         }
         return remaining;
     }
@@ -925,7 +932,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             if ((now - node.WriteTime) < duration)
             {
                 bool stalePosition = (last.WriteTime - node.WriteTime) < 0;
-                if (stalePosition)
+                if (stalePosition || IsComputingAsync(node))
                 {
                     _writeOrderDeque.MoveToBack(node);
                     node = next;
@@ -935,7 +942,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             EvictEntry(node, RemovalCause.Expired, now);
             remaining--;
-            node = next;
+
+            // Resume from live links and stop if reentrant maintenance removed the scan's bound.
+            node = ReferenceEquals(node, last) ? null : _writeOrderDeque.PeekFirst;
+            if (node != null && !_writeOrderDeque.Contains(last))
+            {
+                remaining = 0;
+                break;
+            }
         }
         if (remaining == 0)
         {
