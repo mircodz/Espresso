@@ -48,14 +48,22 @@ internal sealed class FrequencySketch
     {
         ArgumentOutOfRangeException.ThrowIfNegative(maximumSize);
         int maximum = Math.Max((int)Math.Min(maximumSize, int.MaxValue >>> 1), MinSketchSize);
+        int sample = (int)Math.Min(10L * maximum, int.MaxValue);
         if (table != null && table.Length >= maximum)
         {
+            // The table is kept, but the sample period (which also paces the window climber) follows
+            // the requested size so that a smaller maximum does not keep the larger cadence.
+            if (sample != sampleSize)
+            {
+                sampleSize = sample;
+                size = Math.Min(size, sampleSize - 1);
+            }
             return;
         }
 
-        sampleSize = (int)Math.Min(10L * maximum, int.MaxValue);
         table = new long[Common.CeilingPowerOfTwo(maximum)];
         blockMask = (table.Length >>> 3) - 1;
+        sampleSize = sample;
         size = 0;
     }
 
@@ -183,6 +191,6 @@ internal sealed class FrequencySketch
             count += BitOperations.PopCount((ulong)(t[i] & OneMask));
             t[i] = (t[i] >>> 1) & ResetMask;
         }
-        size = (int)((size - (count >>> 2)) >>> 1);
+        size = Math.Max(0, (int)((size - (count >>> 2)) >>> 1));
     }
 }

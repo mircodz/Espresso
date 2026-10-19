@@ -41,8 +41,83 @@ public sealed class FrequencySketchTest
         int size = sketch.table!.Length;
         sketch.EnsureCapacity(size / 2);
         Assert.Equal(size, sketch.table!.Length);
-        Assert.Equal(10 * size, sketch.sampleSize);
+        Assert.Equal(10 * size / 2, sketch.sampleSize);
         Assert.Equal((size >> 3) - 1, sketch.blockMask);
+    }
+
+    [Fact]
+    public void EnsureCapacity_Shrink_ResetReachable()
+    {
+        var sketch = MakeSketch(1_024);
+        sketch.size = 5_000;
+
+        // The table is retained but the aging period tracks the new maximum, with the observed
+        // count clamped so that the equality reset test remains reachable
+        sketch.EnsureCapacity(256);
+        Assert.Equal(1_024, sketch.table!.Length);
+        Assert.Equal(2_560, sketch.sampleSize);
+        Assert.Equal(2_559, sketch.size);
+
+        // the next observed addition reaches the sample threshold and triggers the aging cycle
+        sketch.Increment(_item);
+        Assert.Equal(1_279, sketch.size);
+    }
+
+    [Fact]
+    public void EnsureCapacity_Shrink_DenseTable_AgesOnSchedule()
+    {
+        var sketch = MakeSketch(1_024);
+        Array.Fill(sketch.table!, FrequencySketch.OneMask);
+        sketch.size = 5_000;
+
+        sketch.EnsureCapacity(256);
+        Assert.Equal(2_559, sketch.size);
+
+        // The retained table's counter mass is denominated in the old maximum and outweighs the
+        // observations the reset corrects against it. An underflow here stalls aging for as many
+        // additions as it went negative by, restoring the old size's cadence that the retrack removes.
+        sketch.Increment(_item);
+        Assert.Equal(0, sketch.size);
+        Assert.Equal(1, sketch.Frequency(_item));
+    }
+
+    [Fact]
+    public void EnsureCapacity_RepeatedRetrack_ResetReachable()
+    {
+        var sketch = MakeSketch(1_024);
+        for (int i = 0; i < 15; i++)
+        {
+            sketch.Increment(_item);
+        }
+        Assert.Equal(15, sketch.Frequency(_item));
+
+        // A weighted cache retracks on every addition as its entry count wobbles, so a repeated
+        // clamp must not discard the aging progress and starve the periodic reset
+        for (int i = 0; i < 15_000; i++)
+        {
+            sketch.Increment(i);
+            sketch.EnsureCapacity(1_024 - (i & 1));
+        }
+        Assert.True(sketch.Frequency(_item) < 15);
+    }
+
+    [Fact]
+    public void EnsureCapacity_Retrack_KeepsAgingProgress()
+    {
+        var sketch = MakeSketch(1_024);
+        for (int i = 0; i < 15; i++)
+        {
+            sketch.Increment(_item);
+        }
+        int size = sketch.size;
+
+        // a retrack may only clamp the observed count to keep the reset reachable, never advance it
+        // towards the sample threshold, else a weighted cache's per-addition retracks age the sketch
+        // on nearly every increment and admission degrades towards random
+        sketch.EnsureCapacity(512);
+        Assert.Equal(5_120, sketch.sampleSize);
+        Assert.Equal(size, sketch.size);
+        Assert.Equal(15, sketch.Frequency(_item));
     }
 
     [Fact]

@@ -38,6 +38,29 @@ internal static class Common
     }
 
     /// <summary>
+    /// Converts a double to a long by truncating toward zero, saturating at
+    /// <see cref="long.MinValue"/>/<see cref="long.MaxValue"/>, and mapping NaN to zero. A plain cast
+    /// leaves out-of-range and NaN conversions platform-dependent on .NET 8.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ToLongSaturating(double value)
+    {
+        if (double.IsNaN(value))
+        {
+            return 0L;
+        }
+        if (value >= 9.2233720368547758E18) // 2^63
+        {
+            return long.MaxValue;
+        }
+        if (value <= -9.2233720368547758E18) // -2^63
+        {
+            return long.MinValue;
+        }
+        return (long)value;
+    }
+
+    /// <summary>
     /// Returns the smallest power of two greater than or equal to <paramref name="x"/>,
     /// else the maximum. (Hacker's Delight, ch.3.)
     /// </summary>
