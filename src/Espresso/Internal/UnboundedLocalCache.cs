@@ -60,19 +60,28 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
             return current;
         }
 
-        // Miss: compute under the bin lock so the function runs atomically, at most once.
+        // Miss: compute under the bin lock so the function runs atomically, at most once. The miss is
+        // recorded before loading and a throwing load is recorded as a failure (Caffeine's statsAware).
         bool[] loaded = { false };
         long startTime = 0;
         V? result = _data.ComputeIfAbsent(key, k =>
         {
             loaded[0] = true;
+            _statsCounter.RecordMisses(1);
             startTime = _ticker.Read();
-            return mappingFunction(k);
+            try
+            {
+                return mappingFunction(k);
+            }
+            catch
+            {
+                _statsCounter.RecordLoadFailure(_ticker.Read() - startTime);
+                throw;
+            }
         });
 
         if (loaded[0])
         {
-            _statsCounter.RecordMisses(1);
             long elapsed = _ticker.Read() - startTime;
             if (result != null)
             {

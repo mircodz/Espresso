@@ -32,7 +32,7 @@ public class ComputeIfAbsentTest
     }
 
     [Fact]
-    public void Get_HitRacingInvalidate_NeverReturnsNullForNonNullLoader()
+    public async Task Get_HitRacingInvalidate_NeverReturnsNullForNonNullLoader()
     {
         for (int i = 0; i < 200; i++)
         {
@@ -50,7 +50,7 @@ public class ComputeIfAbsentTest
             cache.Invalidate(1); // removal task drains inline and kills the node
             expiry.Release.Set();
 
-            string? result = reader.GetAwaiter().GetResult();
+            string? result = await reader;
             Assert.True(result is "old" or "loaded", $"iteration {i}: Get returned '{result ?? "null"}'");
         }
     }

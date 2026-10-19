@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Espresso.Stats;
@@ -2103,99 +2104,234 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
         }
 
-        long now = _ticker.Read();
-        Node<K, V>? newNode = null;
-        Node<K, V>? updatedNode = null;
-        V? computed = null;
-        bool ran = false;
-        int updateWeightDifference = 0;
-        // When an expired node is replaced in place, its prior value/weight/cause are captured so the
-        // EXPIRED removal notification and eviction stat fire after the atomic section.
-        V? expiredOldValue = null;
-        int expiredOldWeight = 0;
-        long loadStart = 0L;
+        return DoComputeIfAbsent(key, mappingFunction, recordStats, recordLoad, readNow);
+    }
 
-        _data.Compute(key, (k, node) =>
+    /// <summary>
+    /// The miss path of <see cref="ComputeIfAbsent"/> (Caffeine's <c>doComputeIfAbsent</c>). An absent
+    /// key is loaded under the bin lock. A present node is re-validated under its own monitor (which
+    /// optimized puts use), and if it has expired it is recomputed while that monitor is held: a
+    /// replacement is weighed and timed before the node is mutated, while a null or throwing
+    /// recomputation retires the node and enqueues its removal. The expired value is reported as an
+    /// eviction either way.
+    /// </summary>
+    private V? DoComputeIfAbsent(K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad, long now)
+    {
+        V? oldValue = null;
+        V? newValue = null;
+        int oldWeight = 0;
+        int newWeight = 0;
+        RemovalCause? cause = null;
+        Node<K, V>? removed = null;
+        ExceptionDispatchInfo? failure = null;
+
+        Node<K, V>? node = _data.Compute(key, (k, n) =>
         {
-            if (node != null && node.Value != null && !HasExpired(node, now))
+            if (n == null)
             {
-                computed = node.Value;
-                return node;
-            }
-            ran = true;
-            loadStart = _statsTicker.Read();
-            computed = mappingFunction(k);
-            if (computed == null)
-            {
-                // Absent (or an expired node with no replacement) — remove any stale node.
-                return null;
-            }
-            int weight = WeighEntry(k, computed);
-            if (node != null)
-            {
-                // Refresh an expired node in place so its identity (and policy links) are preserved.
-                lock (node)
+                newValue = recordStats ? LoadWithStats(key, mappingFunction, recordLoad) : mappingFunction(key);
+                if (newValue == null)
                 {
-                    // Compute the variable-expiration time BEFORE mutating the node so that a throwing
-                    // user IExpiry leaves the node untouched.
-                    long varTime = ExpireAfterCreate(k, computed, now);
-                    expiredOldValue = node.Value;
-                    expiredOldWeight = node.Weight;
-                    updateWeightDifference = weight - expiredOldWeight;
-                    node.Value = computed;
-                    node.Weight = weight;
-                    SetVariableTime(node, varTime);
-                    if (_expiresAfterWrite || _refreshAfterWrite) node.WriteTime = now;
-                    if (_expiresAfterAccess) node.AccessTime = now;
+                    DiscardRefreshForKey(k);
+                    return null;
                 }
-                updatedNode = node;
-                return node;
+                now = _ticker.Read();
+                newWeight = WeighEntry(key, newValue);
+                Node<K, V> created = NodeFactory.Create(_nodeFeatures, k, newValue, newWeight, now);
+                SetVariableTime(created, ExpireAfterCreate(key, newValue, now));
+                StampAsyncExpiryIfComputing(created, now);
+                DiscardRefreshForKey(k);
+                return created;
             }
-            newNode = NodeFactory.Create(_nodeFeatures, k, computed, weight, now);
-            SetVariableTime(newNode, ExpireAfterCreate(k, computed, now));
-            StampAsyncExpiryIfComputing(newNode, now);
-            return newNode;
+
+            lock (n)
+            {
+                oldValue = n.Value;
+                oldWeight = n.Weight;
+                if (oldValue == null)
+                {
+                    cause = RemovalCause.Collected;
+                }
+                else if (HasExpired(n, now = _ticker.Read()))
+                {
+                    cause = RemovalCause.Expired;
+                }
+                else
+                {
+                    return n; // a live entry won the race: this is a hit
+                }
+
+                object keyRef = n.KeyReference;
+                try
+                {
+                    newValue = recordStats ? LoadWithStats(key, mappingFunction, recordLoad) : mappingFunction(key);
+                    if (newValue == null)
+                    {
+                        DiscardRefresh(keyRef);
+                        removed = n;
+                        n.Retire();
+                        return null;
+                    }
+                    now = _ticker.Read();
+                    newWeight = WeighEntry(key, newValue);
+                    long varTime = ExpireAfterCreate(key, newValue, now);
+
+                    n.Value = newValue;
+                    n.Weight = newWeight;
+                    long expirationTime = IsComputingAsync(newValue) ? (now + AsyncExpiry) : now;
+                    if (_expiresAfterAccess) n.AccessTime = expirationTime;
+                    if (_expiresAfterWrite || _refreshAfterWrite) n.WriteTime = expirationTime;
+                    SetVariableTime(n, varTime);
+                    DiscardRefresh(keyRef);
+                    return n;
+                }
+                catch (Exception e)
+                {
+                    newValue = null;
+                    DiscardRefresh(keyRef);
+                    failure = ExceptionDispatchInfo.Capture(e);
+                    removed = n;
+                    n.Retire();
+                    return null;
+                }
+            }
         });
 
-        if (ran)
+        if (cause != null)
         {
-            if (recordStats) _statsCounter.RecordMisses(1);
-            if (newNode != null)
+            _statsCounter.RecordEviction(oldWeight, cause.Value);
+            NotifyRemoval(key, oldValue, cause.Value);
+        }
+        if (node == null)
+        {
+            if (removed != null)
             {
-                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_statsTicker.Read() - loadStart);
-                AfterWrite(new AddTask(this, newNode, newNode.Weight));
+                AfterWrite(new RemovalTask(this, removed));
             }
-            else if (updatedNode != null)
+            failure?.Throw();
+            return null;
+        }
+        if (oldValue != null && newValue == null)
+        {
+            // Contended hit: another writer installed a live value before this thread's computation.
+            if (!IsComputingAsync(oldValue))
             {
-                if (recordStats && recordLoad) _statsCounter.RecordLoadSuccess(_statsTicker.Read() - loadStart);
-                // The replaced node had expired: report the eviction and propagate the weight delta.
-                if (expiredOldValue != null)
-                {
-                    _statsCounter.RecordEviction(expiredOldWeight, RemovalCause.Expired);
-                    NotifyRemoval(key, expiredOldValue, RemovalCause.Expired);
-                }
-                AfterWrite(new UpdateTask(this, updatedNode, updateWeightDifference));
+                TryExpireAfterRead(node, key, oldValue, now);
+                SetAccessTime(node, now);
             }
-            else if (recordStats && recordLoad)
-            {
-                _statsCounter.RecordLoadFailure(_statsTicker.Read() - loadStart);
-            }
+            if (recordStats) _statsCounter.RecordHits(1);
+            AfterRead(node, now);
+            return oldValue;
+        }
+        if (oldValue == null && cause == null)
+        {
+            AfterWrite(new AddTask(this, node, newWeight));
         }
         else
         {
-            if (recordStats) _statsCounter.RecordHits(1);
-            if (existing != null) AfterRead(existing, now);
+            AfterWrite(new UpdateTask(this, node, newWeight - oldWeight));
         }
-        return computed;
+        return newValue;
+    }
+
+    /// <summary>
+    /// Invokes a loading function with Caffeine's <c>statsAware</c> accounting: the miss is recorded
+    /// before the call, a throw is recorded as a load failure, and (when <paramref name="recordLoad"/>)
+    /// a returned value as a load success or, if null, a load failure.
+    /// </summary>
+    private V? LoadWithStats(K key, Func<K, V?> mappingFunction, bool recordLoad)
+    {
+        _statsCounter.RecordMisses(1);
+        long start = _statsTicker.Read();
+        V? value;
+        try
+        {
+            value = mappingFunction(key);
+        }
+        catch
+        {
+            _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
+            throw;
+        }
+        if (recordLoad)
+        {
+            long loadTime = _statsTicker.Read() - start;
+            if (value == null)
+            {
+                _statsCounter.RecordLoadFailure(loadTime);
+            }
+            else
+            {
+                _statsCounter.RecordLoadSuccess(loadTime);
+            }
+        }
+        return value;
     }
 
     public V? Remove(K key)
     {
         ThrowIfKeyNull(key);
         Node<K, V>? removed = null;
-        V? value = null;
-        bool expired = false;
-        long now = _ticker.Read();
+        V? oldValue = null;
+        int oldWeight = 0;
+        RemovalCause? cause = null;
+        _data.Compute(key, (k, node) =>
+        {
+            if (node == null)
+            {
+                DiscardRefreshForKey(k);
+                return null;
+            }
+            lock (node)
+            {
+                oldValue = node.Value;
+                oldWeight = node.Weight;
+                if (oldValue == null)
+                {
+                    cause = RemovalCause.Collected;
+                }
+                else if (HasExpired(node, _ticker.Read()))
+                {
+                    cause = RemovalCause.Expired;
+                }
+                else
+                {
+                    cause = RemovalCause.Explicit;
+                }
+                DiscardRefresh(node.KeyReference);
+                removed = node;
+                node.Retire();
+            }
+            return null;
+        });
+
+        if (cause == null)
+        {
+            return null;
+        }
+        AfterWrite(new RemovalTask(this, removed!));
+        if (cause != RemovalCause.Explicit)
+        {
+            // An already-expired entry is an eviction, and its stale value is not returned.
+            _statsCounter.RecordEviction(oldWeight, cause.Value);
+        }
+        NotifyRemoval(key, oldValue, cause.Value);
+        return (cause == RemovalCause.Explicit) ? oldValue : null;
+    }
+
+    /// <summary>
+    /// Removes the key only if it currently maps to <paramref name="value"/>. An expired entry is
+    /// removed as <see cref="RemovalCause.Expired"/> regardless of its value, and the call returns
+    /// <c>false</c> because no live mapping was removed.
+    /// </summary>
+    public bool Remove(K key, V value)
+    {
+        ThrowIfKeyNull(key);
+        ArgumentNullException.ThrowIfNull(value);
+        Node<K, V>? removed = null;
+        V? oldValue = null;
+        int oldWeight = 0;
+        RemovalCause cause = RemovalCause.Explicit;
         _data.Compute(key, (_, node) =>
         {
             if (node == null)
@@ -2204,68 +2340,49 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             lock (node)
             {
-                value = node.Value;
-                expired = value != null && HasExpired(node, now);
-                node.Retire();
-                removed = node;
-            }
-            return null;
-        });
-
-        if (removed != null)
-        {
-            DiscardRefresh(key); // cancel any in-flight reload for the removed key
-            AfterWrite(new RemovalTask(this, removed));
-            if (value != null)
-            {
-                // An already-expired entry is reported as EXPIRED, and its stale value is not
-                // returned to the caller.
-                NotifyRemoval(key, value, expired ? RemovalCause.Expired : RemovalCause.Explicit);
-            }
-            return expired ? null : value;
-        }
-        return null;
-    }
-
-    /// <summary>Removes the key only if it currently maps to <paramref name="value"/>.</summary>
-    public bool Remove(K key, V value)
-    {
-        ThrowIfKeyNull(key);
-        ArgumentNullException.ThrowIfNull(value);
-        Node<K, V>? removed = null;
-        _data.Compute(key, (_, node) =>
-        {
-            if (node == null)
-            {
-                return node;
-            }
-            lock (node)
-            {
-                if (!ReferenceEquals(node.Value, value) && !value.Equals(node.Value))
+                oldValue = node.Value;
+                oldWeight = node.Weight;
+                if (oldValue == null)
+                {
+                    cause = RemovalCause.Collected;
+                }
+                else if (HasExpired(node, _ticker.Read()))
+                {
+                    cause = RemovalCause.Expired;
+                }
+                else if (ReferenceEquals(oldValue, value) || value.Equals(oldValue))
+                {
+                    cause = RemovalCause.Explicit;
+                }
+                else
                 {
                     return node; // value no longer matches; leave it
                 }
-                node.Retire();
+                DiscardRefresh(node.KeyReference);
                 removed = node;
+                node.Retire();
             }
             return null;
         });
 
-        if (removed != null)
+        if (removed == null)
         {
-            DiscardRefresh(key);
-            AfterWrite(new RemovalTask(this, removed));
-            NotifyRemoval(key, value, RemovalCause.Explicit);
-            return true;
+            return false;
         }
-        return false;
+        AfterWrite(new RemovalTask(this, removed));
+        if (cause != RemovalCause.Explicit)
+        {
+            _statsCounter.RecordEviction(oldWeight, cause);
+        }
+        NotifyRemoval(key, oldValue, cause);
+        return cause == RemovalCause.Explicit;
     }
 
     /// <summary>
-    /// Replaces the value only if the key currently maps to <paramref name="oldValue"/>. When the new
-    /// value equals the old (the async completion case: replacing a future with itself), this still
-    /// re-weighs the entry and resets its expiry timestamps to now, so the real timers start once the
-    /// in-flight future has resolved.
+    /// Replaces the value only if the key currently maps to a live (unexpired) <paramref name="oldValue"/>.
+    /// When the new value is the same instance (the async completion case: replacing a future with
+    /// itself), this still re-weighs the entry and resets its expiry timestamps, so the real timers start
+    /// once the in-flight future has resolved; only a different instance is reported as replaced.
     /// </summary>
     public bool Replace(K key, V oldValue, V newValue)
     {
@@ -2273,60 +2390,73 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         ArgumentNullException.ThrowIfNull(oldValue);
         ArgumentNullException.ThrowIfNull(newValue);
         int weight = WeighEntry(key, newValue);
-        long now = _ticker.Read();
 
-        Node<K, V>? updated = null;
-        int weightDifference = 0;
+        V? replaced = null;
+        int oldWeight = 0;
+        long now = 0L;
         bool exceedsTolerance = false;
-        _data.Compute(key, (_, node) =>
+        Node<K, V>? node = _data.Compute(key, (_, n) =>
         {
-            if (node == null)
+            if (n == null)
             {
-                return node;
+                return null;
             }
-            lock (node)
+            lock (n)
             {
-                V? current = node.Value;
+                V? current = n.Value;
                 if (current == null
-                    || (!ReferenceEquals(current, oldValue) && !oldValue.Equals(current)))
+                    || (!ReferenceEquals(current, oldValue) && !oldValue.Equals(current))
+                    || HasExpired(n, now = _ticker.Read()))
                 {
-                    return node; // old value no longer present
+                    return n; // old value no longer present (or expired); leave it
                 }
-                int oldWeight = node.Weight;
-                long oldVarTime = node.VariableTime;
-                long varTime = ExpireAfterUpdate(node, key, newValue, now);
-                node.Value = newValue;
-                node.Weight = weight;
-                weightDifference = weight - oldWeight;
-                bool writeExceeds = ExceedsWriteTimeTolerance(node, now);
+                oldWeight = n.Weight;
+                long oldVarTime = n.VariableTime;
+                long varTime = ExpireAfterUpdate(n, key, newValue, now);
+                n.Value = newValue;
+                n.Weight = weight;
+
+                long expirationTime = IsComputingAsync(newValue) ? (now + AsyncExpiry) : now;
+                bool writeExceeds = ExceedsWriteTimeTolerance(n, expirationTime);
                 bool varExceeds = _expiresVariable && Math.Abs(varTime - oldVarTime) > ExpireTolerance;
                 exceedsTolerance = writeExceeds || varExceeds;
                 // Reset the write timers only when the reorder is worthwhile; for a completed async
                 // future the variable delta always exceeds tolerance, so its wheel timer is rescheduled.
                 if (exceedsTolerance)
                 {
-                    if (_expiresAfterWrite || _refreshAfterWrite) node.WriteTime = now;
+                    if (_expiresAfterWrite || _refreshAfterWrite) n.WriteTime = expirationTime;
                 }
-                if (_expiresAfterAccess) node.AccessTime = now;
-                SetVariableTime(node, varTime);
-                updated = node;
+                if (_expiresAfterAccess) n.AccessTime = expirationTime;
+                SetVariableTime(n, varTime);
+                DiscardRefresh(n.KeyReference);
+                replaced = current;
             }
-            return node;
+            return n;
         });
 
-        if (updated != null)
+        if (replaced == null)
         {
-            if (exceedsTolerance || weightDifference != 0)
+            if (node != null)
             {
-                AfterWrite(new UpdateTask(this, updated, weightDifference));
+                ScheduleDrainBuffers(); // e.g. an expired entry is left for maintenance to evict
             }
-            else
-            {
-                AfterRead(updated, now);
-            }
-            return true;
+            return false;
         }
-        return false;
+
+        int weightDifference = weight - oldWeight;
+        if (exceedsTolerance || weightDifference != 0)
+        {
+            AfterWrite(new UpdateTask(this, node!, weightDifference));
+        }
+        else
+        {
+            AfterRead(node!, now);
+        }
+        if (!ReferenceEquals(replaced, newValue))
+        {
+            NotifyRemoval(key, replaced, RemovalCause.Replaced);
+        }
+        return true;
     }
 
     public void Clear()
@@ -2443,6 +2573,18 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
     }
 
+    /// <summary>
+    /// <see cref="DiscardRefresh(object)"/> for a key that has no node to supply its key reference;
+    /// checks the feature before boxing a value-type key.
+    /// </summary>
+    private void DiscardRefreshForKey(K key)
+    {
+        if (_refreshAfterWrite)
+        {
+            _refreshes.Remove(key);
+        }
+    }
+
     // ===== public ICache<K,V> surface =====
 
     V? ICache<K, V>.GetIfPresent(K key) => GetIfPresent(key, recordStats: true);
@@ -2510,7 +2652,16 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     {
         RequireLoader();
         long start = _statsTicker.Read();
-        V? loaded = _loader!.Load(key);
+        V? loaded;
+        try
+        {
+            loaded = _loader!.Load(key);
+        }
+        catch
+        {
+            _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
+            throw;
+        }
         long elapsed = _statsTicker.Read() - start;
         if (loaded == null)
         {
