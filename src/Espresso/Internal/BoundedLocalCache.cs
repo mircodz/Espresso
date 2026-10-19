@@ -1168,7 +1168,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     /// <summary>Returns whether the node holds an async future that has not yet completed successfully.</summary>
     private bool IsComputingAsync(Node<K, V> node)
-        => _isAsync && node.Value is Task task && !AsyncValue.IsReady(task);
+        => IsComputingAsync(node.Value);
+
+    /// <summary>Returns whether the value is an async future that has not yet completed successfully.</summary>
+    private bool IsComputingAsync(V? value)
+        => _isAsync && value is Task task && !AsyncValue.IsReady(task);
 
     /// <summary>
     /// For an async cache, pushes a freshly-inserted in-flight future's expiry timestamps ~220 years
@@ -2043,14 +2047,22 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         Node<K, V>? existing = _data.GetOrDefault(key);
         long readNow = _ticker.Read();
-        if (existing != null && existing.Value != null && !HasExpired(existing, readNow))
+        if (existing != null)
         {
-            V hitValue = existing.Value!;
-            if (recordStats) _statsCounter.RecordHits(1);
-            SetAccessTime(existing, readNow);
-            TryExpireAfterRead(existing, key, hitValue, readNow);
-            AfterRead(existing, readNow);
-            return existing.Value;
+            // Read the value once: a concurrent removal may kill the node (clearing its value) at any
+            // point, and a hit must return the value it established rather than a later re-read.
+            V? hitValue = existing.Value;
+            if (hitValue != null && !HasExpired(existing, readNow))
+            {
+                if (recordStats) _statsCounter.RecordHits(1);
+                if (!IsComputingAsync(hitValue))
+                {
+                    SetAccessTime(existing, readNow);
+                    TryExpireAfterRead(existing, key, hitValue, readNow);
+                }
+                AfterRead(existing, readNow);
+                return hitValue;
+            }
         }
 
         long now = _ticker.Read();
