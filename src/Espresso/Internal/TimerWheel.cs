@@ -52,6 +52,8 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
     };
 
     private readonly Node<K, V>[][] _wheel;
+    private readonly Node<K, V> _pending = new TimerWheelSentinel<K, V>();
+    private bool _advancing;
     internal long Nanos;
 
     public TimerWheel()
@@ -74,6 +76,11 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
     /// </summary>
     public int Advance(ITimerWheelCache<K, V> cache, long currentTimeNanos, int limit)
     {
+        if (_advancing)
+        {
+            return limit;
+        }
+        _advancing = true;
         long previousTimeNanos = Nanos;
         Nanos = currentTimeNanos;
 
@@ -108,6 +115,10 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
             Nanos = previousTimeNanos;
             throw;
         }
+        finally
+        {
+            _advancing = false;
+        }
         return limit;
     }
 
@@ -123,55 +134,62 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
         for (int i = start; i < end; i++)
         {
             Node<K, V> sentinel = timerWheel[i & mask];
-            Node<K, V>? prev = sentinel.PreviousInVariableOrder;
-            Node<K, V>? node = sentinel.NextInVariableOrder;
-            sentinel.PreviousInVariableOrder = sentinel;
-            sentinel.NextInVariableOrder = sentinel;
-
-            while (!ReferenceEquals(node, sentinel))
+            Transfer(sentinel, _pending);
+            try
             {
-                Node<K, V> current = node!;
-                Node<K, V>? next = current.NextInVariableOrder;
-                current.PreviousInVariableOrder = null;
-                current.NextInVariableOrder = null;
-
-                try
+                Node<K, V> node;
+                while (!ReferenceEquals(node = _pending.NextInVariableOrder!, _pending))
                 {
-                    if ((current.VariableTime - Nanos) > 0)
+                    Deschedule(node);
+                    try
                     {
-                        Schedule(current);
-                    }
-                    else if (cache.EvictEntry(current, RemovalCause.Expired, Nanos))
-                    {
-                        if (--limit == 0)
+                        if ((node.VariableTime - Nanos) > 0)
                         {
-                            // Leave the unprocessed remainder in the bucket for the next advance.
-                            if (!ReferenceEquals(next, sentinel))
+                            Schedule(node);
+                        }
+                        else if (cache.EvictEntry(node, RemovalCause.Expired, Nanos))
+                        {
+                            if (--limit == 0)
                             {
-                                next!.PreviousInVariableOrder = sentinel.PreviousInVariableOrder;
-                                sentinel.PreviousInVariableOrder!.NextInVariableOrder = next;
-                                sentinel.PreviousInVariableOrder = prev;
+                                return 0;
                             }
-                            return 0;
+                        }
+                        else
+                        {
+                            Schedule(node);
                         }
                     }
-                    else
+                    catch
                     {
-                        Schedule(current);
+                        Link(_pending, node);
+                        throw;
                     }
-                    node = next;
                 }
-                catch
-                {
-                    current.PreviousInVariableOrder = sentinel.PreviousInVariableOrder;
-                    current.NextInVariableOrder = next;
-                    sentinel.PreviousInVariableOrder!.NextInVariableOrder = current;
-                    sentinel.PreviousInVariableOrder = prev;
-                    throw;
-                }
+            }
+            finally
+            {
+                Transfer(_pending, sentinel);
             }
         }
         return limit;
+    }
+
+    /// <summary>Moves a circular list's entries to the tail of another list.</summary>
+    internal static void Transfer(Node<K, V> from, Node<K, V> to)
+    {
+        Node<K, V> first = from.NextInVariableOrder!;
+        if (ReferenceEquals(first, from))
+        {
+            return;
+        }
+        Node<K, V> last = from.PreviousInVariableOrder!;
+        from.PreviousInVariableOrder = from;
+        from.NextInVariableOrder = from;
+
+        first.PreviousInVariableOrder = to.PreviousInVariableOrder;
+        to.PreviousInVariableOrder!.NextInVariableOrder = first;
+        last.NextInVariableOrder = to;
+        to.PreviousInVariableOrder = last;
     }
 
     /// <summary>Schedules a timer event for the node.</summary>

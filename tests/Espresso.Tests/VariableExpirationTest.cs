@@ -78,6 +78,40 @@ public sealed class VariableExpirationTest : CacheTestBase
     }
 
     [Fact]
+    public void Expiration_ReentrantListener_PreservesPendingTimers()
+    {
+        var ticker = new FakeTicker();
+        bool reentered = false;
+        ICache<int, string>? cache = null;
+        cache = Cache.NewBuilder<int, string>()
+            .ExpireAfter(new ControllableExpiry { CreateNanos = TimeSpan.FromMinutes(1).Ticks * 100L })
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((key, _, _) =>
+            {
+                if (key == 1 && !reentered)
+                {
+                    reentered = true;
+                    cache!.Invalidate(2);
+                    cache.CleanUp();
+                }
+            }))
+            .Build();
+        using (cache)
+        {
+            for (int i = 1; i <= 6; i++) cache.Put(i, "v");
+            ticker.Advance(TimeSpan.FromMinutes(2));
+
+            cache.CleanUp();
+
+            Assert.True(reentered);
+            Assert.Equal(0, cache.EstimatedSize());
+            cache.CleanUp();
+            Assert.Equal(0, cache.EstimatedSize());
+        }
+    }
+
+    [Fact]
     public void Get_AfterCreateDurationElapses_ReturnsNull()
     {
         var ticker = new FakeTicker();
