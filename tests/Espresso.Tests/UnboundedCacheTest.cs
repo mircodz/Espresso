@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +13,49 @@ public sealed class UnboundedCacheTest : CacheTestBase
         var builder = Cache.NewBuilder<string, string>();
         if (stats) builder.RecordStats();
         return builder.Build();
+    }
+
+    [Theory]
+    [InlineData("GetIfPresent")]
+    [InlineData("GetWithMapping")]
+    [InlineData("Put")]
+    [InlineData("Invalidate")]
+    [InlineData("GetAllPresent")]
+    [InlineData("InvalidateAll")]
+    [InlineData("Get")]
+    [InlineData("GetAll")]
+    [InlineData("Refresh")]
+    public void NullKey_IsRejectedBeforeCallingUserCode(string operation)
+    {
+        int loads = 0;
+        using var cache = Cache.NewBuilder<string, string>().RecordStats().Build(_ =>
+        {
+            loads++;
+            return "loaded";
+        });
+
+        var error = Assert.Throws<ArgumentNullException>(() =>
+        {
+            switch (operation)
+            {
+                case "GetIfPresent": cache.GetIfPresent(null!); break;
+                case "GetWithMapping": cache.Get(null!, _ => { loads++; return "mapped"; }); break;
+                case "Put": cache.Put(null!, "value"); break;
+                case "Invalidate": cache.Invalidate(null!); break;
+                case "GetAllPresent": cache.GetAllPresent(new[] { (string)null! }); break;
+                case "InvalidateAll": cache.InvalidateAll(new[] { (string)null! }); break;
+                case "Get": cache.Get(null!); break;
+                case "GetAll": cache.GetAll(new[] { (string)null! }); break;
+                case "Refresh": cache.Refresh(null!); break;
+                default: throw new InvalidOperationException("Unknown test operation.");
+            }
+        });
+
+        Assert.Equal("key", error.ParamName);
+        Assert.Equal(0, loads);
+        Assert.Equal(0, cache.EstimatedSize());
+        Assert.Equal(0, cache.Stats().HitCount);
+        Assert.Equal(0, cache.Stats().MissCount);
     }
 
     [Fact]
@@ -59,6 +103,7 @@ public sealed class UnboundedCacheTest : CacheTestBase
     {
         var listener = new RecordingListener();
         var cache = Cache.NewBuilder<string, string>()
+            .Executor(DirectExecutor.Instance)
             .RemovalListener(listener)
             .Build();
 
@@ -75,6 +120,7 @@ public sealed class UnboundedCacheTest : CacheTestBase
     {
         var listener = new RecordingListener();
         var cache = Cache.NewBuilder<string, string>()
+            .Executor(DirectExecutor.Instance)
             .RemovalListener(listener)
             .Build();
 
