@@ -64,6 +64,81 @@ public sealed class PacerTest
         Assert.False(pacer.IsScheduled);
     }
 
+    private sealed class RejectingScheduler : IScheduler
+    {
+        public int Calls;
+        public bool Reject;
+        public bool ReturnNull;
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Calls++;
+            if (Reject)
+            {
+                Reject = false;
+                if (ReturnNull) return null!;
+                throw new InvalidOperationException("scheduler rejected maintenance");
+            }
+            return new ControllableFuture();
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Schedule_RejectedOrNullFuture_LeavesStateRetryable(bool replacement, bool returnNull)
+    {
+        var scheduler = new RejectingScheduler { ReturnNull = returnNull };
+        var pacer = new Pacer(scheduler);
+        if (replacement)
+        {
+            pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+        }
+        scheduler.Reject = true;
+
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, 0L);
+
+        Assert.False(pacer.IsScheduled);
+        Assert.Equal(0L, pacer.NextFireTime);
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, 0L);
+        Assert.True(pacer.IsScheduled);
+        Assert.Equal(replacement ? 3 : 2, scheduler.Calls);
+        pacer.Cancel();
+    }
+
+    [Fact]
+    public void Cancel_NullFuture_ResetsInitializingState()
+    {
+        var pacer = new Pacer(new RecordingScheduler()) { NextFireTime = Now };
+
+        pacer.Cancel();
+
+        Assert.Equal(0L, pacer.NextFireTime);
+        Assert.False(pacer.IsScheduled);
+    }
+
+    [Theory]
+    [InlineData(0xFFFFFFFEL * TimeSpan.TicksPerMillisecond)]
+    [InlineData(0xFFFFFFFFL * TimeSpan.TicksPerMillisecond)]
+    [InlineData(60L * TimeSpan.TicksPerDay)]
+    [InlineData(long.MaxValue)]
+    public void SystemScheduler_LargeDelay_CanBeScheduledAndCancelled(long ticks)
+    {
+        IScheduledFuture future = Schedulers.System.Schedule(
+            DirectExecutor.Instance, Command, TimeSpan.FromTicks(ticks));
+        try
+        {
+            Assert.False(future.IsDone);
+        }
+        finally
+        {
+            future.Cancel();
+        }
+        Assert.True(future.IsDone);
+    }
+
     [Fact]
     public void Schedule_Initialize()
     {
