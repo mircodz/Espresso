@@ -86,7 +86,8 @@ public sealed class NodeTest
     {
         var node = Make(NodeFeature.MaximumWeight, weight: 42);
         Assert.Equal(42, node.Weight);
-        Assert.Equal(42, node.PolicyWeight);
+        // the policy weight is credited by the node's AddTask, as in Caffeine
+        Assert.Equal(0, node.PolicyWeight);
         node.Weight = 7;
         node.PolicyWeight = 9;
         Assert.Equal(7, node.Weight);

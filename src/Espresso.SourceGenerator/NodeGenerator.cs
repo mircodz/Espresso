@@ -115,7 +115,6 @@ public sealed class NodeGenerator : IIncrementalGenerator
         if (f.Weighted)
         {
             sb.AppendLine("            _weight = weight;");
-            sb.AppendLine("            _policyWeight = weight;");
         }
         if (f.Access)
         {
