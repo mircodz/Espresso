@@ -67,9 +67,12 @@ internal sealed class Pacer
     /// <summary>Attempts to cancel the scheduled task, if present.</summary>
     public void Cancel()
     {
-        _future?.Cancel();
-        NextFireTime = 0L;
-        _future = null;
+        if (_future != null)
+        {
+            _future.Cancel();
+            NextFireTime = 0L;
+            _future = null;
+        }
     }
 
     /// <summary>Whether a task is currently scheduled to run.</summary>
