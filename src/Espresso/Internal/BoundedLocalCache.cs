@@ -1518,46 +1518,21 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>Removes a victim from the map and policy. Caller holds the eviction lock.</summary>
     public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now = 0L)
     {
-        K? key = node.Key;
+        // Capture the key reference before the remap can retire the node (retiring swaps it for a
+        // sentinel). A node already retired by a concurrent removal is no longer in the map under its
+        // key, so the remap is skipped and only the policy unlink below runs.
+        object keyRef = node.KeyReference;
+        bool hasKey = !ReferenceEquals(keyRef, Node<K, V>.RetiredSentinel)
+            && !ReferenceEquals(keyRef, Node<K, V>.DeadSentinel);
+        K? key = hasKey ? (K)keyRef : default;
 
         // State-passing remap so the eviction path allocates no closure (it fires once per insert past
         // capacity and dominated the write-path allocation profile).
         var s = new EvictState { Cache = this, Node = node, Cause = cause, Now = now, ActualCause = cause };
-        _data.ComputeIfPresent(key!, static (Node<K, V> current, ref EvictState st) =>
+        if (hasKey)
         {
-            if (!ReferenceEquals(current, st.Node))
-            {
-                return current; // a different node now occupies the key; leave it
-            }
-            var n = st.Node;
-            lock (n)
-            {
-                st.Value = n.Value;
-                st.ActualCause = (n.Key == null || st.Value == null) ? RemovalCause.Collected : st.Cause;
-
-                if (st.ActualCause == RemovalCause.Expired)
-                {
-                    // Re-verify: the entry may have been touched since it was queued for expiration.
-                    if (!st.Cache.HasExpired(n, st.Now))
-                    {
-                        st.Resurrect = true;
-                        return n;
-                    }
-                }
-                else if (st.ActualCause == RemovalCause.Size)
-                {
-                    if (n.Weight == 0)
-                    {
-                        st.Resurrect = true;
-                        return n; // pinned entry, keep it
-                    }
-                }
-
-                st.Removed = true;
-                n.Retire();
-                return null; // remove from the map
-            }
-        }, ref s);
+            RemapForEviction(key!, ref s);
+        }
 
         V? value = s.Value;
         bool removed = s.Removed;
@@ -1593,8 +1568,6 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             _timerWheel!.Deschedule(node);
         }
 
-        // Capture the key reference while the node is still alive; MakeDead swaps it for a sentinel.
-        object keyRef = node.KeyReference;
         lock (node)
         {
             MakeDead(node);
@@ -1607,6 +1580,45 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             NotifyRemoval(key, value, actualCause);
         }
         return true;
+    }
+
+    private void RemapForEviction(K key, ref EvictState s)
+    {
+        _data.ComputeIfPresent(key, static (Node<K, V> current, ref EvictState st) =>
+        {
+            if (!ReferenceEquals(current, st.Node))
+            {
+                return current; // a different node now occupies the key; leave it
+            }
+            var n = st.Node;
+            lock (n)
+            {
+                st.Value = n.Value;
+                st.ActualCause = (n.Key == null || st.Value == null) ? RemovalCause.Collected : st.Cause;
+
+                if (st.ActualCause == RemovalCause.Expired)
+                {
+                    // Re-verify: the entry may have been touched since it was queued for expiration.
+                    if (!st.Cache.HasExpired(n, st.Now))
+                    {
+                        st.Resurrect = true;
+                        return n;
+                    }
+                }
+                else if (st.ActualCause == RemovalCause.Size)
+                {
+                    if (n.Weight == 0)
+                    {
+                        st.Resurrect = true;
+                        return n; // pinned entry, keep it
+                    }
+                }
+
+                st.Removed = true;
+                n.Retire();
+                return null; // remove from the map
+            }
+        }, ref s);
     }
 
     // State threaded through the eviction remap: the caller sets the inputs, the remap writes outputs back.
