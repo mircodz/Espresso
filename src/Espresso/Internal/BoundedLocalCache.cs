@@ -148,6 +148,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private int _drainStatus = Idle;
 
     // A single reusable maintenance delegate, so scheduling a drain never allocates a fresh closure.
+    // It is bound to a PerformCleanupTask that only weakly references this cache, so a pending
+    // scheduler timer or queued work item does not keep a dropped cache alive.
     private readonly Action _drainBuffersTask;
 
     // Cached read-buffer consumer so draining never allocates a fresh Action<Node> per cycle.
@@ -155,7 +157,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     internal BoundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)
     {
-        _drainBuffersTask = RunMaintenanceUnderLock;
+        _drainBuffersTask = new PerformCleanupTask(this).Run;
         _onAccess = OnAccess;
         _data = new ConcurrentHashMap<K, Node<K, V>>(config.InitialCapacity);
         _statsCounter = config.StatsCounter;
@@ -605,7 +607,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         lock (_evictionLock)
         {
             try { Maintenance(task); }
-            catch { /* maintenance must not surface to the writer */ throw; }
+            catch { /* maintenance must not surface to the writer */ }
         }
         RescheduleDrainIfIncomplete();
     }
@@ -622,28 +624,31 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
 
-        // If a scheduler was configured then the maintenance can be deferred and run in the near
-        // future via the pacer; otherwise it will be handled by other cache activity.
-        if (_pacer != null)
+        // An immediate scheduling cannot be performed on a custom executor because it may use a
+        // caller-runs policy (e.g. DirectExecutor). This could cause the caller's penalty to exceed the
+        // amortized threshold, e.g. repeated concurrent writes could result in a retry loop.
+        if (ReferenceEquals(_executor, ThreadPoolExecutor.Instance))
         {
-            if (!_pacer.IsScheduled && Monitor.TryEnter(_evictionLock))
-            {
-                try
-                {
-                    if (Volatile.Read(ref _drainStatus) == Required && !_pacer.IsScheduled)
-                    {
-                        _pacer.Schedule(_executor, DrainBuffersTask, _ticker.Read(), Pacer.Tolerance);
-                    }
-                }
-                finally
-                {
-                    Monitor.Exit(_evictionLock);
-                }
-            }
+            ScheduleDrainBuffers();
             return;
         }
 
-        ScheduleDrainBuffers();
+        // If a scheduler was configured then the maintenance can be deferred onto the custom executor
+        // and run in the near future via the pacer; otherwise it will be handled by other cache activity.
+        if (_pacer != null && !_pacer.IsScheduled && Monitor.TryEnter(_evictionLock))
+        {
+            try
+            {
+                if (Volatile.Read(ref _drainStatus) == Required && !_pacer.IsScheduled)
+                {
+                    _pacer.Schedule(_executor, _drainBuffersTask, _ticker.Read(), Pacer.Tolerance);
+                }
+            }
+            finally
+            {
+                Monitor.Exit(_evictionLock);
+            }
+        }
     }
 
     private void ScheduleAfterWrite()
@@ -699,7 +704,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     // The executor rejected the task (saturated/shutdown). Run maintenance inline so
                     // the drain status is reset by Maintenance's finally block; otherwise the state
                     // machine would stay stuck at ProcessingToIdle forever and never schedule again.
-                    Maintenance(null);
+                    try { Maintenance(null); }
+                    catch { /* maintenance must not surface to the caller */ }
                 }
             }
             finally
@@ -779,25 +785,48 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             else
             {
-                _pacer.Schedule(_executor, DrainBuffersTask, now, delay);
+                _pacer.Schedule(_executor, _drainBuffersTask, now, delay);
             }
         }
     }
 
-    /// <summary>The maintenance task the pacer submits when a proactive drain is due.</summary>
-    private void DrainBuffersTask()
+    /// <summary>
+    /// Performs the maintenance work, blocking until the eviction lock is acquired, then schedules
+    /// another cycle if work remains (a concurrent write during the cycle, or a per-cycle budget hit).
+    /// </summary>
+    private void PerformCleanUp()
     {
         lock (_evictionLock) { Maintenance(null); }
         RescheduleDrainIfIncomplete();
     }
 
     /// <summary>
-    /// The cached delegate used by <see cref="ScheduleDrainBuffers"/> to run a maintenance cycle on
-    /// the executor without allocating a fresh closure per schedule.
+    /// The maintenance task submitted to the executor and the pacer. It holds the cache only weakly
+    /// and never lets a maintenance failure escape onto the executor's thread (on the thread pool an
+    /// unhandled exception would terminate the process); <see cref="Maintenance"/> resets the drain
+    /// status in its finally block, so a failed cycle does not wedge the state machine.
     /// </summary>
-    private void RunMaintenanceUnderLock()
+    private sealed class PerformCleanupTask
     {
-        lock (_evictionLock) { Maintenance(null); }
+        private readonly WeakReference<BoundedLocalCache<K, V>> _reference;
+
+        public PerformCleanupTask(BoundedLocalCache<K, V> cache)
+            => _reference = new WeakReference<BoundedLocalCache<K, V>>(cache);
+
+        public void Run()
+        {
+            try
+            {
+                if (_reference.TryGetTarget(out BoundedLocalCache<K, V>? cache))
+                {
+                    cache.PerformCleanUp();
+                }
+            }
+            catch
+            {
+                // Maintenance must not surface to the executor (no logger is available).
+            }
+        }
     }
 
     /// <summary>
@@ -2309,11 +2338,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public void CleanUp()
     {
-        lock (_evictionLock)
+        try
         {
-            Maintenance(null);
+            PerformCleanUp();
         }
-        RescheduleDrainIfIncomplete();
+        catch
+        {
+            // Maintenance must not surface to the caller (no logger is available).
+        }
     }
 
     /// <summary>
