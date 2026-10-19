@@ -38,6 +38,32 @@ public sealed class PacerTest
 
     private static readonly Action Command = () => { };
 
+    private sealed class InlineScheduler : IScheduler
+    {
+        public int Calls;
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Calls++;
+            executor.Execute(command);
+            return new ControllableFuture { IsDone = true };
+        }
+    }
+
+    [Fact]
+    public void Schedule_InlineCompletedReplacement_GuardsReentry()
+    {
+        var scheduler = new InlineScheduler();
+        var pacer = new Pacer(scheduler);
+        Action command = () => pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+
+        pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+        pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+
+        Assert.Equal(2, scheduler.Calls);
+        Assert.False(pacer.IsScheduled);
+    }
+
     [Fact]
     public void Schedule_Initialize()
     {

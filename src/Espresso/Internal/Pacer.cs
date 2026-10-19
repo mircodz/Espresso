@@ -44,7 +44,7 @@ internal sealed class Pacer
             {
                 return;
             }
-            _future.Cancel();
+            Cancel();
         }
 
         long actualDelay = CalculateSchedule(now, delay, scheduleAt);
