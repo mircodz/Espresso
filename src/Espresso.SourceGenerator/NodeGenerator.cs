@@ -130,9 +130,9 @@ public sealed class NodeGenerator : IIncrementalGenerator
         {
             sb.AppendLine();
             sb.AppendLine("        private int _weight;");
-            sb.AppendLine("        private int _policyWeight;");
+            sb.AppendLine("        private long _policyWeight;");
             sb.AppendLine("        public override int Weight { get => Volatile.Read(ref _weight); set => Volatile.Write(ref _weight, value); }");
-            sb.AppendLine("        public override int PolicyWeight { get => Volatile.Read(ref _policyWeight); set => Volatile.Write(ref _policyWeight, value); }");
+            sb.AppendLine("        public override long PolicyWeight { get => Volatile.Read(ref _policyWeight); set => Volatile.Write(ref _policyWeight, value); }");
         }
 
         if (f.UsesMaximum)

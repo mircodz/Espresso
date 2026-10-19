@@ -99,7 +99,8 @@ internal abstract class Node<K, V> : IAccessOrder<Node<K, V>>, IWriteOrder<Node<
         set { }
     }
 
-    public virtual int PolicyWeight
+    // 64-bit: reordered update deltas can leave the int range before the replay settles.
+    public virtual long PolicyWeight
     {
         get => 1;
         set { }

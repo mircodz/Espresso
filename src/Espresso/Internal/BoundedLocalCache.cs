@@ -1044,7 +1044,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 break;
             }
 
-            int weight = candidate.PolicyWeight;
+            long weight = candidate.PolicyWeight;
             if (quota < weight)
             {
                 break;
@@ -1090,7 +1090,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 break;
             }
 
-            int weight = candidate.PolicyWeight;
+            long weight = candidate.PolicyWeight;
             if (quota < weight)
             {
                 break;

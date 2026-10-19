@@ -94,6 +94,27 @@ public sealed class NodeTest
         Assert.Equal(9, node.PolicyWeight);
     }
 
+    [Theory]
+    [InlineData((int)NodeFeature.MaximumWeight)]
+    [InlineData((int)(NodeFeature.MaximumWeight | NodeFeature.ExpireAccess | NodeFeature.ExpireWrite | NodeFeature.RefreshWrite))]
+    [InlineData((int)(NodeFeature.MaximumWeight | NodeFeature.ExpireVariable))]
+    public void Weighted_PolicyWeight_RoundTripsBeyondIntRange(int features)
+    {
+        var node = Make((NodeFeature)features, weight: 5);
+        foreach (long value in new[] { (long)int.MaxValue + 1, (1L << 40) + 7, -((long)int.MaxValue + 2), long.MaxValue, long.MinValue, -1L, 0L })
+        {
+            node.PolicyWeight = value;
+            Assert.Equal(value, node.PolicyWeight);
+        }
+
+        // a transient excursion past the int range, as when reordered update deltas are replayed
+        node.PolicyWeight = int.MaxValue - 1;
+        node.PolicyWeight += int.MaxValue - 1;
+        node.PolicyWeight += -(long)(int.MaxValue - 1);
+        Assert.Equal(int.MaxValue - 1, node.PolicyWeight);
+        Assert.Equal(5, node.Weight);
+    }
+
     [Fact]
     public void MaximumSize_IsUnweighted_ButHasQueueType()
     {
