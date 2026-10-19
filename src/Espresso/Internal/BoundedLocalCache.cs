@@ -349,7 +349,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>
     /// Async refresh: the delegate synchronously starts a reload and returns a NEW in-flight future,
     /// which becomes the stored value (replacing the old future) if the entry was not modified in
-    /// flight. The wrapper attaches completion handling to that new future.
+    /// flight. The wrapper attaches completion handling to that new future. A failure to start or
+    /// install the reload never reaches the reader and releases only this refresh's registration; a
+    /// reload that is not installed is reported like a discarded value.
     /// </summary>
     private void RefreshAsync(K key, V oldValue, object keyRef, object token, long writeTime)
     {
@@ -369,61 +371,98 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return;
         }
 
-        long now = _ticker.Read();
         Node<K, V>? updated = null;
         int weightDifference = 0;
-        _data.Compute(key, (_, current) =>
+        RemovalCause? discardCause = null;
+        try
         {
-            bool owned = ReferenceEquals(_refreshes.GetOrDefault(keyRef), token);
-            if (current == null)
+            _data.Compute(key, (_, current) =>
             {
-                return null;
-            }
-            bool unmodified = owned
-                && ReferenceEquals(current.Value, oldValue)
-                && (current.WriteTime & ~1L) == writeTime;
-            if (!unmodified)
-            {
-                return current; // superseded; discard the refresh (the new future is orphaned)
-            }
-            int oldWeight = current.Weight;
-            current.Value = newFuture;
-            current.Weight = _weigher.Weigh(key, newFuture);
-            weightDifference = current.Weight - oldWeight;
-            // Reset the write time to now so a reload in flight is no longer "overdue" (prevents a
-            // second refresh from being triggered on the next access while this one is still loading),
-            // then apply the async sentinel if the cache also expires.
-            if (_expiresAfterWrite || _refreshAfterWrite) current.WriteTime = now;
-            StampAsyncExpiryIfComputing(current, now);
-            updated = current;
-            return current;
-        });
-
-        if (updated != null)
+                if (current == null)
+                {
+                    discardCause = RemovalCause.Explicit; // the entry is gone; drop the reload
+                    return null;
+                }
+                lock (current)
+                {
+                    if (!IsUnmodifiedSinceRefresh(current, oldValue, keyRef, token, writeTime))
+                    {
+                        // Superseded by a concurrent write: the reload is discarded (its future is orphaned).
+                        if (!ReferenceEquals(current.Value, newFuture))
+                        {
+                            discardCause = RemovalCause.Replaced;
+                        }
+                        return current;
+                    }
+                    // Weigh before mutating so a throwing weigher leaves the entry untouched.
+                    long now = _ticker.Read();
+                    int newWeight = WeighEntry(key, newFuture);
+                    weightDifference = newWeight - current.Weight;
+                    current.Value = newFuture;
+                    current.Weight = newWeight;
+                    // Reset the write time to now so a reload in flight is no longer "overdue" (prevents a
+                    // second refresh from being triggered on the next access while this one is still
+                    // loading), then apply the async sentinel if the cache also expires.
+                    if (_expiresAfterWrite || _refreshAfterWrite) current.WriteTime = now;
+                    StampAsyncExpiryIfComputing(current, now);
+                    updated = current;
+                    return current;
+                }
+            });
+        }
+        catch
         {
-            // Propagate the weight change to the policy bookkeeping (the in-flight future weighs 0
-            // via AsyncWeigher), matching how Replace/UpdateTask keep the weighted-size telescoping.
-            AfterWrite(new UpdateTask(this, updated, weightDifference));
+            // A user callback threw before anything was installed: the best-effort refresh is dropped
+            // without failing the reader.
+            discardCause = null;
         }
 
-        bool stored = updated != null;
-        if (stored)
+        if (updated == null)
         {
-            // Keep the debounce token registered until the new future completes; Java clears it on
-            // completion so no fresh refresh is triggered while this reload is in flight.
-            ((Task)(object)newFuture).ContinueWith(_ => _refreshes.Remove(keyRef, token),
-                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            _refreshes.Remove(keyRef, token); // nothing installed; release the registration now
+            if (discardCause != null)
+            {
+                NotifyRemoval(key, newFuture, discardCause.Value);
+            }
+            return;
         }
-        else
+
+        // Propagate the weight change to the policy bookkeeping (the in-flight future weighs 0 via
+        // AsyncWeigher), matching how Replace/UpdateTask keep the weighted-size telescoping.
+        AfterWrite(new UpdateTask(this, updated, weightDifference));
+
+        // Keep the debounce token registered until the new future completes; Java clears it on
+        // completion so no fresh refresh is triggered while this reload is in flight.
+        ((Task)(object)newFuture).ContinueWith(_ => _refreshes.Remove(keyRef, token),
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Synchronous refresh: submits the reload to the executor. A rejected submission leaves nothing
+    /// in flight, so it releases this refresh's registration and lets the reader proceed.
+    /// </summary>
+    private void RefreshSync(K key, V oldValue, object keyRef, object token, long writeTime)
+    {
+        try
         {
-            _refreshes.Remove(keyRef, token); // discarded; release the token now
+            _executor.Execute(() => RefreshSyncTask(key, oldValue, keyRef, token, writeTime));
+        }
+        catch
+        {
+            _refreshes.Remove(keyRef, token);
         }
     }
 
-    /// <summary>Synchronous refresh: load a resolved value in the background and commit it (ABA-guarded).</summary>
-    private void RefreshSync(K key, V oldValue, object keyRef, object token, long writeTime)
+    /// <summary>
+    /// Loads a resolved value and commits it if the entry was not modified while in flight. The
+    /// ownership/ABA check and every mutation happen under the entry's lock (which optimized puts use),
+    /// and the expiry and weight are computed before the entry is mutated. A null reload removes the
+    /// entry; a discarded reload is reported. Nothing escapes the work item, and the registration is
+    /// always released (by identity, so a successor's registration is never taken).
+    /// </summary>
+    private void RefreshSyncTask(K key, V oldValue, object keyRef, object token, long writeTime)
     {
-        _executor.Execute(() =>
+        try
         {
             long start = _statsTicker.Read();
             V? newValue;
@@ -433,68 +472,85 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
             catch
             {
-                _refreshes.Remove(keyRef, token);
                 _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
                 return;
             }
             long loadTime = _statsTicker.Read() - start;
 
-            // Commit the reload only if the entry was not modified while in flight (ABA guard on
-            // both the value identity AND the write-time). A null reload removes the mapping.
-            bool removed = false;
-            bool replaced = false;
             Node<K, V>? updated = null;
+            Node<K, V>? removed = null;
             int weightDifference = 0;
-            long commitNow = _ticker.Read();
-            _data.Compute(key, (_, current) =>
+            RemovalCause? discardCause = null;
+            try
             {
-                bool owned = ReferenceEquals(_refreshes.GetOrDefault(keyRef), token);
-                if (current == null)
+                _data.Compute(key, (_, current) =>
                 {
-                    return null; // entry vanished; drop the refresh
-                }
-                bool unmodified = owned
-                    && ReferenceEquals(current.Value, oldValue)
-                    && (current.WriteTime & ~1L) == writeTime;
-                if (!unmodified)
-                {
-                    return current; // superseded by a concurrent write; discard the reload
-                }
-                if (newValue == null)
-                {
-                    removed = true;
-                    return null; // a null reload removes the entry
-                }
-                // Compute the variable-expiration time BEFORE mutating so a throwing user IExpiry
-                // leaves the node untouched.
-                long varTime = ExpireAfterUpdate(current, key, newValue, commitNow);
-                int oldWeight = current.Weight;
-                replaced = !ReferenceEquals(newValue, oldValue);
-                current.Value = newValue;
-                current.Weight = WeighEntry(key, newValue);
-                weightDifference = current.Weight - oldWeight;
-                SetVariableTime(current, varTime);
-                if (_expiresAfterWrite || _refreshAfterWrite) current.WriteTime = commitNow;
-                updated = current;
-                return current;
-            });
+                    if (current == null)
+                    {
+                        if (newValue != null)
+                        {
+                            discardCause = RemovalCause.Explicit; // the entry is gone; drop the reload
+                        }
+                        return null;
+                    }
+                    lock (current)
+                    {
+                        if (!IsUnmodifiedSinceRefresh(current, oldValue, keyRef, token, writeTime))
+                        {
+                            // Superseded by a concurrent write: discard the reload, preserving the entry.
+                            if (newValue != null && !ReferenceEquals(current.Value, newValue))
+                            {
+                                discardCause = RemovalCause.Replaced;
+                            }
+                            return current;
+                        }
+                        if (newValue == null)
+                        {
+                            removed = current; // a null reload removes the entry
+                            current.Retire();
+                            return null;
+                        }
+                        // Evaluate the user callbacks before mutating so a throw leaves the node untouched.
+                        long now = _ticker.Read();
+                        long varTime = ExpireAfterUpdate(current, key, newValue, now);
+                        int newWeight = WeighEntry(key, newValue);
+                        weightDifference = newWeight - current.Weight;
+                        current.Value = newValue;
+                        current.Weight = newWeight;
+                        if (_expiresAfterAccess) current.AccessTime = now;
+                        if (_expiresAfterWrite || _refreshAfterWrite) current.WriteTime = now;
+                        SetVariableTime(current, varTime);
+                        updated = current;
+                        return current;
+                    }
+                });
+            }
+            catch
+            {
+                // A user callback (expiry, weigher, key equality) threw before the entry was mutated.
+                _statsCounter.RecordLoadFailure(loadTime);
+                return;
+            }
 
-            // Propagate the weight change and wheel reschedule through the policy, mirroring the async
-            // refresh path (otherwise weightedSize drifts and the write-order/timer is left stale).
             if (updated != null)
             {
+                // Propagate the weight change and wheel reschedule through the policy.
                 AfterWrite(new UpdateTask(this, updated, weightDifference));
+                if (!ReferenceEquals(newValue, oldValue))
+                {
+                    NotifyRemoval(key, oldValue, RemovalCause.Replaced);
+                }
             }
-
-            if (removed)
+            else if (removed != null)
             {
+                AfterWrite(new RemovalTask(this, removed));
                 NotifyRemoval(key, oldValue, RemovalCause.Explicit);
             }
-            else if (replaced)
+            if (discardCause != null)
             {
-                NotifyRemoval(key, oldValue, RemovalCause.Replaced);
+                NotifyRemoval(key, newValue, discardCause.Value);
             }
-            _refreshes.Remove(keyRef, token);
+
             if (newValue == null)
             {
                 _statsCounter.RecordLoadFailure(loadTime);
@@ -503,8 +559,27 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 _statsCounter.RecordLoadSuccess(loadTime);
             }
-        });
+        }
+        catch
+        {
+            // A best-effort refresh must not fail the executor's thread (no logger is available).
+        }
+        finally
+        {
+            _refreshes.Remove(keyRef, token);
+        }
     }
+
+    /// <summary>
+    /// Returns whether a refresh still owns its registration and the entry is unchanged since the
+    /// reload started (same value instance and write time, ignoring the in-progress flag). Must be
+    /// called under the entry's lock.
+    /// </summary>
+    private bool IsUnmodifiedSinceRefresh(Node<K, V> current, V oldValue, object keyRef, object token, long writeTime)
+        => current.IsAlive
+            && ReferenceEquals(_refreshes.GetOrDefault(keyRef), token)
+            && ReferenceEquals(current.Value, oldValue)
+            && (current.WriteTime & ~1L) == writeTime;
 
     public V? GetIfPresentQuietly(K key)
     {

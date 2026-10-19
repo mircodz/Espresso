@@ -91,8 +91,8 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             V? value = t.IsCompletedSuccessfully ? t.Result : null;
             if (value == null)
             {
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
                 Cache.Remove(key, future);
+                Cache.StatsCounter.RecordLoadFailure(loadTime);
             }
             else
             {
@@ -128,8 +128,8 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             {
                 // Refresh failed (faulted, cancelled, or null result): keep the last good value by
                 // reverting the entry from the failing future back to the previous one. Never remove.
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
                 Cache.Replace(key, refreshed, oldFuture);
+                Cache.StatsCounter.RecordLoadFailure(loadTime);
             }
             else
             {
