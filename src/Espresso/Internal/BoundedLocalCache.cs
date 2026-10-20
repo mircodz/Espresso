@@ -272,8 +272,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return null;
         }
         if (recordStats) _statsCounter.RecordHits(1);
-        SetAccessTime(node, now);
-        TryExpireAfterRead(node, key, value, now);
+        if (!IsComputingAsync(value))
+        {
+            // An in-flight load keeps its async sentinel until it completes.
+            SetAccessTime(node, now);
+            TryExpireAfterRead(node, key, value, now);
+        }
         AfterRead(node, now);
         return value;
     }
@@ -635,8 +639,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 toRemove.Add(key);
                 continue;
             }
-            SetAccessTime(node, now);
-            TryExpireAfterRead(node, key, value, now);
+            if (!IsComputingAsync(value))
+            {
+                SetAccessTime(node, now);
+                TryExpireAfterRead(node, key, value, now);
+            }
             AfterRead(node, now);
             result[key] = value;
         }
@@ -1321,6 +1328,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
     }
 
+    /// <summary>Writes the async sentinel into every configured expiration timestamp of the node.</summary>
+    private void StampAsyncExpiry(Node<K, V> node, long sentinel)
+    {
+        if (_expiresAfterWrite || _refreshAfterWrite) node.WriteTime = sentinel;
+        if (_expiresAfterAccess) node.AccessTime = sentinel;
+        if (_expiresVariable) node.VariableTime = sentinel;
+    }
+
     /// <summary>Updates a node's access time on the read path, subject to the reorder tolerance.</summary>
     private void SetAccessTime(Node<K, V> node, long now)
     {
@@ -1732,10 +1747,18 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
                 if (st.ActualCause == RemovalCause.Expired)
                 {
-                    // Re-verify: the entry may have been touched since it was queued for expiration,
-                    // and an in-flight async load never expires.
-                    if (!st.Cache.HasExpired(n, st.Now) || st.Cache.IsComputingAsync(st.Value))
+                    // Re-verify: the entry may have been touched since it was queued for expiration.
+                    if (!st.Cache.HasExpired(n, st.Now))
                     {
+                        st.Resurrect = true;
+                        return n;
+                    }
+                    if (st.Cache.IsComputingAsync(st.Value))
+                    {
+                        // An in-flight async load never expires. Push its timestamps out to the async
+                        // sentinel (restored when the load completes) so the expiration scans and the
+                        // timer wheel move past it instead of finding it expired again.
+                        st.Cache.StampAsyncExpiry(n, st.Now + AsyncExpiry);
                         st.Resurrect = true;
                         return n;
                     }
