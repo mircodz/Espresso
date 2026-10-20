@@ -374,12 +374,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         catch
         {
-            _refreshes.Remove(keyRef, token);
+            ReleaseRefresh(keyRef, token);
             return;
         }
         if (newFuture == null)
         {
-            _refreshes.Remove(keyRef, token); // not eligible (e.g. current future not ready)
+            ReleaseRefresh(keyRef, token); // not eligible (e.g. current future not ready)
             return;
         }
 
@@ -431,7 +431,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (updated == null)
         {
-            _refreshes.Remove(keyRef, token); // nothing installed; release the registration now
+            ReleaseRefresh(keyRef, token); // nothing installed; release the registration now
             if (discardCause != null)
             {
                 NotifyRemoval(key, newFuture, discardCause.Value);
@@ -445,7 +445,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         // Keep the debounce token registered until the new future completes; Java clears it on
         // completion so no fresh refresh is triggered while this reload is in flight.
-        ((Task)(object)newFuture).ContinueWith(_ => _refreshes.Remove(keyRef, token),
+        ((Task)(object)newFuture).ContinueWith(_ => ReleaseRefresh(keyRef, token),
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
@@ -461,7 +461,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         catch
         {
-            _refreshes.Remove(keyRef, token);
+            ReleaseRefresh(keyRef, token);
         }
     }
 
@@ -578,7 +578,24 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         finally
         {
+            ReleaseRefresh(keyRef, token);
+        }
+    }
+
+    /// <summary>
+    /// Releases a refresh's own registration (by identity, so a successor's is never taken). Hashing
+    /// the key can throw; that must not escape a work item (on the thread pool it would terminate the
+    /// process) nor fail a reader, so the failure is swallowed and the registration is left behind.
+    /// </summary>
+    private void ReleaseRefresh(object keyRef, object token)
+    {
+        try
+        {
             _refreshes.Remove(keyRef, token);
+        }
+        catch
+        {
+            // No logger is available.
         }
     }
 
