@@ -28,6 +28,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private const int DefaultCapacity = 16;
     private const int MaximumCapacity = 1 << 30;
     private const int HashBits = 0x7fffffff;
+    private const int ReservedHash = -3; // Spread keeps user hashes non-negative.
 
     // Treeification thresholds (mirrors JDK ConcurrentHashMap). A bin whose chain grows to
     // TreeifyThreshold nodes converts to a red-black tree, but only once the table is at least
@@ -62,6 +63,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     {
         internal readonly Node?[] NextTable;
         internal ForwardingNode(Node?[] nextTable) : base(0, default!, default!, null) => NextTable = nextTable;
+    }
+
+    private sealed class ReservationNode : Node
+    {
+        // No key can match this hash; the null Next routes locked mutations through the miss guard.
+        internal ReservationNode() : base(ReservedHash, default!, default!, null) { }
     }
 
     /// <summary>
@@ -1099,6 +1106,10 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         Node? next = e.Next;
                         if (next == null)
                         {
+                            if (e.Hash == ReservedHash)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             Volatile.Write(ref e.Next, new Node(h, key, value, null));
                             inserted = true;
                             break;
@@ -1217,6 +1228,10 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         Node? next = e.Next;
                         if (next == null)
                         {
+                            if (e.Hash == ReservedHash)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             break;
                         }
                         e = next;
@@ -1247,7 +1262,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             Node? f = TabAt(tab, i);
             if (f == null)
             {
-                var node = new Node(h, key, null!, null);
+                var node = new ReservationNode();
                 TValue? val;
                 lock (node)
                 {
@@ -1255,22 +1270,18 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     {
                         continue; // lost the race, retry
                     }
-                    bool added = false;
+                    Node? replacement = null;
                     try
                     {
                         val = mappingFunction(key);
                         if (val != null)
                         {
-                            Volatile.Write(ref node.Value, val);
-                            added = true;
+                            replacement = new Node(h, key, val, null);
                         }
                     }
                     finally
                     {
-                        if (!added)
-                        {
-                            SetTabAt(tab, i, null);
-                        }
+                        SetTabAt(tab, i, replacement);
                     }
                 }
                 if (val != null)
@@ -1298,8 +1309,8 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
 
             // Lock-free fast path: if the key is already present with a published value, return it
-            // without locking. A node whose value is still null is an in-flight placeholder (another
-            // thread is computing under its lock); fall through to the lock and wait for it.
+            // without locking. A reservation has a negative hash and no value; fall through to the
+            // lock and wait for its owner to publish a real node or clear the slot.
             if (f is not TreeBin)
             {
                 for (Node? e = f; e != null; e = Volatile.Read(ref e.Next))
@@ -1362,9 +1373,17 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         Node? next = e.Next;
                         if (next == null)
                         {
+                            if (e.Hash == ReservedHash)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             result = mappingFunction(key);
                             if (result != null)
                             {
+                                if (e.Next != null)
+                                {
+                                    throw new InvalidOperationException("Recursive update");
+                                }
                                 Volatile.Write(ref e.Next, new Node(h, key, result, null));
                                 inserted = true;
                             }
@@ -1479,6 +1498,10 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         Node? next = e.Next;
                         if (next == null)
                         {
+                            if (e.Hash == ReservedHash)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             break;
                         }
                         e = next;
@@ -1515,7 +1538,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 {
                     return null;
                 }
-                var node = new Node(h, key, null!, null);
+                var node = new ReservationNode();
                 TValue? computed;
                 lock (node)
                 {
@@ -1523,22 +1546,18 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     {
                         continue;
                     }
-                    bool added = false;
+                    Node? replacement = null;
                     try
                     {
                         computed = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
                         if (computed != null)
                         {
-                            Volatile.Write(ref node.Value, computed);
-                            added = true;
+                            replacement = new Node(h, key, computed, null);
                         }
                     }
                     finally
                     {
-                        if (!added)
-                        {
-                            SetTabAt(tab, i, null);
-                        }
+                        SetTabAt(tab, i, replacement);
                     }
                 }
                 if (computed != null)
@@ -1631,11 +1650,19 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         Node? next = e.Next;
                         if (next == null)
                         {
+                            if (e.Hash == ReservedHash)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             if (!onlyIfPresent)
                             {
                                 val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
                                 if (val != null)
                                 {
+                                    if (e.Next != null)
+                                    {
+                                        throw new InvalidOperationException("Recursive update");
+                                    }
                                     delta = 1;
                                     Volatile.Write(ref e.Next, new Node(h, key, val, null));
                                 }
@@ -1689,6 +1716,10 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             {
                 if (TabAt(tab, i) == f)
                 {
+                    if (f.Hash == ReservedHash)
+                    {
+                        throw new InvalidOperationException("Recursive update");
+                    }
                     Node? p = f is TreeBin tb ? tb.First : f;
                     for (; p != null; p = p.Next)
                     {
@@ -2146,6 +2177,10 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     if (TabAt(oldTab, i) != f)
                     {
                         continue; // head changed under us; re-read
+                    }
+                    if (f.Hash == ReservedHash)
+                    {
+                        throw new InvalidOperationException("Recursive update");
                     }
                     if (f is TreeBin tb)
                     {

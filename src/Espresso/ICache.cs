@@ -28,6 +28,10 @@ public interface ICache<K, V> : IDisposable
     /// if absent. The function runs atomically and at most once per key; if it returns <c>null</c>
     /// nothing is cached and <c>null</c> is returned.
     /// </summary>
+    /// <remarks>
+    /// The mapping function must not modify this cache. A detected recursive update may throw
+    /// <see cref="InvalidOperationException"/>.
+    /// </remarks>
     V? Get(K key, Func<K, V?> mappingFunction);
 
     /// <summary>Returns the cached values for the given keys that are currently present.</summary>
