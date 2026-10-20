@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Espresso;
@@ -6,6 +7,10 @@ namespace Espresso;
 /// A cache whose values are automatically loaded by a <see cref="ICacheLoader{K,V}"/> and stored
 /// until evicted or invalidated.
 /// </summary>
+/// <remarks>
+/// The loader must not modify this cache. A detected recursive update may throw
+/// <see cref="InvalidOperationException"/>.
+/// </remarks>
 /// <typeparam name="K">the key type</typeparam>
 /// <typeparam name="V">the value type (reference types only)</typeparam>
 public interface ILoadingCache<K, V> : ICache<K, V>

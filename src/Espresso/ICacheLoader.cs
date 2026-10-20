@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Espresso;
@@ -7,7 +8,8 @@ namespace Espresso;
 /// Most implementations only need <see cref="Load"/>; <see cref="LoadAll"/> may be overridden when
 /// bulk retrieval is significantly more efficient than many individual lookups.
 /// <para>
-/// <b>Warning:</b> loading must not attempt to update any mappings of the cache directly.
+/// <b>Warning:</b> loading must not modify the cache. A detected recursive update may throw
+/// <see cref="InvalidOperationException"/>.
 /// </para>
 /// </summary>
 /// <typeparam name="K">the key type</typeparam>

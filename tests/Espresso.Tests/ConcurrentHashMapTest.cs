@@ -635,20 +635,18 @@ public sealed class ConcurrentHashMapTest
         Assert.Equal(map.AsEnumerable().LongCount(), count);
     }
 
-    // .NET monitors are reentrant, so a mapping function that recurses into ComputeIfAbsent for the
-    // same key does not deadlock. Document the resulting behavior so a future change can't regress it
-    // silently: the inner call observes the bin mid-computation.
     [Fact]
-    public void ComputeIfAbsent_ReentrantSameKey_DoesNotDeadlock()
+    public void ComputeIfAbsent_ReentrantSameKey_ThrowsRecursiveUpdate()
     {
         var map = new ConcurrentHashMap<int, string>(16);
-        string? result = map.ComputeIfAbsent(1, k =>
+        var error = Assert.Throws<InvalidOperationException>(() => map.ComputeIfAbsent(1, k =>
         {
             map.ComputeIfAbsent(1, _ => "inner");
             return "outer";
-        });
-        Assert.NotNull(result);
-        Assert.NotNull(map.GetOrDefault(1));
+        }));
+        Assert.Equal("Recursive update", error.Message);
+        Assert.Null(map.GetOrDefault(1));
+        Assert.Equal(0, map.Count);
     }
 }
 
