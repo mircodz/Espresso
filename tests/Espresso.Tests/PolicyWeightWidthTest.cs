@@ -9,7 +9,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for the 64-bit policy weight (upstream d885a95ee).</summary>
+/// <summary>Tests for the 64-bit policy weight.</summary>
 public sealed class PolicyWeightWidthTest
 {
     private static object Field(object cache, string name) =>
@@ -18,10 +18,9 @@ public sealed class PolicyWeightWidthTest
     private static long SumPolicyWeights(object cache, string dequeField) =>
         ((IEnumerable)Field(cache, dequeField)).Cast<Node<int, string>>().Sum(n => n.PolicyWeight);
 
-    // Mirrors BoundedLocalCacheTest.put_reorderedUpdates_leaveNoRegionResidue: a removal listener on a
-    // direct executor runs between the node update and its queued UpdateTask, so a second writer's
-    // positive delta is applied before the first writer's negative one and the transient sum
-    // leaves the int range.
+    // A removal listener on a direct executor runs between the node update and its queued
+    // UpdateTask, so a second writer's positive delta is applied before the first writer's negative
+    // one and the transient sum leaves the int range.
     [Fact]
     public async Task ReorderedUpdates_LeaveNoRegionResidue()
     {
@@ -43,10 +42,8 @@ public sealed class PolicyWeightWidthTest
             .Executor(DirectExecutor.Instance).Build();
         cache.Put(1, original);
 
-        // A dedicated thread: the writer blocks inside the listener, so it must not depend on thread-pool
-        // availability while other tests run in parallel.
-        Task writer = Task.Factory.StartNew(() => cache.Put(1, "1"), CancellationToken.None,
-            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // The writer blocks inside the listener, so it runs on its own thread.
+        Task writer = DedicatedThread.Run(() => cache.Put(1, "1"));
         try
         {
             Assert.True(arrived.Wait(TimeSpan.FromSeconds(10)));

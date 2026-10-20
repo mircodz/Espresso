@@ -61,7 +61,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         }
 
         // Miss: compute under the bin lock so the function runs atomically, at most once. The miss is
-        // recorded before loading and a throwing load is recorded as a failure (Caffeine's statsAware).
+        // recorded before loading and a throwing load is recorded as a failure.
         bool[] loaded = { false };
         long startTime = 0;
         V? result = _data.ComputeIfAbsent(key, k =>

@@ -290,10 +290,10 @@ public sealed class VariableExpirationTest : CacheTestBase
         Assert.Equal(0, cache.EstimatedSize());
     }
 
-    // Regression (Finding 1): if the user IExpiry throws on an update, the node must be left
-    // untouched — the value/weight must NOT be mutated before the (throwing) expiry callback runs,
-    // otherwise the entry keeps the new value with stale accounting. Espresso computes the expiry
-    // time first, so the throw leaves the prior value intact.
+    // If the user IExpiry throws on an update, the node must be left untouched — the value/weight
+    // must NOT be mutated before the (throwing) expiry callback runs, otherwise the entry keeps the
+    // new value with stale accounting. The expiry time is computed first, so the throw leaves the
+    // prior value intact.
     [Fact]
     public void ThrowingExpiryOnUpdate_LeavesEntryUnchanged()
     {

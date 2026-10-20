@@ -5,7 +5,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for the <c>BoundedLocalCache.ComputeIfAbsent</c> (<c>Get(key, fn)</c>) hit path.</summary>
+/// <summary>Tests for the <c>BoundedLocalCache.ComputeIfAbsent</c> (<c>Get(key, fn)</c>) hit path.</summary>
 public class ComputeIfAbsentTest
 {
     private const long Hour = 3_600_000_000_000L;
@@ -44,7 +44,7 @@ public class ComputeIfAbsentTest
             cache.Put(1, "old");
 
             expiry.Armed = true;
-            Task<string?> reader = Task.Run(() => cache.Get(1, _ => "loaded"));
+            Task<string?> reader = DedicatedThread.Run(() => cache.Get(1, _ => "loaded"));
             Assert.True(expiry.Entered.Wait(TimeSpan.FromSeconds(10)));
 
             cache.Invalidate(1); // removal task drains inline and kills the node

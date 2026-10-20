@@ -6,7 +6,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for how <c>AddTask</c> links a new node into the eviction policy.</summary>
+/// <summary>Tests for how <c>AddTask</c> links a new node into the eviction policy.</summary>
 public class AddTaskTest
 {
     private sealed class ManualExecutor : IExecutor

@@ -10,9 +10,9 @@ using Xunit;
 namespace Espresso.Tests;
 
 /// <summary>
-/// Evicting an entry discards its refresh while the key's bin is still locked (as Caffeine does inside
-/// its <c>computeIfPresent</c>), so the discard can never remove the refresh registration of an entry
-/// that was re-inserted for the same key after the eviction released the bin.
+/// Evicting an entry discards its refresh while the key's bin is still locked, so the discard can never
+/// remove the refresh registration of an entry that was re-inserted for the same key after the
+/// eviction released the bin.
 /// </summary>
 public class EvictionRefreshDiscardTest
 {
@@ -99,7 +99,7 @@ public class EvictionRefreshDiscardTest
         clock.Now = 20 * Second; // expired
 
         // The evictor expires the old entry and parks inside the refresh discard for its key.
-        Task evictor = Task.Run(() =>
+        Task evictor = DedicatedThread.Run(() =>
         {
             HookKey.EvictorThread = Environment.CurrentManagedThreadId;
             cache.CleanUp();
@@ -107,14 +107,14 @@ public class EvictionRefreshDiscardTest
         Assert.True(HookKey.Parked.Wait(TimeSpan.FromSeconds(10)), "the eviction never reached the refresh discard");
 
         // A successor is written for the same key and becomes due for refresh, which registers a reload.
-        Task successor = Task.Run(() =>
+        Task successor = DedicatedThread.Run(() =>
         {
             cache.Put(new HookKey(1), "new");
             Interlocked.Exchange(ref clock.Now, 25 * Second);
             Assert.Equal("new", cache.GetIfPresent(new HookKey(1), recordStats: false));
         });
-        // With the discard inside the eviction's bin lock the successor waits for the eviction to
-        // finish; with the discard after it, the successor registers its refresh while the evictor is parked.
+        // The discard runs inside the eviction's bin lock, so the successor's write waits for the
+        // eviction to finish and registers its refresh only after the discard.
         await Task.WhenAny(successor, Task.Delay(300));
 
         HookKey.Resume.Set();

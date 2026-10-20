@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -35,11 +34,13 @@ public class InFlightExpirationScanTest
     private sealed class CountingExecutor : IExecutor
     {
         public int Submissions;
+        public readonly ManualResetEventSlim Ran = new();
 
         public void Execute(Action action)
         {
             Interlocked.Increment(ref Submissions);
             action();
+            Ran.Set();
         }
     }
 
@@ -54,7 +55,7 @@ public class InFlightExpirationScanTest
     private const int A = 1, B = 2, C = 3;
 
     /// <summary>
-    /// The reviewer's two shapes. Write: <c>b</c>, <c>a</c> written at 0s, <c>a</c> rewritten with an
+    /// Two entry shapes. Write: <c>b</c>, <c>a</c> written at 0s, <c>a</c> rewritten with an
     /// in-flight future at 2s, <c>c</c> written at 3s. Access: <c>b</c> written and <c>a</c> loaded
     /// asynchronously at 0s, <c>a</c> read at 2s, <c>c</c> written at 3s. In both, at 20s every entry's
     /// timestamps say expired, and the in-flight <c>a</c> sits ahead of <c>c</c> in the scanned deque.
@@ -123,7 +124,7 @@ public class InFlightExpirationScanTest
         s.Store.CleanUp();
 
         Assert.Null(NodeOf(s.Store, B));
-        Assert.Null(NodeOf(s.Store, C)); // was starved behind the in-flight head
+        Assert.Null(NodeOf(s.Store, C)); // not starved behind the in-flight head
         Assert.NotNull(NodeOf(s.Store, A));
         Assert.Equal(2, s.Async.Stats().EvictionCount);
         Assert.Equal(0, DrainStatus(s.Store)); // Idle: the budget was not exhausted, nothing re-armed
@@ -164,13 +165,15 @@ public class InFlightExpirationScanTest
         Setup s = Create(shape, executor);
         s.Store.CleanUp();
 
-        s.Load.SetResult("a");
         Node<int, Task<string>> a = NodeOf(s.Store, A)!;
-        var sw = Stopwatch.StartNew();
-        while (Timestamp(a, shape) > 20 * Second && sw.Elapsed < TimeSpan.FromSeconds(5))
-        {
-            await Task.Delay(1);
-        }
+        Assert.Equal(0, DrainStatus(s.Store));
+
+        // The completion handler (asynchronous on the thread pool for a loaded future) replaces the
+        // future with itself, which restamps the timers and then submits a drain to the executor. With
+        // the drain status idle, that submission is the next executor run, so it signals the restamp.
+        executor.Ran.Reset();
+        s.Load.SetResult("a");
+        Assert.True(executor.Ran.Wait(TimeSpan.FromSeconds(30)), "the completion handler never ran");
         Assert.Equal(20 * Second, Timestamp(a, shape)); // completion restarted the real timer at 20s
 
         s.Clock.Now = 29 * Second;

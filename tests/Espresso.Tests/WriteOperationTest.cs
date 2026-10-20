@@ -9,11 +9,11 @@ using Xunit;
 namespace Espresso.Tests;
 
 /// <summary>
-/// Write operations must match Caffeine's lifecycle protocol: a removed node is retired and unlinked,
+/// Write operations follow the entry lifecycle: a removed node is retired and unlinked,
 /// an expired entry is reported as EXPIRED with an eviction stat, conditional operations respect
 /// expiry, and a throwing loader is counted as a miss and a load failure.
 /// </summary>
-public class WriteOperationParityTest
+public class WriteOperationTest
 {
     private sealed class Clock
     {
@@ -47,7 +47,7 @@ public class WriteOperationParityTest
             .GetField("_data", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(cache)!).GetOrDefault(key);
 
-    // ----- C13: an expired entry whose recomputation yields nothing is retired like a removal -----
+    // ----- an expired entry whose recomputation yields nothing is retired like a removal -----
 
     [Fact]
     public void ExpiredNullLoad_ReclaimsPolicyAndRecordsEviction()
@@ -130,7 +130,7 @@ public class WriteOperationParityTest
         Assert.Equal(new[] { ((string?)"old", RemovalCause.Expired) }, removals);
     }
 
-    // ----- C15: the expired-entry recomputation serializes with the node-locked Put -----
+    // ----- the expired-entry recomputation serializes with the node-locked Put -----
 
     [Fact]
     public async Task ExpiredCompute_SerializesLoaderWithPut()
@@ -145,7 +145,7 @@ public class WriteOperationParityTest
 
         using var loaderEntered = new ManualResetEventSlim();
         using var releaseLoader = new ManualResetEventSlim();
-        Task<string?> loader = Task.Run(() => cache.Get(1, _ =>
+        Task<string?> loader = DedicatedThread.Run(() => cache.Get(1, _ =>
         {
             loaderEntered.Set();
             releaseLoader.Wait(TimeSpan.FromSeconds(10));
@@ -153,7 +153,7 @@ public class WriteOperationParityTest
         }));
         Assert.True(loaderEntered.Wait(TimeSpan.FromSeconds(10)));
 
-        Task put = Task.Run(() => cache.Put(1, "put"));
+        Task put = DedicatedThread.Run(() => cache.Put(1, "put"));
         await Task.WhenAny(put, Task.Delay(200)); // the Put must wait for the in-flight recomputation
         releaseLoader.Set();
         await loader;
@@ -162,7 +162,7 @@ public class WriteOperationParityTest
         Assert.Equal("put", cache.GetIfPresent(1));
     }
 
-    // ----- C16: Remove / conditional Remove / Replace respect expiry and report like Java -----
+    // ----- Remove / conditional Remove / Replace respect expiry and report it -----
 
     [Fact]
     public void ExpiredRemove_RecordsEviction()
@@ -298,7 +298,7 @@ public class WriteOperationParityTest
         Assert.Equal(0, Refreshes(cache).Count);
     }
 
-    // ----- C17: a throwing loader records a miss and a load failure -----
+    // ----- a throwing loader records a miss and a load failure -----
 
     [Fact]
     public void Bounded_ThrowingLoader_RecordsMissAndLoadFailure()

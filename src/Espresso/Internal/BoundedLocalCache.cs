@@ -443,8 +443,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         // AsyncWeigher), matching how Replace/UpdateTask keep the weighted-size telescoping.
         AfterWrite(new UpdateTask(this, updated, weightDifference));
 
-        // Keep the debounce token registered until the new future completes; Java clears it on
-        // completion so no fresh refresh is triggered while this reload is in flight.
+        // Keep the debounce token registered until the new future completes, so no fresh refresh is
+        // triggered while this reload is in flight; the completion releases it.
         ((Task)(object)newFuture).ContinueWith(_ => ReleaseRefresh(keyRef, token),
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
@@ -2253,7 +2253,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     /// <summary>
-    /// The miss path of <see cref="ComputeIfAbsent"/> (Caffeine's <c>doComputeIfAbsent</c>). An absent
+    /// The miss path of <see cref="ComputeIfAbsent"/>. An absent
     /// key is loaded under the bin lock. A present node is re-validated under its own monitor (which
     /// optimized puts use), and if it has expired it is recomputed while that monitor is held: a
     /// replacement is weighed and timed before the node is mutated, while a null or throwing
@@ -2390,7 +2390,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     /// <summary>
-    /// Invokes a loading function with Caffeine's <c>statsAware</c> accounting: the miss is recorded
+    /// Invokes a loading function with load-statistics accounting: the miss is recorded
     /// before the call, a throw is recorded as a load failure, and (when <paramref name="recordLoad"/>)
     /// a returned value as a load success or, if null, a load failure.
     /// </summary>

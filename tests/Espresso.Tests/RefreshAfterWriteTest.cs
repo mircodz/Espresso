@@ -179,9 +179,9 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         Assert.Equal("1.2", cache.GetIfPresent(1));
     }
 
-    // Regression: refreshAfterWrite must fire on the LoadingCache.Get path, not only GetIfPresent.
-    // Previously AfterRead did not call RefreshIfNeeded, so Get() (routed through ComputeIfAbsent)
-    // never refreshed a hot present key.
+    // refreshAfterWrite must fire on the LoadingCache.Get path, not only GetIfPresent: Get() is
+    // routed through ComputeIfAbsent, whose hit path runs AfterRead, which calls RefreshIfNeeded so
+    // a hot present key is refreshed.
     [Fact]
     public void Refresh_TriggeredVia_LoadingCacheGet()
     {
@@ -204,7 +204,7 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         Assert.Equal("1-v2", cache.Get(1)); // reloaded value now visible
     }
 
-    // Regression: a reload loader that THROWS must preserve the existing (stale) value — refresh is
+    // A reload loader that THROWS must preserve the existing (stale) value — refresh is
     // best-effort. Only a null reload removes the entry.
     [Fact]
     public void Refresh_ThrowingReload_PreservesOldValue()
@@ -228,9 +228,9 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         Assert.True(cache.Stats().LoadFailureCount >= 1, $"LoadFailureCount {cache.Stats().LoadFailureCount} should be >= 1");
     }
 
-    // Regression: a weighted sync refresh that changes the entry weight must propagate the weight
-    // delta to the policy (previously RefreshSync never enqueued an UpdateTask -> weightedSize drift,
-    // which would break the weight bound). Behavioral check: the cache stays within its weight bound.
+    // A weighted sync refresh that changes the entry weight must propagate the weight delta to the
+    // policy (RefreshSync enqueues an UpdateTask; without it weightedSize would drift and break the
+    // weight bound). Behavioral check: the cache stays within its weight bound.
     [Fact]
     public void Refresh_WeightedReload_KeepsWeightBound()
     {
@@ -263,7 +263,7 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         Assert.True(totalWeight <= 40, "live weight must respect bound 40 (no weightedSize drift)");
     }
 
-    // Regression: when an EXPIRED entry is refreshed in place on the loader path, the old value's
+    // When an EXPIRED entry is refreshed in place on the loader path, the old value's
     // expiration must fire a removal notification with cause Expired (and record the eviction).
     [Fact]
     public void ExpiredEntry_ReplacedOnGet_FiresExpiredNotification()
@@ -296,9 +296,9 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         public void OnRemoval(int key, string? value, RemovalCause cause) => _on(key, value, cause);
     }
 
-    // Regression: on a refresh-only cache (no expireAfterWrite), a Put over an existing key must reset
-    // the write time so the refresh window is measured from that write. Previously the put path gated
-    // the write-time reset on expireAfterWrite only, leaving it stale and mis-timing the next refresh.
+    // On a refresh-only cache (no expireAfterWrite), a Put over an existing key must reset the write
+    // time so the refresh window is measured from that write: the put path resets the write time for
+    // refreshAfterWrite just as for expireAfterWrite, so the next refresh is timed from the Put.
     [Fact]
     public void PutOverExisting_ResetsRefreshWindow()
     {

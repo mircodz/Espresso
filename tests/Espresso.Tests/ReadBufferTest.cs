@@ -5,7 +5,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for read-buffer bookkeeping on caches whose policy does not track access.</summary>
+/// <summary>Tests for read-buffer bookkeeping on caches whose policy does not track access.</summary>
 public class ReadBufferTest
 {
     private sealed class CountingExecutor : IExecutor
