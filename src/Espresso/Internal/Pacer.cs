@@ -44,11 +44,24 @@ internal sealed class Pacer
             {
                 return;
             }
-            _future.Cancel();
+            Cancel();
         }
 
         long actualDelay = CalculateSchedule(now, delay, scheduleAt);
-        _future = _scheduler.Schedule(executor, command, NanosToTimeSpan(actualDelay));
+        try
+        {
+            _future = _scheduler.Schedule(executor, command, NanosToTimeSpan(actualDelay))
+                ?? CompletedFuture.Instance;
+        }
+        catch
+        {
+            // A rejected maintenance tick must not poison future scheduling attempts.
+            _future = CompletedFuture.Instance;
+        }
+        if (_future.IsDone)
+        {
+            NextFireTime = 0L;
+        }
     }
 
     /// <summary>Attempts to cancel the scheduled task, if present.</summary>

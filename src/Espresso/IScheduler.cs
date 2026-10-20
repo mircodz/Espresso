@@ -71,8 +71,8 @@ internal sealed class SystemScheduler : IScheduler
     public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
     {
         var future = new TimerFuture();
-        // Clamp to a non-negative delay; a due-or-past task fires promptly.
-        long ms = (long)Math.Max(0d, delay.TotalMilliseconds);
+        // Timer's maximum delay is ~49.7 days; an early maintenance tick re-arms the pacer.
+        long ms = Math.Clamp(delay.Ticks / TimeSpan.TicksPerMillisecond, 0L, 0xFFFFFFFEL);
         var timer = new Timer(_ =>
         {
             if (future.TryFire())

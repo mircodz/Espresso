@@ -38,6 +38,168 @@ public sealed class PacerTest
 
     private static readonly Action Command = () => { };
 
+    private sealed class InlineScheduler : IScheduler
+    {
+        public int Calls;
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Calls++;
+            executor.Execute(command);
+            return new ControllableFuture { IsDone = true };
+        }
+    }
+
+    [Fact]
+    public void Schedule_InlineCompletedReplacement_GuardsReentry()
+    {
+        var scheduler = new InlineScheduler();
+        var pacer = new Pacer(scheduler);
+        Action command = () => pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+
+        pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+        pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+
+        Assert.Equal(2, scheduler.Calls);
+        Assert.False(pacer.IsScheduled);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Schedule_InlineCancelThenReschedule_PreservesReentryGuard(bool replacement)
+    {
+        var scheduler = new InlineScheduler();
+        var pacer = new Pacer(scheduler);
+        if (replacement)
+        {
+            pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+        }
+        int depth = 0;
+        int maximumDepth = 0;
+        Action command = null!;
+        command = () =>
+        {
+            depth++;
+            maximumDepth = Math.Max(maximumDepth, depth);
+            try
+            {
+                // Bound the broken baseline's recursion; Schedule catches this exception.
+                if (depth > 8) throw new InvalidOperationException("recursive inline scheduling");
+                pacer.Cancel();
+                pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+            }
+            finally
+            {
+                depth--;
+            }
+        };
+
+        pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);
+
+        Assert.Equal(replacement ? 2 : 1, scheduler.Calls);
+        Assert.Equal(1, maximumDepth);
+        Assert.Equal(0, depth);
+        Assert.False(pacer.IsScheduled);
+        Assert.Equal(0L, pacer.NextFireTime);
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+        Assert.Equal(replacement ? 3 : 2, scheduler.Calls);
+    }
+
+    private sealed class RejectingScheduler : IScheduler
+    {
+        public int Calls;
+        public bool Reject;
+        public bool ReturnNull;
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Calls++;
+            if (Reject)
+            {
+                Reject = false;
+                if (ReturnNull) return null!;
+                throw new InvalidOperationException("scheduler rejected maintenance");
+            }
+            return new ControllableFuture();
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Schedule_RejectedOrNullFuture_LeavesStateRetryable(bool replacement, bool returnNull)
+    {
+        var scheduler = new RejectingScheduler { ReturnNull = returnNull };
+        var pacer = new Pacer(scheduler);
+        if (replacement)
+        {
+            pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+        }
+        scheduler.Reject = true;
+
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, 0L);
+
+        Assert.False(pacer.IsScheduled);
+        Assert.Equal(0L, pacer.NextFireTime);
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, 0L);
+        Assert.True(pacer.IsScheduled);
+        Assert.Equal(replacement ? 3 : 2, scheduler.Calls);
+        pacer.Cancel();
+    }
+
+    [Fact]
+    public void Cancel_NullFuture_PreservesInitializingState()
+    {
+        var pacer = new Pacer(new RecordingScheduler()) { NextFireTime = Now };
+
+        pacer.Cancel();
+
+        Assert.Equal(Now, pacer.NextFireTime);
+        Assert.False(pacer.IsScheduled);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Cancel_AfterRejectedOrNullFuture_AllowsRetry(bool returnNull)
+    {
+        var scheduler = new RejectingScheduler { Reject = true, ReturnNull = returnNull };
+        var pacer = new Pacer(scheduler);
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+
+        pacer.Cancel();
+
+        Assert.Equal(0L, pacer.NextFireTime);
+        Assert.False(pacer.IsScheduled);
+        pacer.Schedule(DirectExecutor.Instance, Command, Now, OneMinute);
+        Assert.Equal(2, scheduler.Calls);
+        Assert.True(pacer.IsScheduled);
+        pacer.Cancel();
+    }
+
+    [Theory]
+    [InlineData(0xFFFFFFFEL * TimeSpan.TicksPerMillisecond)]
+    [InlineData(0xFFFFFFFFL * TimeSpan.TicksPerMillisecond)]
+    [InlineData(60L * TimeSpan.TicksPerDay)]
+    [InlineData(long.MaxValue)]
+    public void SystemScheduler_LargeDelay_CanBeScheduledAndCancelled(long ticks)
+    {
+        IScheduledFuture future = Schedulers.System.Schedule(
+            DirectExecutor.Instance, Command, TimeSpan.FromTicks(ticks));
+        try
+        {
+            Assert.False(future.IsDone);
+        }
+        finally
+        {
+            future.Cancel();
+        }
+        Assert.True(future.IsDone);
+    }
+
     [Fact]
     public void Schedule_Initialize()
     {

@@ -115,7 +115,6 @@ public sealed class NodeGenerator : IIncrementalGenerator
         if (f.Weighted)
         {
             sb.AppendLine("            _weight = weight;");
-            sb.AppendLine("            _policyWeight = weight;");
         }
         if (f.Access)
         {
@@ -131,9 +130,9 @@ public sealed class NodeGenerator : IIncrementalGenerator
         {
             sb.AppendLine();
             sb.AppendLine("        private int _weight;");
-            sb.AppendLine("        private int _policyWeight;");
+            sb.AppendLine("        private long _policyWeight;");
             sb.AppendLine("        public override int Weight { get => Volatile.Read(ref _weight); set => Volatile.Write(ref _weight, value); }");
-            sb.AppendLine("        public override int PolicyWeight { get => Volatile.Read(ref _policyWeight); set => Volatile.Write(ref _policyWeight, value); }");
+            sb.AppendLine("        public override long PolicyWeight { get => Volatile.Read(ref _policyWeight); set => Volatile.Write(ref _policyWeight, value); }");
         }
 
         if (f.UsesMaximum)
@@ -154,7 +153,7 @@ public sealed class NodeGenerator : IIncrementalGenerator
         {
             sb.AppendLine();
             sb.AppendLine("        private long _writeTime;");
-            sb.AppendLine("        public override long WriteTime { get => Volatile.Read(ref _writeTime); set => Volatile.Write(ref _writeTime, value); }");
+            sb.AppendLine("        public override long WriteTime { get => Volatile.Read(ref _writeTime); set => Volatile.Write(ref _writeTime, value & ~1L); }");
             sb.AppendLine("        public override bool CasWriteTime(long expect, long update)");
             sb.AppendLine("            => Interlocked.CompareExchange(ref _writeTime, update, expect) == expect;");
         }

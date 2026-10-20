@@ -51,6 +51,26 @@ public sealed class EspressoBuilderTest
         Assert.Throws<ArgumentOutOfRangeException>(act);
     }
 
+    [Theory]
+    [InlineData(0L, 0L)]
+    [InlineData(1L, 100L)]
+    [InlineData(long.MaxValue / 100L, long.MaxValue / 100L * 100L)]
+    [InlineData(long.MaxValue / 100L + 1L, long.MaxValue)]
+    [InlineData(long.MaxValue, long.MaxValue)]
+    public void TimingDurations_ConvertToSaturatedNanoseconds(long ticks, long expected)
+    {
+        TimeSpan duration = TimeSpan.FromTicks(ticks);
+        Assert.Equal(expected, Cache.NewBuilder<int, string>()
+            .ExpireAfterWrite(duration).ToConfiguration().ExpiresAfterWriteNanos);
+        Assert.Equal(expected, Cache.NewBuilder<int, string>()
+            .ExpireAfterAccess(duration).ToConfiguration().ExpiresAfterAccessNanos);
+        if (ticks > 0)
+        {
+            Assert.Equal(expected, Cache.NewBuilder<int, string>()
+                .RefreshAfterWrite(duration).ToConfiguration().RefreshAfterWriteNanos);
+        }
+    }
+
     [Fact]
     public void MaximumSize_Build_Succeeds()
     {

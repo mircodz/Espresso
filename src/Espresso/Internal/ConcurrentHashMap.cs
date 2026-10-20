@@ -114,7 +114,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 {
                     p = pl;
                 }
-                else if (comparable && ((IComparable<TKey>)k).CompareTo(p.Key) is var dir && dir != 0)
+                else if (comparable && CompareComparables(k, p.Key) is var dir && dir != 0)
                 {
                     p = dir < 0 ? pl : pr;
                 }
@@ -185,7 +185,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         }
                         else
                         {
-                            int c = comparable ? ((IComparable<TKey>)k).CompareTo(p.Key) : 0;
+                            int c = comparable ? CompareComparables(k, p.Key) : 0;
                             dir = c != 0 ? c : TieBreakOrder(k, p.Key);
                         }
 
@@ -318,7 +318,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 }
                 else
                 {
-                    int c = comparable ? ((IComparable<TKey>)k).CompareTo(p.Key) : 0;
+                    int c = comparable ? CompareComparables(k, p.Key) : 0;
                     if (c == 0)
                     {
                         if (!searched)
@@ -783,6 +783,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
         }
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CompareComparables(TKey a, TKey b)
+        => typeof(TKey) == typeof(string)
+            ? string.CompareOrdinal((string)(object)a, (string)(object)b)
+            : ((IComparable<TKey>)a).CompareTo(b);
 
     /// <summary>
     /// Deterministic total-order tiebreak used when two keys collide on hash and are not comparable
@@ -2236,4 +2242,3 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         }
     }
 }
-

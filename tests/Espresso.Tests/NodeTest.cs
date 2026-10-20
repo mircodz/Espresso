@@ -86,11 +86,33 @@ public sealed class NodeTest
     {
         var node = Make(NodeFeature.MaximumWeight, weight: 42);
         Assert.Equal(42, node.Weight);
-        Assert.Equal(42, node.PolicyWeight);
+        // the policy weight is credited by the node's AddTask, as in Caffeine
+        Assert.Equal(0, node.PolicyWeight);
         node.Weight = 7;
         node.PolicyWeight = 9;
         Assert.Equal(7, node.Weight);
         Assert.Equal(9, node.PolicyWeight);
+    }
+
+    [Theory]
+    [InlineData((int)NodeFeature.MaximumWeight)]
+    [InlineData((int)(NodeFeature.MaximumWeight | NodeFeature.ExpireAccess | NodeFeature.ExpireWrite | NodeFeature.RefreshWrite))]
+    [InlineData((int)(NodeFeature.MaximumWeight | NodeFeature.ExpireVariable))]
+    public void Weighted_PolicyWeight_RoundTripsBeyondIntRange(int features)
+    {
+        var node = Make((NodeFeature)features, weight: 5);
+        foreach (long value in new[] { (long)int.MaxValue + 1, (1L << 40) + 7, -((long)int.MaxValue + 2), long.MaxValue, long.MinValue, -1L, 0L })
+        {
+            node.PolicyWeight = value;
+            Assert.Equal(value, node.PolicyWeight);
+        }
+
+        // a transient excursion past the int range, as when reordered update deltas are replayed
+        node.PolicyWeight = int.MaxValue - 1;
+        node.PolicyWeight += int.MaxValue - 1;
+        node.PolicyWeight += -(long)(int.MaxValue - 1);
+        Assert.Equal(int.MaxValue - 1, node.PolicyWeight);
+        Assert.Equal(5, node.Weight);
     }
 
     [Fact]
@@ -114,14 +136,17 @@ public sealed class NodeTest
     }
 
     [Fact]
-    public void WriteTime_SeededWithLowBitCleared_AndCasWorks()
+    public void WriteTime_OrdinaryWritesClearLowBit_AndCasPreservesMarker()
     {
         var node = Make(NodeFeature.ExpireWrite, now: 0b1011);
         Assert.Equal(0b1010L, node.WriteTime); // now & ~1L
 
+        node.WriteTime = 0b1111;
+        Assert.Equal(0b1110L, node.WriteTime);
+
         Assert.False(node.CasWriteTime(999, 7)); // wrong expected
-        Assert.True(node.CasWriteTime(0b1010L, 500));
-        Assert.Equal(500L, node.WriteTime);
+        Assert.True(node.CasWriteTime(0b1110L, 0b1001));
+        Assert.Equal(0b1001L, node.WriteTime);
     }
 
     [Fact]

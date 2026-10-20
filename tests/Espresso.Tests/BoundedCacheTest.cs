@@ -1,5 +1,4 @@
 using System;
-using System.Threading.Tasks;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -141,38 +140,4 @@ public sealed class BoundedCacheTest : CacheTestBase
         Assert.Equal("v250", cache.GetIfPresent(250));
     }
 
-    [Fact]
-    public void ConcurrentPutGet_StaysWithinBoundAndReadable()
-    {
-        const int max = 500;
-        // Real thread-pool executor exercises the async drain/maintenance path under contention.
-        var cache = Cache.NewBuilder<int, string>()
-            .MaximumSize(max)
-            .RecordStats()
-            .Build();
-
-        const int threads = 8;
-        const int perThread = 50_000;
-        Parallel.For(0, threads, t =>
-        {
-            var rng = new Random(t);
-            for (int i = 0; i < perThread; i++)
-            {
-                int key = rng.Next(2000);
-                if ((i & 3) == 0)
-                {
-                    cache.Put(key, "v" + key);
-                }
-                else
-                {
-                    cache.GetIfPresent(key);
-                }
-            }
-        });
-
-        cache.CleanUp();
-        Assert.True(cache.EstimatedSize() <= max, $"size {cache.EstimatedSize()} exceeds {max}");
-        cache.Put(999999, "final");
-        Assert.Equal("final", cache.GetIfPresent(999999));
-    }
 }

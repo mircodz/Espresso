@@ -31,6 +31,7 @@ public sealed class BuilderOverloadTest
     {
         RemovalCause? seen = null;
         var watched = Cache.NewBuilder<int, string>()
+            .Executor(DirectExecutor.Instance)
             .RemovalListener((k, v, c) => seen = c).Build();
 
         watched.Put(1, "a");

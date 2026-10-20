@@ -64,5 +64,7 @@ internal interface ILocalCache<K, V> : IDisposable
     StatsCounter StatsCounter { get; }
     IExecutor Executor { get; }
     Ticker Ticker { get; }
+    /// <summary>The ticker used to time loads for statistics.</summary>
+    Ticker StatsTicker { get; }
     bool IsRecordingStats { get; }
 }

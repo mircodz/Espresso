@@ -86,7 +86,7 @@ internal sealed class FuncExpiry<K, V> : IExpiry<K, V>
         _read = afterRead;
     }
 
-    private static long ToNanos(TimeSpan duration) => duration.Ticks * 100L;
+    private static long ToNanos(TimeSpan duration) => Internal.Common.SaturatedToNanos(duration);
 
     /// <inheritdoc/>
     public long ExpireAfterCreate(K key, V value, long currentTime)

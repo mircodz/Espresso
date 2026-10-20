@@ -1,4 +1,9 @@
 using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Espresso.Internal;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -13,6 +18,24 @@ public sealed class ExpirationTest : CacheTestBase
     }
 
     private static readonly TimeSpan OneMinute = TimeSpan.FromMinutes(1);
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FixedExpiration_MaxValueDuration_DoesNotExpireImmediately(bool access)
+    {
+        var builder = Cache.NewBuilder<int, string>()
+            .Ticker(() => 0L)
+            .Executor(DirectExecutor.Instance);
+        if (access) builder.ExpireAfterAccess(TimeSpan.MaxValue);
+        else builder.ExpireAfterWrite(TimeSpan.MaxValue);
+        using var cache = builder.Build();
+
+        cache.Put(1, "v");
+
+        Assert.Equal("v", cache.GetIfPresent(1));
+        Assert.Equal(1, cache.EstimatedSize());
+    }
 
     [Fact]
     public void ExpireAfterWrite_EvictsAfterDuration()
@@ -285,6 +308,223 @@ public sealed class ExpirationTest : CacheTestBase
             ticker.Advance(TimeSpan.FromSeconds(40));
             var present = cache.GetAllPresent(new[] { 1 });
             Assert.Equal("a", present[1]);
+        }
+    }
+
+    private static T Field<T>(object instance, string name)
+        => (T)instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(instance)!;
+
+    private static void SetField(object instance, string name, object value)
+        => instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(instance, value);
+
+    private static void AssertDequeConsistent<T>(ILinkedDeque<Node<int, T>> deque, long count, int? queueType = null)
+        where T : class
+    {
+        var seen = new HashSet<Node<int, T>>();
+        Node<int, T>? previous = null;
+        for (var node = deque.PeekFirst; node != null; node = deque.GetNext(node))
+        {
+            Assert.True(seen.Add(node), "cycle in expiration deque");
+            Assert.True(node.IsAlive);
+            Assert.Same(previous, deque.GetPrevious(node));
+            if (queueType.HasValue) Assert.Equal(queueType.Value, node.QueueType);
+            previous = node;
+        }
+        Assert.Same(previous, deque.PeekLast);
+        Assert.Equal(count, seen.Count);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FixedScan_ReentrantRemoval_DoesNotReorderDetachedSuccessor(bool access)
+    {
+        long now = 0L;
+        bool reentered = false;
+        ICache<int, string>? cache = null;
+        var builder = Cache.NewBuilder<int, string>().Ticker(() => now)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((key, _, cause) =>
+            {
+                if (key != 1 || cause != RemovalCause.Expired || reentered) return;
+                reentered = true;
+                cache!.Put(2, "renewed");
+                cache.Invalidate(2);
+                cache.CleanUp();
+            }));
+        if (access) builder.ExpireAfterAccess(OneMinute);
+        else builder.ExpireAfterWrite(OneMinute);
+        cache = builder.Build();
+        using (cache)
+        {
+            cache.Put(1, "a");
+            now = TimeSpan.FromSeconds(30).Ticks * 100L;
+            cache.Put(2, "b");
+            cache.Put(3, "c");
+            now = TimeSpan.FromSeconds(45).Ticks * 100L;
+            cache.Put(4, "d");
+            now = TimeSpan.FromSeconds(61).Ticks * 100L;
+
+            cache.CleanUp();
+
+            Assert.True(reentered);
+            Assert.Equal(2, cache.EstimatedSize());
+            var deque = Field<ILinkedDeque<Node<int, string>>>(cache,
+                access ? "_windowDeque" : "_writeOrderDeque");
+            AssertDequeConsistent(deque, cache.EstimatedSize());
+            now = TimeSpan.FromSeconds(122).Ticks * 100L;
+            cache.CleanUp();
+            Assert.Equal(0, cache.EstimatedSize());
+            AssertDequeConsistent(deque, 0);
+        }
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task FixedScan_ReentrantRenewal_TerminatesWithOrWithoutCapturedTail(bool access, bool removeTail)
+    {
+        long now = 0L;
+        bool reentered = false;
+        ICache<int, string>? cache = null;
+        var builder = Cache.NewBuilder<int, string>().Ticker(() => Volatile.Read(ref now))
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((key, _, cause) =>
+            {
+                if (key != 1 || cause != RemovalCause.Expired || reentered) return;
+                reentered = true;
+                cache!.Put(2, "b");
+                cache.Put(3, "c");
+                if (removeTail) cache.Invalidate(4);
+                cache.CleanUp();
+            }));
+        if (access) builder.ExpireAfterAccess(OneMinute);
+        else builder.ExpireAfterWrite(OneMinute);
+        cache = builder.Build();
+        using (cache)
+        {
+            cache.Put(1, "a");
+            now = TimeSpan.FromSeconds(30).Ticks * 100L;
+            cache.Put(2, "b");
+            cache.Put(3, "c");
+            now = TimeSpan.FromSeconds(45).Ticks * 100L;
+            cache.Put(4, "d");
+            var deque = Field<ILinkedDeque<Node<int, string>>>(cache,
+                access ? "_windowDeque" : "_writeOrderDeque");
+            var capturedTail = deque.PeekLast!;
+            now = TimeSpan.FromSeconds(61).Ticks * 100L;
+
+            Task cleanup = Task.Run(cache.CleanUp);
+            bool terminated = await Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromSeconds(2))) == cleanup;
+            if (!terminated)
+            {
+                // Release the broken baseline scan before asserting; never abandon a spinning worker.
+                long recoveryTime = TimeSpan.FromSeconds(62).Ticks * 100L;
+                Volatile.Write(ref now, recoveryTime);
+                capturedTail.AccessTime = recoveryTime;
+                capturedTail.WriteTime = recoveryTime;
+            }
+            await cleanup.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.True(terminated, "expiration scan rotated renewed successors indefinitely");
+            Assert.True(reentered);
+            Assert.Equal(removeTail ? 2 : 3, cache.EstimatedSize());
+            AssertDequeConsistent(deque, cache.EstimatedSize());
+            Volatile.Write(ref now, TimeSpan.FromSeconds(123).Ticks * 100L);
+            cache.CleanUp();
+            Assert.Equal(0, cache.EstimatedSize());
+            AssertDequeConsistent(deque, 0);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FixedScan_PendingAsyncHead_DoesNotHideExpiredEntry(bool access)
+    {
+        long now = 0L;
+        var builder = Cache.NewBuilder<int, string>().Ticker(() => now).Executor(DirectExecutor.Instance);
+        if (access) builder.ExpireAfterAccess(OneMinute);
+        else builder.ExpireAfterWrite(OneMinute);
+        using var cache = builder.BuildAsync();
+        var first = new TaskCompletionSource<string>();
+        var last = new TaskCompletionSource<string>();
+        cache.Put(1, first.Task);
+        cache.Put(2, Task.FromResult("expired"));
+        now = TimeSpan.FromSeconds(1).Ticks * 100L;
+        cache.Put(3, last.Task);
+        object store = Field<object>(cache, "Cache");
+        var deque = Field<ILinkedDeque<Node<int, Task<string>>>>(store,
+            access ? "_windowDeque" : "_writeOrderDeque");
+        Node<int, Task<string>>? pendingHead = null;
+        foreach (var node in deque) if (node.Key == 1) pendingHead = node;
+        Assert.NotNull(pendingHead);
+        deque.MoveToFront(pendingHead);
+        now = TimeSpan.FromSeconds(61).Ticks * 100L;
+
+        cache.CleanUp();
+
+        Assert.Equal(2, cache.EstimatedSize());
+        AssertDequeConsistent(deque, 2);
+        Assert.Same(first.Task, cache.GetIfPresent(1));
+        Assert.Same(last.Task, cache.GetIfPresent(3));
+    }
+
+    [Fact]
+    public void AccessScan_TransferredTail_RearmsEvenWhenLinksRemainLive()
+    {
+        long now = 0L;
+        bool reentered = false;
+        ICache<int, string>? cache = null;
+        ILinkedDeque<Node<int, string>>? window = null;
+        ILinkedDeque<Node<int, string>>? probation = null;
+        Node<int, string>? capturedTail = null;
+        cache = Cache.NewBuilder<int, string>().MaximumSize(100).ExpireAfterAccess(OneMinute)
+            .Ticker(() => now).Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((key, _, cause) =>
+            {
+                if (key != 1 || cause != RemovalCause.Expired || reentered) return;
+                reentered = true;
+                Assert.True(window!.Remove(capturedTail!));
+                capturedTail!.MakeMainProbation();
+                probation!.OfferLast(capturedTail);
+                SetField(cache!, "_windowWeightedSize",
+                    Field<long>(cache!, "_windowWeightedSize") - capturedTail.PolicyWeight);
+            })).Build();
+        using (cache)
+        {
+            SetField(cache, "_windowMaximum", 100L);
+            cache.Put(1, "a");
+            now = TimeSpan.FromSeconds(30).Ticks * 100L;
+            cache.Put(2, "b");
+            cache.Put(3, "c");
+            now = TimeSpan.FromSeconds(45).Ticks * 100L;
+            cache.Put(4, "d");
+            cache.Put(5, "e");
+            window = Field<ILinkedDeque<Node<int, string>>>(cache, "_windowDeque");
+            probation = Field<ILinkedDeque<Node<int, string>>>(cache, "_probationDeque");
+            var staged = window.PollLast()!;
+            staged.MakeMainProbation();
+            probation.OfferLast(staged);
+            SetField(cache, "_windowWeightedSize", Field<long>(cache, "_windowWeightedSize") - staged.PolicyWeight);
+            capturedTail = window.PeekLast!;
+            now = TimeSpan.FromSeconds(61).Ticks * 100L;
+            Assert.Equal(0, Field<int>(cache, "_drainStatus"));
+
+            lock (Field<object>(cache, "_evictionLock"))
+            {
+                typeof(BoundedLocalCache<int, string>).GetMethod("ExpireAfterAccessEntries",
+                    BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(long) }, null)!
+                    .Invoke(cache, new object[] { now });
+            }
+
+            Assert.True(reentered);
+            Assert.Equal(3, Field<int>(cache, "_drainStatus"));
+            AssertDequeConsistent(window, 2, Node<int, string>.Window);
+            AssertDequeConsistent(probation, 2, Node<int, string>.Probation);
+            Assert.Equal(4, cache.EstimatedSize());
         }
     }
 

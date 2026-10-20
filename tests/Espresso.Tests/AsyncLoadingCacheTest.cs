@@ -204,6 +204,7 @@ public sealed class AsyncLoadingCacheTest
         private long _nanos;
         public long Read() => _nanos;
         public void Advance(TimeSpan by) => _nanos += by.Ticks * 100L;
+        public void AdvanceNanos(long nanos) => _nanos += nanos;
     }
 
     [Fact]
@@ -233,6 +234,34 @@ public sealed class AsyncLoadingCacheTest
         await WaitUntil(() => cache.GetIfPresent(1)!.IsCompletedSuccessfully
                               && cache.GetIfPresent(1)!.Result == "1.v2");
         Assert.Equal("1.v2", await cache.GetIfPresent(1)!);
+    }
+
+    [Fact]
+    public async Task RefreshAfterWrite_OddCompletionTimes_DoNotBlockLaterRefreshes()
+    {
+        var ticker = new FakeTicker();
+        int version = 1;
+        var loader = new CountingLoader(k => $"{k}.v{version}");
+        var cache = Cache.NewBuilder<int, string>()
+            .RefreshAfterWrite(TimeSpan.FromMinutes(1))
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync(loader);
+
+        ticker.AdvanceNanos(1);
+        cache.Put(1, Task.FromResult("initial"));
+        cache.Put(1, Task.FromResult("replacement"));
+
+        version = 2;
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        _ = cache.GetIfPresent(1);
+        Assert.Equal("1.v2", await cache.GetIfPresent(1)!);
+
+        version = 3;
+        ticker.Advance(TimeSpan.FromSeconds(61));
+        _ = cache.GetIfPresent(1);
+        Assert.Equal("1.v3", await cache.GetIfPresent(1)!);
+        Assert.Equal(2, loader.LoadCalls);
     }
 
     [Fact]

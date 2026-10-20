@@ -245,6 +245,117 @@ public sealed class TimerWheelTest
     }
 
     [Fact]
+    public void Advance_NestedCall_PreservesClockAndBudget()
+    {
+        var wheel = new TimerWheel<long, string>();
+        var nested = new CountingCache();
+        var first = new Timer(Spans[0]);
+        var second = new Timer(2 * Spans[0]);
+        wheel.Schedule(first);
+        wheel.Schedule(second);
+        int remaining = -1;
+        long nestedClock = -1;
+        var cache = new CountingCache(node =>
+        {
+            if (ReferenceEquals(node, first))
+            {
+                remaining = wheel.Advance(nested, 3 * Spans[0], 7);
+                nestedClock = wheel.Nanos;
+            }
+            return true;
+        });
+
+        Assert.Equal(8, wheel.Advance(cache, 2 * Spans[0], 10));
+
+        Assert.Equal(7, remaining);
+        Assert.Equal(2 * Spans[0], nestedClock);
+        Assert.Equal(2 * Spans[0], wheel.Nanos);
+        Assert.Empty(nested.Evicted);
+        Assert.Equal(new Node<long, string>[] { first, second }, cache.Evicted);
+        CheckEmpty(wheel);
+    }
+
+    [Fact]
+    public void Advance_ReentrantDeschedule_PreservesRemainderAfterBudget()
+    {
+        var wheel = new TimerWheel<long, string>();
+        var timers = Enumerable.Range(0, 4).Select(_ => new Timer(Spans[0])).ToArray();
+        foreach (var timer in timers) wheel.Schedule(timer);
+        var cache = new CountingCache(_ =>
+        {
+            wheel.Deschedule(timers[1]);
+            return true;
+        });
+
+        Assert.Equal(0, wheel.Advance(cache, 2 * Spans[0], 1));
+
+        Assert.Equal(0L, wheel.Nanos);
+        Assert.Equal(new Node<long, string>[] { timers[2], timers[3] }, wheel.ToArray());
+        Assert.Same(timers[2], timers[3].PreviousInVariableOrder);
+        var retry = new CountingCache();
+        Assert.Equal(8, wheel.Advance(retry, 2 * Spans[0], 10));
+        Assert.Equal(new Node<long, string>[] { timers[2], timers[3] }, retry.Evicted);
+        CheckEmpty(wheel);
+    }
+
+    [Fact]
+    public void Advance_ReentrantException_RestoresCircularChainAndGuard()
+    {
+        var wheel = new TimerWheel<long, string>();
+        var timers = Enumerable.Range(0, 4).Select(_ => new Timer(Spans[0])).ToArray();
+        foreach (var timer in timers) wheel.Schedule(timer);
+        var cache = new CountingCache(node =>
+        {
+            if (ReferenceEquals(node, timers[1]))
+            {
+                wheel.Deschedule(timers[2]);
+                throw new ArgumentException("eviction failed");
+            }
+            return true;
+        });
+
+        Assert.Throws<ArgumentException>(() => wheel.Advance(cache, 2 * Spans[0], 10));
+
+        Assert.Equal(0L, wheel.Nanos);
+        Assert.Equal(new Node<long, string>[] { timers[3], timers[1] }, wheel.ToArray());
+        Assert.Same(timers[3], timers[1].PreviousInVariableOrder);
+        var retry = new CountingCache();
+        Assert.Equal(8, wheel.Advance(retry, 2 * Spans[0], 10));
+        Assert.Equal(new Node<long, string>[] { timers[3], timers[1] }, retry.Evicted);
+        CheckEmpty(wheel);
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(0, 2)]
+    [InlineData(2, 0)]
+    [InlineData(2, 2)]
+    public void Transfer_AppendsAndEmptiesSource(int sourceCount, int destinationCount)
+    {
+        var wheel = new TimerWheel<long, string>();
+        var source = Wheel(wheel)[0][1];
+        var destination = Wheel(wheel)[0][2];
+        var sourceNodes = Enumerable.Range(0, sourceCount).Select(_ => new Timer(Spans[0])).ToArray();
+        var destinationNodes = Enumerable.Range(0, destinationCount).Select(_ => new Timer(2 * Spans[0])).ToArray();
+        foreach (var node in sourceNodes) wheel.Schedule(node);
+        foreach (var node in destinationNodes) wheel.Schedule(node);
+
+        TimerWheel<long, string>.Transfer(source, destination);
+
+        Assert.Same(source, source.NextInVariableOrder);
+        Assert.Same(source, source.PreviousInVariableOrder);
+        Node<long, string> previous = destination;
+        foreach (var node in destinationNodes.Concat(sourceNodes))
+        {
+            Assert.Same(node, previous.NextInVariableOrder);
+            Assert.Same(previous, node.PreviousInVariableOrder);
+            previous = node;
+        }
+        Assert.Same(destination, previous.NextInVariableOrder);
+        Assert.Same(previous, destination.PreviousInVariableOrder);
+    }
+
+    [Fact]
     public void Advance_BoundedPerCycle()
     {
         var cache = new CountingCache();

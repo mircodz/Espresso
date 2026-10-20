@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using Espresso.Stats;
 
 namespace Espresso.Internal;
@@ -15,6 +16,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     private readonly ConcurrentHashMap<K, V> _data;
     private readonly StatsCounter _statsCounter;
     private readonly IRemovalListener<K, V>? _removalListener;
+    private readonly IExecutor _executor;
     private readonly Ticker _ticker;
     private readonly ICacheLoader<K, V>? _loader;
 
@@ -23,7 +25,8 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         _data = new ConcurrentHashMap<K, V>(config.InitialCapacity);
         _statsCounter = config.StatsCounter;
         _removalListener = config.RemovalListener;
-        _ticker = config.Ticker;
+        _executor = config.Executor;
+        _ticker = config.StatsTicker; // used only to time loads
         _loader = loader;
     }
 
@@ -31,6 +34,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public V? GetIfPresent(K key)
     {
+        ThrowIfKeyNull(key);
         V? value = _data.GetOrDefault(key);
         if (value == null)
         {
@@ -45,6 +49,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public V? Get(K key, Func<K, V?> mappingFunction)
     {
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(mappingFunction);
 
         // A present value is a hit and never runs the function.
@@ -55,19 +60,28 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
             return current;
         }
 
-        // Miss: compute under the bin lock so the function runs atomically, at most once.
+        // Miss: compute under the bin lock so the function runs atomically, at most once. The miss is
+        // recorded before loading and a throwing load is recorded as a failure (Caffeine's statsAware).
         bool[] loaded = { false };
         long startTime = 0;
         V? result = _data.ComputeIfAbsent(key, k =>
         {
             loaded[0] = true;
+            _statsCounter.RecordMisses(1);
             startTime = _ticker.Read();
-            return mappingFunction(k);
+            try
+            {
+                return mappingFunction(k);
+            }
+            catch
+            {
+                _statsCounter.RecordLoadFailure(_ticker.Read() - startTime);
+                throw;
+            }
         });
 
         if (loaded[0])
         {
-            _statsCounter.RecordMisses(1);
             long elapsed = _ticker.Read() - startTime;
             if (result != null)
             {
@@ -94,6 +108,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         int misses = 0;
         foreach (K key in keys)
         {
+            ThrowIfKeyNull(key);
             V? value = _data.GetOrDefault(key);
             if (value == null)
             {
@@ -112,6 +127,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public void Put(K key, V value)
     {
+        ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(value);
         V? previous = _data.Put(key, value);
         if (previous != null && !ReferenceEquals(previous, value))
@@ -131,6 +147,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public void Invalidate(K key)
     {
+        ThrowIfKeyNull(key);
         V? removed = _data.Remove(key);
         if (removed != null)
         {
@@ -179,6 +196,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public V? Get(K key)
     {
+        ThrowIfKeyNull(key);
         RequireLoader();
         return Get(key, k => _loader!.Load(k));
     }
@@ -190,6 +208,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         var result = new Dictionary<K, V>();
         foreach (K key in keys)
         {
+            ThrowIfKeyNull(key);
             if (result.ContainsKey(key))
             {
                 continue;
@@ -205,6 +224,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public void Refresh(K key)
     {
+        ThrowIfKeyNull(key);
         RequireLoader();
         long startTime = _ticker.Read();
         V? loaded;
@@ -235,6 +255,15 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     // ----- helpers -----
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ThrowIfKeyNull(K key, [CallerArgumentExpression(nameof(key))] string? param = null)
+    {
+        if (default(K) is null && key is null)
+        {
+            throw new ArgumentNullException(param);
+        }
+    }
+
     private void RequireLoader()
     {
         if (_loader == null)
@@ -256,17 +285,28 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     private void NotifyRemoval(K? key, V? value, RemovalCause cause)
     {
-        if (_removalListener == null)
+        IRemovalListener<K, V>? listener = _removalListener;
+        if (listener == null)
         {
             return;
         }
+        NotifyRemovalViaExecutor(listener, key, value, cause);
+    }
+
+    private void NotifyRemovalViaExecutor(IRemovalListener<K, V> listener, K? key, V? value, RemovalCause cause)
+    {
+        void Run()
+        {
+            try { listener.OnRemoval(key, value, cause); }
+            catch { /* a misbehaving listener must not disrupt the cache */ }
+        }
         try
         {
-            _removalListener.OnRemoval(key, value, cause);
+            _executor.Execute(Run);
         }
         catch
         {
-            // A misbehaving listener must not disrupt cache operations; swallow.
+            Run(); // executor rejected the task; run inline so the notification is not lost
         }
     }
 }

@@ -224,7 +224,7 @@ public sealed class EspressoBuilder<K, V>
         || _refreshAfterWrite != null || _expiry != null;
 
     private static long ToNanos(TimeSpan? duration)
-        => duration is { } d ? d.Ticks * 100L : 0L; // 1 tick = 100 ns
+        => duration is { } d ? Common.SaturatedToNanos(d) : 0L; // 1 tick = 100 ns
 
     /// <summary>Resolves the raw builder fields into a defaults-applied configuration.</summary>
     internal CacheConfiguration<K, V> ToConfiguration() => new()
@@ -234,6 +234,8 @@ public sealed class EspressoBuilder<K, V>
         RemovalListener = _removalListener,
         Executor = _executor ?? ThreadPoolExecutor.Instance,
         Ticker = _ticker ?? (UsesTiming ? Espresso.Ticker.System : Espresso.Ticker.Disabled),
+        // Load times are measured whenever stats are recorded, independent of the expiration features.
+        StatsTicker = _recordStats ? (_ticker ?? Espresso.Ticker.System) : Espresso.Ticker.Disabled,
         Weigher = _weigher ?? SingletonWeigher<K, V>.Instance,
         Expiry = _expiry,
         Scheduler = _scheduler == null || ReferenceEquals(_scheduler, Schedulers.Disabled) ? null : _scheduler,

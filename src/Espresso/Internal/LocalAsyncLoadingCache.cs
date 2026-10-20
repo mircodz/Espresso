@@ -30,14 +30,14 @@ internal sealed class LocalAsyncLoadingCache<K, V> : LocalAsyncCache<K, V>, IAsy
                 {
                     return null; // the current future is not ready — not eligible for refresh
                 }
-                long startTime = Cache.Ticker.Read();
+                long startTime = Cache.StatsTicker.Read();
                 Task<V> refreshed = Adapt(_loader.AsyncReload(key, current, CancellationToken.None));
                 // If the reload already completed unsuccessfully (e.g. a synchronous failure/null),
                 // don't install it — that would replace the good value with a failed future. Leave the
                 // existing value in place and record the failure.
                 if (refreshed.IsCompleted && !refreshed.IsCompletedSuccessfully)
                 {
-                    Cache.StatsCounter.RecordLoadFailure(Cache.Ticker.Read() - startTime);
+                    Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
                     return null;
                 }
                 // Otherwise the reload is genuinely in flight: a later failure reverts to the old value
