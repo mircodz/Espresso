@@ -172,7 +172,7 @@ public sealed class MpscGrowableArrayQueueTest
     // --- Concurrency ---
 
     [Fact]
-    public void OneProducer_OneConsumer()
+    public async Task OneProducer_OneConsumer()
     {
         var queue = new MpscGrowableArrayQueue<string>(4, 1 << 16);
         using var start = new Barrier(2);
@@ -192,7 +192,7 @@ public sealed class MpscGrowableArrayQueueTest
                 while (queue.Poll() == null) { }
             }
         });
-        Task.WaitAll(producer, consumer);
+        await Task.WhenAll(producer, consumer);
         Assert.True(queue.IsEmpty);
     }
 
@@ -215,7 +215,7 @@ public sealed class MpscGrowableArrayQueueTest
     }
 
     [Fact]
-    public void ManyProducers_OneConsumer_DrainsAll()
+    public async Task ManyProducers_OneConsumer_DrainsAll()
     {
         var queue = new MpscGrowableArrayQueue<string>(4, 1 << 16);
         using var start = new Barrier(NumProducers + 1);
@@ -235,7 +235,7 @@ public sealed class MpscGrowableArrayQueueTest
                 while (!queue.Offer("e" + i)) { }
             }
         });
-        consumer.Wait();
+        await consumer;
         Assert.True(queue.IsEmpty);
     }
 }

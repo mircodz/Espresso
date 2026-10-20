@@ -169,11 +169,11 @@ public sealed class ConcurrentHashMapTest
         Assert.Equal("v50", seen[50]);
     }
 
-    // Regression: enumerating across a concurrent resize must not yield an entry twice. The traverser
-    // captures the table at iteration start; when a bin has been migrated (ForwardingNode) it must
-    // descend into the new table rather than restart from bin 0 (which re-yielded visited entries).
+    // Enumerating across a concurrent resize must not yield an entry twice. The traverser captures the
+    // table at iteration start; when a bin has been migrated (ForwardingNode) it descends into the new
+    // table rather than restarting from bin 0.
     [Fact]
-    public void Enumerate_AcrossConcurrentResize_NoDuplicateKeys()
+    public async Task Enumerate_AcrossConcurrentResize_NoDuplicateKeys()
     {
         for (int attempt = 0; attempt < 50; attempt++)
         {
@@ -201,7 +201,7 @@ public sealed class ConcurrentHashMapTest
                 counts.TryGetValue(kv.Key, out int c);
                 counts[kv.Key] = c + 1;
             }
-            grower.Wait();
+            await grower;
 
             foreach (var pair in counts)
             {
@@ -601,7 +601,7 @@ public sealed class ConcurrentHashMapTest
     // Clear() interleaved with concurrent writers and resizes must leave a consistent, non-negative
     // count that agrees with enumeration.
     [Fact]
-    public void Clear_ConcurrentWithPutsAndResize()
+    public async Task Clear_ConcurrentWithPutsAndResize()
     {
         var map = new ConcurrentHashMap<int, string>(2);
         const int writers = 8;
@@ -627,7 +627,7 @@ public sealed class ConcurrentHashMapTest
             }
         });
 
-        Task.WaitAll(writerTasks.Append(clearer).ToArray());
+        await Task.WhenAll(writerTasks.Append(clearer));
 
         // Whatever remains, the counter must be non-negative and match a fresh enumeration.
         long count = map.Count;
