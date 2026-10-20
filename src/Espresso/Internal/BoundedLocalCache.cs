@@ -75,7 +75,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     {
         // Unweighted caches use the singleton weigher (always 1); skip the interface dispatch entirely so
         // the common case does not pay a vtable call on every insert/update.
-        if (!_isWeighted)
+        if (!_weighsEntries)
         {
             return 1;
         }
@@ -98,7 +98,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     // Feature predicates: each gates the code for an enabled feature so a configuration only pays for
     // what it uses.
     private readonly bool _evicts;
+    // Whether the user configured a weigher, so entries may have different weights (sizes the sketch).
     private readonly bool _isWeighted;
+    // Whether entries are weighed: a weighted cache, or a size-bounded async cache, whose future-aware
+    // weigher gives an in-flight load zero weight so it is not evicted while loading.
+    private readonly bool _weighsEntries;
     private readonly bool _isAsync;
     private readonly bool _expiresAfterAccess;
     private readonly bool _expiresAfterWrite;
@@ -167,6 +171,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _evicts = config.Evicts;
         _isWeighted = config.IsWeighted;
         _isAsync = config.IsAsync;
+        _weighsEntries = config.Evicts && (config.IsWeighted || config.IsAsync);
         _expiresAfterAccess = config.ExpiresAfterAccess;
         _expiresAfterWrite = config.ExpiresAfterWrite;
         _refreshAfterWrite = config.RefreshesAfterWrite;
@@ -181,7 +186,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _refreshAfterWriteNanos = config.RefreshAfterWriteNanos;
 
         // Select the smallest node variant that carries the fields this configuration needs.
-        NodeFeature features = _isWeighted ? NodeFeature.MaximumWeight
+        NodeFeature features = _weighsEntries ? NodeFeature.MaximumWeight
             : _evicts ? NodeFeature.MaximumSize : NodeFeature.None;
         if (_expiresAfterAccess) features |= NodeFeature.ExpireAccess;
         if (_expiresAfterWrite) features |= NodeFeature.ExpireWrite;
