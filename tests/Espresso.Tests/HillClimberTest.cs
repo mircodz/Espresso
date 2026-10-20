@@ -273,25 +273,93 @@ public sealed class HillClimberTest : CacheTestBase
             .MaximumSize(Full)
             .Executor(DirectExecutor.Instance)
             .BuildAsync();
-        var local = (BoundedLocalCache<int, Task<string>>)typeof(LocalAsyncCache<int, string>)
-            .GetField("Cache", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(cache)!;
-        var sketch = (FrequencySketch)typeof(BoundedLocalCache<int, Task<string>>)
-            .GetField("_sketch", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(local)!;
-        var data = (ConcurrentHashMap<int, Node<int, Task<string>>>)typeof(BoundedLocalCache<int, Task<string>>)
-            .GetField("_data", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(local)!;
-        sketch.EnsureCapacity(Full);
+        var local = AsyncLocal.Of(cache);
+        local.Sketch.EnsureCapacity(Full);
         var future = new TaskCompletionSource<string>().Task;
         cache.Put(1, future);
         cache.CleanUp();
-        long hits = local.Climber!.sample.hits;
-        AssertThat(data.GetOrDefault(1)!.PolicyWeight).IsEqualTo(0);
+        long hits = local.Cache.Climber!.sample.hits;
+        AssertThat(local.Data.GetOrDefault(1)!.PolicyWeight).IsEqualTo(0);
 
         // An in-flight future's policy weight is zero: its coalesced reads are free window credit
         // until the load completes, so they must not steer the climber
         var read = cache.GetIfPresent(1);
         cache.CleanUp();
         AssertThat(ReferenceEquals(read, future)).IsTrue();
-        AssertThat(local.Climber.sample.hits).IsEqualTo(hits);
+        AssertThat(local.Cache.Climber.sample.hits).IsEqualTo(hits);
+    }
+
+    [Fact]
+    public void AsyncCompletion_DoesNotRecordAccess()
+    {
+        // A load's completion finalizes the entry's weight and expiration; it is bookkeeping, not a
+        // usage, so the load counts once (the insertion's miss and sketch increment)
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumSize(Full)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync();
+        var local = AsyncLocal.Of(cache);
+        local.Sketch.EnsureCapacity(Full);
+
+        var future = new TaskCompletionSource<string>();
+        cache.Put(1, future.Task);
+        future.SetResult("a");
+        cache.CleanUp();
+
+        AssertThat(local.Data.GetOrDefault(1)!.PolicyWeight).IsEqualTo(1);
+        AssertThat(local.Cache.Climber!.sample.misses).IsEqualTo(1);
+        AssertThat(local.Cache.Climber.sample.hits).IsEqualTo(0);
+        AssertThat(local.Cache.Climber.sample.windowHits).IsEqualTo(0);
+        AssertThat(local.Sketch.Frequency(1)).IsEqualTo(1);
+    }
+
+    [Fact]
+    public async Task AsyncBulkCompletion_DoesNotRecordAccess()
+    {
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumSize(Full)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync();
+        var local = AsyncLocal.Of(cache);
+        local.Sketch.EnsureCapacity(Full);
+        int[] keys = { 1, 2, 3 };
+
+        var result = await cache.GetAll(keys, (missing, _) =>
+        {
+            var loaded = new Dictionary<int, string>();
+            foreach (int key in missing)
+            {
+                loaded[key] = "v" + key;
+            }
+            return Task.FromResult<IReadOnlyDictionary<int, string>>(loaded);
+        });
+        cache.CleanUp();
+
+        AssertThat(result.Count).IsEqualTo(keys.Length);
+        AssertThat(local.Cache.Climber!.sample.misses).IsEqualTo(keys.Length);
+        AssertThat(local.Cache.Climber.sample.hits).IsEqualTo(0);
+        AssertThat(local.Cache.Climber.sample.windowHits).IsEqualTo(0);
+        foreach (int key in keys)
+        {
+            AssertThat(local.Sketch.Frequency(key)).IsEqualTo(1);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Replace_RecordsAccessUnlessQuiet(bool quietly)
+    {
+        var cache = Probe.Of(FullCache(weighted: false));
+        cache.Sketch.EnsureCapacity(Full);
+        int frequency = cache.Sketch.Frequency(0);
+        long hits = cache.Climber.sample.hits;
+
+        AssertThat(cache.Blc.Replace(0, "v0", "a", quietly)).IsTrue();
+        cache.Cache.CleanUp();
+
+        AssertThat(cache.Climber.sample.hits).IsEqualTo(quietly ? hits : hits + 1);
+        AssertThat(cache.Sketch.Frequency(0)).IsEqualTo(quietly ? frequency : frequency + 1);
     }
 
     [Fact]
@@ -1153,6 +1221,28 @@ public sealed class HillClimberTest : CacheTestBase
         private long _nanos;
         public long Read() => _nanos;
         public void Advance(TimeSpan by) => _nanos += by.Ticks * 100L;
+    }
+
+    /// <summary>White-box access to the <c>BoundedLocalCache</c> behind an async cache.</summary>
+    private sealed class AsyncLocal
+    {
+        private const BindingFlags Flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        private static readonly Type Type = typeof(BoundedLocalCache<int, Task<string>>);
+
+        public readonly BoundedLocalCache<int, Task<string>> Cache;
+
+        private AsyncLocal(IAsyncCache<int, string> cache)
+        {
+            Cache = (BoundedLocalCache<int, Task<string>>)typeof(LocalAsyncCache<int, string>)
+                .GetField("Cache", Flags)!.GetValue(cache)!;
+        }
+
+        public static AsyncLocal Of(IAsyncCache<int, string> cache) => new(cache);
+
+        public FrequencySketch Sketch => (FrequencySketch)Type.GetField("_sketch", Flags)!.GetValue(Cache)!;
+
+        public ConcurrentHashMap<int, Node<int, Task<string>>> Data
+            => (ConcurrentHashMap<int, Node<int, Task<string>>>)Type.GetField("_data", Flags)!.GetValue(Cache)!;
     }
 
     /// <summary>

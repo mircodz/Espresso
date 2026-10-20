@@ -1309,7 +1309,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>
     /// For an async cache, pushes a freshly-inserted in-flight future's expiry timestamps ~220 years
     /// out (the async sentinel) so it cannot expire while loading. The real timers are restored by
-    /// <see cref="Replace"/> when the future completes. This keeps the design uniform for the future
+    /// <see cref="Replace(K, V, V, bool)"/> when the future completes. This keeps the design uniform for the future
     /// variable-expiration (timer-wheel) path, where the sentinel is the sole in-flight signal.
     /// </summary>
     private void StampAsyncExpiryIfComputing(Node<K, V> node, long now)
@@ -2542,9 +2542,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// Replaces the value only if the key currently maps to a live (unexpired) <paramref name="oldValue"/>.
     /// When the new value is the same instance (the async completion case: replacing a future with
     /// itself), this still re-weighs the entry and resets its expiry timestamps, so the real timers start
-    /// once the in-flight future has resolved; only a different instance is reported as replaced.
+    /// once the in-flight future has resolved; only a different instance is reported as replaced. A
+    /// quiet replacement reorders but does not record a usage with the admission sketch or a hit with
+    /// the window climber: a completion is bookkeeping, and counting it would double each load's
+    /// admission frequency and record a synthetic hit for every miss.
     /// </summary>
-    public bool Replace(K key, V oldValue, V newValue)
+    public bool Replace(K key, V oldValue, V newValue) => Replace(key, oldValue, newValue, quietly: false);
+
+    public bool Replace(K key, V oldValue, V newValue, bool quietly)
     {
         ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(oldValue);
@@ -2607,9 +2612,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         int weightDifference = weight - oldWeight;
         if (exceedsTolerance || weightDifference != 0)
         {
-            AfterWrite(new UpdateTask(this, node!, weightDifference));
+            AfterWrite(new UpdateTask(this, node!, weightDifference, quietly ? Access.Quiet : Access.Hit));
         }
-        else
+        else if (!quietly)
         {
             AfterRead(node!, now);
         }
