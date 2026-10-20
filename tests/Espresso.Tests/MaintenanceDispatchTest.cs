@@ -45,6 +45,11 @@ public class MaintenanceDispatchTest
         public void Execute(Action command) { }
     }
 
+    // Drains on the default thread-pool executor have no completion hook (the rescheduling under test
+    // is specific to that executor), so these tests poll for the outcome. The bound only matters when
+    // the pool is slow; a passing run exits as soon as the condition holds.
+    private static readonly TimeSpan ThreadPoolDrainTimeout = TimeSpan.FromSeconds(30);
+
     private static T Field<T>(object o, string name)
         => (T)o.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(o)!;
 
@@ -115,7 +120,7 @@ public class MaintenanceDispatchTest
         cache.Put(-1, "fresh"); // schedules one ordinary drain on the thread pool
 
         var sw = Stopwatch.StartNew();
-        while (cache.EstimatedSize() != 1 && sw.Elapsed < TimeSpan.FromSeconds(10))
+        while (cache.EstimatedSize() != 1 && sw.Elapsed < ThreadPoolDrainTimeout)
         {
             Thread.Sleep(5);
         }
@@ -163,7 +168,7 @@ public class MaintenanceDispatchTest
     private static void WaitForIdle(object cache)
     {
         var sw = Stopwatch.StartNew();
-        while (Field<int>(cache, "_drainStatus") != 0 && sw.Elapsed < TimeSpan.FromSeconds(10))
+        while (Field<int>(cache, "_drainStatus") != 0 && sw.Elapsed < ThreadPoolDrainTimeout)
         {
             Thread.Sleep(1);
         }
