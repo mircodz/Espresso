@@ -1,23 +1,35 @@
-name: Publish NuGet
+name: Release
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # to push the release tag and create the GitHub release
   id-token: write
   packages: write
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
 jobs:
-  tag-and-publish:
+  check:
+    name: check branch and version
     if: github.actor == 'mircodz'
-    environment: publish
     runs-on: ubuntu-latest
-    env:
-      PROJECT: src/Espresso/Espresso.csproj
-      OUT_DIR: artifacts/nupkg
-      OWNER: ${{ github.repository_owner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Ensure main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Releases are published from main; this run is on ${GITHUB_REF}." >&2
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -25,21 +37,37 @@ jobs:
 
       - name: Read version
         id: version
-        run: echo "VERSION=$(tr -d '[:space:]' < version)" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure tag does not already exist
         run: |
-          if git rev-parse "${{ steps.version.outputs.VERSION }}" >/dev/null 2>&1; then
-            echo "::error file=version::Tag ${{ steps.version.outputs.VERSION }} already exists. Bump the version file." >&2
+          version="$(tr -d '[:space:]' < version)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version '$version'. Expected MAJOR.MINOR.PATCH." >&2
             exit 1
           fi
+          if git show-ref --verify --quiet "refs/tags/$version"; then
+            echo "Tag $version already exists. Bump the version file." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.version.outputs.VERSION }}" -m "Release ${{ steps.version.outputs.VERSION }}"
-          git push origin "${{ steps.version.outputs.VERSION }}"
+  build:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      pull-requests: write   # requested by CI's coverage comment step (skipped outside pull requests)
+
+  publish:
+    name: publish and tag
+    needs: [check, build]
+    environment: publish
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      OUT_DIR: artifacts/nupkg
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -48,11 +76,45 @@ jobs:
             8.0.x
             10.0.x
 
-      - name: Restore
-        run: dotnet restore
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: espresso-nupkg
+          path: ${{ env.OUT_DIR }}
 
-      - name: Pack
-        run: dotnet pack $PROJECT -c Release -o $OUT_DIR /p:Version=${{ steps.version.outputs.VERSION }}
+      - name: Verify package
+        run: |
+          test -f "$OUT_DIR/Espresso.Caching.$VERSION.nupkg"
+          smoke=artifacts/smoke
+          mkdir -p "$smoke"
+          cat > "$smoke/Smoke.csproj" <<CSPROJ
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Espresso.Caching" Version="$VERSION" />
+            </ItemGroup>
+          </Project>
+          CSPROJ
+          cat > "$smoke/Program.cs" <<'PROGRAM'
+          using Espresso;
+
+          var cache = Cache.NewBuilder<string, string>().MaximumSize(100).Build();
+          cache.Put("key", "value");
+          if (cache.GetIfPresent("key") != "value")
+          {
+              Console.Error.WriteLine("Espresso.Caching smoke test failed");
+              return 1;
+          }
+          Console.WriteLine("Espresso.Caching smoke test passed");
+          return 0;
+          PROGRAM
+          dotnet restore "$smoke" --source "$PWD/$OUT_DIR" --source https://api.nuget.org/v3/index.json
+          dotnet run --project "$smoke" -c Release --no-restore
 
       - name: NuGet login
         id: nuget_login
@@ -76,3 +138,19 @@ jobs:
             --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
             --api-key "$GITHUB_TOKEN" \
             --skip-duplicate
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$VERSION" "$OUT_DIR"/*.nupkg \
+            --verify-tag \
+            --title "Espresso $VERSION" \
+            --generate-notes

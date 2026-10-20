@@ -55,20 +55,20 @@ public sealed class BuilderOverloadTest
     }
 
     [Fact]
-    public void BuildAsync_WithCancellationTokenLambda_ResolvesOverload()
+    public async Task BuildAsync_WithCancellationTokenLambda_ResolvesOverload()
     {
         var asyncCache = Cache.NewBuilder<int, string>()
             .BuildAsync((k, ct) => Task.FromResult<string?>("v"));
 
-        Assert.Equal("v", asyncCache.Get(1).GetAwaiter().GetResult());
+        Assert.Equal("v", await asyncCache.Get(1));
     }
 
     [Fact]
-    public void BuildAsync_WithKeyOnlyLambda_ResolvesOverload()
+    public async Task BuildAsync_WithKeyOnlyLambda_ResolvesOverload()
     {
         var asyncCache = Cache.NewBuilder<int, string>()
             .BuildAsync(k => Task.FromResult<string?>("w"));
 
-        Assert.Equal("w", asyncCache.Get(1).GetAwaiter().GetResult());
+        Assert.Equal("w", await asyncCache.Get(1));
     }
 }

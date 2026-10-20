@@ -53,7 +53,7 @@ public sealed class AsyncValueTest
     [Fact]
     public void GetIfReady_CompletedWithNull_ReturnsNull()
     {
-        Assert.Null(AsyncValue.GetIfReady(Task.FromResult<string?>(null)));
+        Assert.Null(AsyncValue.GetIfReady(Task.FromResult<string>(null!)));
     }
 
     [Fact]

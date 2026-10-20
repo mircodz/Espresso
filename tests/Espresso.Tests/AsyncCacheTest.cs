@@ -41,7 +41,7 @@ public sealed class AsyncCacheTest
     }
 
     [Fact]
-    public void Get_ConcurrentSameKey_ReturnsSameFutureAndCoalescesLoad()
+    public async Task Get_ConcurrentSameKey_ReturnsSameFutureAndCoalescesLoad()
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
@@ -55,11 +55,11 @@ public sealed class AsyncCacheTest
         Assert.Equal(1, loaderCalls);
 
         gate.SetResult("done");
-        Assert.Equal("done", f1.GetAwaiter().GetResult());
+        Assert.Equal("done", await f1);
     }
 
     [Fact]
-    public void Get_WhileLoading_FutureIsVisibleAndCounted()
+    public async Task Get_WhileLoading_FutureIsVisibleAndCounted()
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
@@ -71,7 +71,7 @@ public sealed class AsyncCacheTest
         Assert.Equal(1, cache.EstimatedSize());
 
         gate.SetResult("v");
-        Assert.Equal("v", f.GetAwaiter().GetResult());
+        Assert.Equal("v", await f);
     }
 
     [Fact]
@@ -126,7 +126,7 @@ public sealed class AsyncCacheTest
             .BuildAsync();
 
         var gate = new TaskCompletionSource<string>();
-        cache.Get(1, (_, _) => gate.Task!);
+        _ = cache.Get(1, (_, _) => gate.Task!);
 
         // Loads for longer than the expiry duration. The in-flight entry must NOT expire.
         ticker.Advance(TimeSpan.FromMinutes(5));

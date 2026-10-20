@@ -4,51 +4,61 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
 
 jobs:
   version-check:
-    if: github.event_name == 'pull_request'
+    name: version check
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fail if version is already tagged
+      - name: Fail if the version is already released
         run: |
           VERSION="$(tr -d '[:space:]' < version)"
           git fetch --tags --force
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
-            echo "::error file=version::Version $VERSION is already tagged. Bump the version file before merging." >&2
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            echo "::error file=version::Version $VERSION is already tagged. Bump the version file (make bump-patch/minor/major) before merging." >&2
             exit 1
           fi
-          echo "Version $VERSION has no existing tag."
+          LATEST="$(git tag --list | sort -V | tail -n1)"
+          if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+            echo "::error file=version::Version $VERSION must be greater than the latest release, $LATEST." >&2
+            exit 1
+          fi
+          echo "Version $VERSION has no tag yet (latest release: ${LATEST:-none})."
 
   build-and-test:
+    name: build and test
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
-      pull-requests: write
-
+      pull-requests: write   # coverage summary comment on pull requests
     steps:
     - uses: actions/checkout@v4
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+    # The library targets net8.0; the newer SDK builds it, the 8.0 runtime runs the tests.
+    - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: |
           8.0.x
           10.0.x
 
-    - name: Restore dependencies
-      run: dotnet restore
+    - name: Restore
+      run: dotnet restore Espresso.sln
 
-    - name: Build
-      run: dotnet build --no-restore --configuration Release
+    - name: Build (Release)
+      run: dotnet build Espresso.sln -c Release --no-restore --warnaserror
 
     - name: Test with coverage
       run: |
@@ -127,3 +137,24 @@ jobs:
         name: coverage-report
         path: CoverageReport/
         retention-days: 30
+
+  pack:
+    name: pack nuget
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Pack
+        run: dotnet pack src/Espresso/Espresso.csproj -c Release -o artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: espresso-nupkg
+          path: artifacts/*.nupkg
