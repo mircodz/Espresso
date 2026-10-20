@@ -13,7 +13,7 @@ internal sealed class LocalAsyncLoadingCache<K, V> : LocalAsyncCache<K, V>, IAsy
 {
     private readonly IAsyncCacheLoader<K, V> _loader;
 
-    internal LocalAsyncLoadingCache(ILocalCache<K, Task<V>> cache, IAsyncCacheLoader<K, V> loader)
+    internal LocalAsyncLoadingCache(BoundedLocalCache<K, Task<V>> cache, IAsyncCacheLoader<K, V> loader)
         : base(cache)
     {
         _loader = loader;
@@ -21,31 +21,28 @@ internal sealed class LocalAsyncLoadingCache<K, V> : LocalAsyncCache<K, V>, IAsy
         // Install the async-reload delegate so the engine's refresh-on-read path can reload async
         // caches. Given the current (ready) stored future, it starts an AsyncReload, adapts it to a
         // new in-flight future, attaches completion handling, and returns it to become the new value.
-        if (cache is BoundedLocalCache<K, Task<V>> bounded)
+        cache.SetAsyncReload((key, oldFuture) =>
         {
-            bounded.SetAsyncReload((key, oldFuture) =>
+            V? current = AsyncValue.GetIfReady(oldFuture);
+            if (current == null)
             {
-                V? current = AsyncValue.GetIfReady(oldFuture);
-                if (current == null)
-                {
-                    return null; // the current future is not ready — not eligible for refresh
-                }
-                long startTime = Cache.StatsTicker.Read();
-                Task<V> refreshed = Adapt(_loader.AsyncReload(key, current, CancellationToken.None));
-                // If the reload already completed unsuccessfully (e.g. a synchronous failure/null),
-                // don't install it — that would replace the good value with a failed future. Leave the
-                // existing value in place and record the failure.
-                if (refreshed.IsCompleted && !refreshed.IsCompletedSuccessfully)
-                {
-                    Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
-                    return null;
-                }
-                // Otherwise the reload is genuinely in flight: a later failure reverts to the old value
-                // (best-effort refresh) rather than removing the entry.
-                HandleRefreshCompletion(key, refreshed, oldFuture, startTime);
-                return refreshed;
-            });
-        }
+                return null; // the current future is not ready — not eligible for refresh
+            }
+            long startTime = Cache.StatsTicker.Read();
+            Task<V> refreshed = Adapt(_loader.AsyncReload(key, current, CancellationToken.None));
+            // If the reload already completed unsuccessfully (e.g. a synchronous failure/null),
+            // don't install it — that would replace the good value with a failed future. Leave the
+            // existing value in place and record the failure.
+            if (refreshed.IsCompleted && !refreshed.IsCompletedSuccessfully)
+            {
+                Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
+                return null;
+            }
+            // Otherwise the reload is genuinely in flight: a later failure reverts to the old value
+            // (best-effort refresh) rather than removing the entry.
+            HandleRefreshCompletion(key, refreshed, oldFuture, startTime);
+            return refreshed;
+        });
     }
 
     public Task<V> Get(K key)

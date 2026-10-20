@@ -16,9 +16,9 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     where K : notnull
     where V : class
 {
-    private protected readonly ILocalCache<K, Task<V>> Cache;
+    private protected readonly BoundedLocalCache<K, Task<V>> Cache;
 
-    internal LocalAsyncCache(ILocalCache<K, Task<V>> cache) => Cache = cache;
+    internal LocalAsyncCache(BoundedLocalCache<K, Task<V>> cache) => Cache = cache;
 
     public Task<V>? GetIfPresent(K key) => Cache.GetIfPresent(key, recordStats: true);
 
@@ -49,19 +49,21 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
 
         long startTime = Cache.StatsTicker.Read();
         Task<V>? created = null;
+        bool deferred = false;
         Task<V> future = Cache.ComputeIfAbsent(key, k =>
         {
             // The mapping function's task is stored immediately, still in-flight. Its result type is
             // Task<V?> (the loader may produce null); we adapt it to the stored Task<V> whose null/failed
             // completion triggers removal in HandleCompletion.
             Task<V> stored = Adapt(mappingFunction(k, CancellationToken.None));
+            deferred = !AsyncValue.IsReady(stored);
             created = stored;
             return stored;
         }, recordStats, recordLoad: false)!;
 
         if (created != null && ReferenceEquals(created, future))
         {
-            HandleCompletion(key, future, startTime);
+            HandleCompletion(key, future, startTime, deferred, computed: true);
         }
         return future;
     }
@@ -71,20 +73,36 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         ArgumentNullException.ThrowIfNull(valueFuture);
         long startTime = Cache.StatsTicker.Read();
+        // Read before the store: a future observed in flight here may complete before the insertion
+        // evaluates it, which the completion detects from the entry itself.
+        bool deferred = !AsyncValue.IsReady(valueFuture);
         Task<V>? prior = Cache.Put(key, valueFuture);
         if (!ReferenceEquals(prior, valueFuture))
         {
-            HandleCompletion(key, valueFuture, startTime);
+            HandleCompletion(key, valueFuture, startTime, deferred, computed: false);
         }
     }
 
     /// <summary>
     /// Attaches a continuation that finalizes an entry once its future resolves: a failed or
-    /// null-completing future removes the entry (only if still mapped to it); a successful future is
-    /// replaced with itself to refresh the weight and expiry timers now that the value is ready.
+    /// null-completing future removes the entry (only if still mapped to it). A successful future whose
+    /// insertion deferred its weight and expiration (it was not ready) is finalized now that the value
+    /// is ready; an already-ready insertion was accounted for by the store. A load is recorded only if
+    /// the caller computed the value or the accounting was deferred to the completion, so an explicit
+    /// write of a ready future records nothing.
     /// </summary>
-    private protected void HandleCompletion(K key, Task<V> future, long startTime)
+    private protected void HandleCompletion(K key, Task<V> future, long startTime, bool deferred, bool computed)
     {
+        bool recordLoad = computed || deferred;
+        if (!deferred && future.Result != null)
+        {
+            // Ready when inserted (deferred is read from the same future), so nothing is left to finalize.
+            if (recordLoad)
+            {
+                Cache.StatsCounter.RecordLoadSuccess(Cache.StatsTicker.Read() - startTime);
+            }
+            return;
+        }
         future.ContinueWith(t =>
         {
             long loadTime = Cache.StatsTicker.Read() - startTime;
@@ -92,20 +110,28 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             if (value == null)
             {
                 Cache.Remove(key, future);
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
+                if (recordLoad)
+                {
+                    Cache.StatsCounter.RecordLoadFailure(loadTime);
+                }
             }
             else
             {
                 try
                 {
-                    // Replace the future with itself → re-runs the weigher and resets the expiry
-                    // timestamps to now, so the real timers start from completion.
-                    Cache.Replace(key, future, future, quietly: true);
-                    Cache.StatsCounter.RecordLoadSuccess(loadTime);
+                    // Re-weigh the entry and start its expiry timers now that the value is ready.
+                    Cache.FinalizeAsyncCompletion(key, future);
+                    if (recordLoad)
+                    {
+                        Cache.StatsCounter.RecordLoadSuccess(loadTime);
+                    }
                 }
                 catch
                 {
-                    Cache.StatsCounter.RecordLoadFailure(loadTime);
+                    if (recordLoad)
+                    {
+                        Cache.StatsCounter.RecordLoadFailure(loadTime);
+                    }
                     Cache.Remove(key, future);
                 }
             }
@@ -314,7 +340,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             if (result.TryGetValue(key, out V? value) && value != null)
             {
                 proxy.TrySetResult(value);
-                try { Cache.Replace(key, proxy.Task, proxy.Task, quietly: true); } // re-weigh + reset timers
+                try { Cache.FinalizeAsyncCompletion(key, proxy.Task); } // re-weigh + start timers
                 catch { Cache.Remove(key, proxy.Task); }
             }
             else

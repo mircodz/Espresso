@@ -51,14 +51,6 @@ internal interface ILocalCache<K, V> : IDisposable
     /// </summary>
     bool Replace(K key, V oldValue, V newValue);
 
-    /// <summary>
-    /// <see cref="Replace(K, V, V)"/>, optionally <paramref name="quietly"/>: a quiet replacement is
-    /// not recorded as an access with the eviction policy (neither the admission sketch nor the
-    /// window climber observes it), as an async load's completion finalizes the entry's weight and
-    /// expiration rather than conveying a usage.
-    /// </summary>
-    bool Replace(K key, V oldValue, V newValue, bool quietly);
-
     void Clear();
 
     // ----- size / maintenance / stats -----

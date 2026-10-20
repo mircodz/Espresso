@@ -340,7 +340,7 @@ public sealed class EspressoBuilder<K, V>
     }
 
     /// <summary>Constructs the future-typed backing store for an async cache.</summary>
-    private ILocalCache<K, Task<V>> BuildAsyncStore()
+    private BoundedLocalCache<K, Task<V>> BuildAsyncStore()
     {
         var inner = new EspressoBuilder<K, Task<V>>
         {

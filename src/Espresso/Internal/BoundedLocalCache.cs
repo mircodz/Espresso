@@ -2555,6 +2555,25 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     public bool Replace(K key, V oldValue, V newValue) => Replace(key, oldValue, newValue, quietly: false);
 
     public bool Replace(K key, V oldValue, V newValue, bool quietly)
+        => ReplaceInternal(key, oldValue, newValue, quietly, finalizeCompletion: false);
+
+    /// <summary>
+    /// Finalizes an inserted async future whose insertion deferred its accounting to the completion,
+    /// as a quiet same-instance replace once the future completes: re-weighs the entry and restarts its
+    /// timers now that the value is ready, without recording a usage. A variable expiration is
+    /// evaluated only while the entry still carries the async sentinel; if the value became available
+    /// before the insertion evaluated it, the insertion already charged the creation and its expiration
+    /// is kept. An in-flight refresh is preserved, because a same-instance finalization is not a
+    /// modification.
+    /// </summary>
+    internal bool FinalizeAsyncCompletion(K key, V future)
+        => ReplaceInternal(key, future, future, quietly: true, finalizeCompletion: true);
+
+    /// <summary>Returns whether the entry's variable expiration is still deferred to its value's completion.</summary>
+    private bool IsExpirationDeferred(long variableTime, long now)
+        => _expiresVariable && (variableTime - now) > MaximumExpiry;
+
+    private bool ReplaceInternal(K key, V oldValue, V newValue, bool quietly, bool finalizeCompletion)
     {
         ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(oldValue);
@@ -2582,9 +2601,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 oldWeight = n.Weight;
                 long oldVarTime = n.VariableTime;
-                long varTime = ExpireAfterUpdate(n, key, newValue, now);
-                // Invalidate the refresh (hashing the key can throw) before mutating the node.
-                DiscardRefresh(n.KeyReference);
+                long varTime = (finalizeCompletion && !IsExpirationDeferred(oldVarTime, now))
+                    ? oldVarTime
+                    : ExpireAfterUpdate(n, key, newValue, now);
+                if (!finalizeCompletion)
+                {
+                    // Invalidate the refresh (hashing the key can throw) before mutating the node.
+                    DiscardRefresh(n.KeyReference);
+                }
                 n.Value = newValue;
                 n.Weight = weight;
 
