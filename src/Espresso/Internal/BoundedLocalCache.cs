@@ -2170,10 +2170,13 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     varTime = ExpireAfterUpdate(prior, key, value, now);
                 }
 
+                // An in-flight future (the value being stored, or the retained one) records the async
+                // sentinel rather than the current time, so it cannot expire while it is still loading.
+                long expirationTime = IsComputingAsync(mayUpdate ? value : oldValue) ? (now + AsyncExpiry) : now;
                 long oldVarTime = prior.VariableTime;
                 if (mayUpdate)
                 {
-                    bool writeExceeds = ExceedsWriteTimeTolerance(prior, now);
+                    bool writeExceeds = ExceedsWriteTimeTolerance(prior, expirationTime);
                     bool varExceeds = _expiresVariable && Math.Abs(varTime - oldVarTime) > ExpireTolerance;
                     exceedsTolerance = writeExceeds || varExceeds;
                     // Invalidate the refresh (hashing the key can throw) before mutating the node.
@@ -2184,12 +2187,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     prior.Weight = newWeight;
                     if (expired || exceedsTolerance)
                     {
-                        if (_expiresAfterWrite || _refreshAfterWrite) prior.WriteTime = now;
+                        if (_expiresAfterWrite || _refreshAfterWrite) prior.WriteTime = expirationTime;
                     }
                 }
 
                 SetVariableTime(prior, varTime);
-                if (_expiresAfterAccess) prior.AccessTime = now;
+                if (_expiresAfterAccess) prior.AccessTime = expirationTime;
             }
 
             if (expired)
