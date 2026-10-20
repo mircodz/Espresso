@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Espresso.Stats;
@@ -47,25 +48,59 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             return present;
         }
 
-        long startTime = Cache.StatsTicker.Read();
-        Task<V>? created = null;
-        bool deferred = false;
-        Task<V> future = Cache.ComputeIfAbsent(key, k =>
-        {
-            // The mapping function's task is stored immediately, still in-flight. Its result type is
-            // Task<V?> (the loader may produce null); we adapt it to the stored Task<V> whose null/failed
-            // completion triggers removal in HandleCompletion.
-            Task<V> stored = Adapt(mappingFunction(k, CancellationToken.None));
-            deferred = !AsyncValue.IsReady(stored);
-            created = stored;
-            return stored;
-        }, recordStats, recordLoad: false)!;
+        return Load(key, mappingFunction, recordStats);
+    }
 
-        if (created != null && ReferenceEquals(created, future))
+    /// <summary>
+    /// The miss path of <see cref="GetInternal"/>. Under the map's bin lock only an in-flight
+    /// placeholder is installed; the mapping function runs after the lock is released and its outcome
+    /// completes the placeholder. So a mapping function's synchronous prefix may itself read or load
+    /// other keys (including keys in the same bin) and never blocks writers, while concurrent callers
+    /// for the key still coalesce onto the one placeholder and the function runs at most once.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Task<V> Load(K key, Func<K, CancellationToken, Task<V?>> mappingFunction, bool recordStats)
+    {
+        long startTime = Cache.StatsTicker.Read();
+        var placeholder = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<V> pending = placeholder.Task;
+        Task<V> future = Cache.ComputeIfAbsent(key, _ => pending, recordStats, recordLoad: false)!;
+        if (!ReferenceEquals(future, pending))
         {
-            HandleCompletion(key, future, startTime, deferred, computed: true);
+            return future; // another caller's load (or a concurrent write) won
         }
-        return future;
+
+        Task<V?> source;
+        try
+        {
+            source = mappingFunction(key, CancellationToken.None)
+                ?? throw new ArgumentNullException(nameof(mappingFunction), "The mapping function returned a null task");
+        }
+        catch (Exception e)
+        {
+            // The load failed before it started: drop the placeholder (unless it was already replaced),
+            // fail it for any caller that coalesced onto it, and surface the error to this caller.
+            try
+            {
+                Cache.Remove(key, pending);
+            }
+            finally
+            {
+                placeholder.TrySetException(e);
+                _ = pending.Exception; // observed here; coalesced callers observe their own copy
+                if (recordStats)
+                {
+                    Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
+                }
+            }
+            throw;
+        }
+
+        // Link first, so that a source that has already completed completes the placeholder now and its
+        // finalization below runs before this call returns.
+        Link(source, placeholder);
+        HandleCompletion(key, pending, startTime, deferred: true, computed: true);
+        return pending;
     }
 
     /// <summary>Stores a future, replacing any prior mapping, and attaches the completion handler.</summary>
@@ -180,8 +215,19 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         ArgumentNullException.ThrowIfNull(source);
         var tcs = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-        source.ContinueWith(t =>
+        Link(source, tcs);
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// Completes <paramref name="tcs"/> with the outcome of <paramref name="source"/>: a fault or a
+    /// cancellation is propagated, and a null result faults it.
+    /// </summary>
+    private static void Link(Task<V?> source, TaskCompletionSource<V> tcs)
+    {
+        source.ContinueWith(static (t, state) =>
         {
+            var tcs = (TaskCompletionSource<V>)state!;
             if (t.IsFaulted)
             {
                 tcs.TrySetException(t.Exception!.InnerExceptions);
@@ -199,8 +245,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             {
                 tcs.TrySetResult(t.Result);
             }
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return tcs.Task;
+        }, tcs, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     /// <summary>Runs a synchronous mapping on the cache executor, producing a Task.</summary>
