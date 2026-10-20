@@ -145,7 +145,7 @@ public class WriteOperationParityTest
 
         using var loaderEntered = new ManualResetEventSlim();
         using var releaseLoader = new ManualResetEventSlim();
-        Task<string?> loader = Task.Run(() => cache.Get(1, _ =>
+        Task<string?> loader = DedicatedThread.Run(() => cache.Get(1, _ =>
         {
             loaderEntered.Set();
             releaseLoader.Wait(TimeSpan.FromSeconds(10));
@@ -153,7 +153,7 @@ public class WriteOperationParityTest
         }));
         Assert.True(loaderEntered.Wait(TimeSpan.FromSeconds(10)));
 
-        Task put = Task.Run(() => cache.Put(1, "put"));
+        Task put = DedicatedThread.Run(() => cache.Put(1, "put"));
         await Task.WhenAny(put, Task.Delay(200)); // the Put must wait for the in-flight recomputation
         releaseLoader.Set();
         await loader;

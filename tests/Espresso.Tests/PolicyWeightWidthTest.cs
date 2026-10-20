@@ -43,10 +43,8 @@ public sealed class PolicyWeightWidthTest
             .Executor(DirectExecutor.Instance).Build();
         cache.Put(1, original);
 
-        // A dedicated thread: the writer blocks inside the listener, so it must not depend on thread-pool
-        // availability while other tests run in parallel.
-        Task writer = Task.Factory.StartNew(() => cache.Put(1, "1"), CancellationToken.None,
-            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // The writer blocks inside the listener, so it runs on its own thread.
+        Task writer = DedicatedThread.Run(() => cache.Put(1, "1"));
         try
         {
             Assert.True(arrived.Wait(TimeSpan.FromSeconds(10)));

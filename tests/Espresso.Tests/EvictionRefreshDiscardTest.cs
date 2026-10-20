@@ -99,7 +99,7 @@ public class EvictionRefreshDiscardTest
         clock.Now = 20 * Second; // expired
 
         // The evictor expires the old entry and parks inside the refresh discard for its key.
-        Task evictor = Task.Run(() =>
+        Task evictor = DedicatedThread.Run(() =>
         {
             HookKey.EvictorThread = Environment.CurrentManagedThreadId;
             cache.CleanUp();
@@ -107,7 +107,7 @@ public class EvictionRefreshDiscardTest
         Assert.True(HookKey.Parked.Wait(TimeSpan.FromSeconds(10)), "the eviction never reached the refresh discard");
 
         // A successor is written for the same key and becomes due for refresh, which registers a reload.
-        Task successor = Task.Run(() =>
+        Task successor = DedicatedThread.Run(() =>
         {
             cache.Put(new HookKey(1), "new");
             Interlocked.Exchange(ref clock.Now, 25 * Second);

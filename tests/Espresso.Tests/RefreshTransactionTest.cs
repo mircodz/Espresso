@@ -208,10 +208,10 @@ public class RefreshTransactionTest
         clock.Advance(TimeSpan.FromSeconds(61));
 
         expiry.Armed = true;
-        Task reader = Task.Run(() => cache.GetIfPresent(1)); // the reload commits inline and pauses
+        Task reader = DedicatedThread.Run(() => cache.GetIfPresent(1)); // the reload commits inline and pauses
         Assert.True(expiry.Entered.Wait(TimeSpan.FromSeconds(10)));
 
-        Task put = Task.Run(() => cache.Put(1, "put"));
+        Task put = DedicatedThread.Run(() => cache.Put(1, "put"));
         await Task.WhenAny(put, Task.Delay(200)); // the Put must wait for the in-flight commit
         expiry.Release.Set();
         await reader;

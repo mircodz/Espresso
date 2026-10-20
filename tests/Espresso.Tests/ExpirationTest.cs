@@ -416,7 +416,7 @@ public sealed class ExpirationTest : CacheTestBase
             var capturedTail = deque.PeekLast!;
             now = TimeSpan.FromSeconds(61).Ticks * 100L;
 
-            Task cleanup = Task.Run(cache.CleanUp);
+            Task cleanup = DedicatedThread.Run(cache.CleanUp);
             bool terminated = await Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromSeconds(2))) == cleanup;
             if (!terminated)
             {

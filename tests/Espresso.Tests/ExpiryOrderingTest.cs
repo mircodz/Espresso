@@ -69,7 +69,7 @@ public class ExpiryOrderingTest
         cache.Put(1, "old");
         ticker.Now = 61 * Second;
 
-        Task<string?> reader = Task.Run(() =>
+        Task<string?> reader = DedicatedThread.Run(() =>
         {
             Volatile.Write(ref ticker.ParkThread, Environment.CurrentManagedThreadId);
             return cache.GetIfPresent(1);
@@ -98,7 +98,7 @@ public class ExpiryOrderingTest
         cache.Put(1, "old");
         ticker.Now = 61 * Second;
 
-        Task<string?> reader = Task.Run(() =>
+        Task<string?> reader = DedicatedThread.Run(() =>
         {
             Volatile.Write(ref ticker.ParkThread, Environment.CurrentManagedThreadId);
             return store.PutIfAbsent(1, "absent");

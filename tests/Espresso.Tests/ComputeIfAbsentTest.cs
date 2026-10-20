@@ -44,7 +44,7 @@ public class ComputeIfAbsentTest
             cache.Put(1, "old");
 
             expiry.Armed = true;
-            Task<string?> reader = Task.Run(() => cache.Get(1, _ => "loaded"));
+            Task<string?> reader = DedicatedThread.Run(() => cache.Get(1, _ => "loaded"));
             Assert.True(expiry.Entered.Wait(TimeSpan.FromSeconds(10)));
 
             cache.Invalidate(1); // removal task drains inline and kills the node
