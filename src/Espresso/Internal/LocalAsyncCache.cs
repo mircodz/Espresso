@@ -202,32 +202,53 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         IEnumerable<K> keys,
         Func<IReadOnlyCollection<K>, CancellationToken, Task<IReadOnlyDictionary<K, V>>> mappingFunction)
     {
-        // Snapshot the requested keys (deduplicated) and their current futures. Any key without a
-        // future gets a proxy future inserted atomically so concurrent readers coalesce onto it.
+        // Validate and de-duplicate the requested keys before touching the store, so an invalid key or
+        // a failing enumeration cannot leave proxies behind.
         var futures = new Dictionary<K, Task<V>>();
-        var proxies = new Dictionary<K, TaskCompletionSource<V>>();
+        var uniqueKeys = new List<K>();
         foreach (K key in keys)
         {
-            if (futures.ContainsKey(key))
+            if (key is null)
             {
-                continue;
+                throw new ArgumentNullException(nameof(keys), "A requested key is null");
             }
-            Task<V>? future = Cache.GetIfPresent(key, recordStats: false);
-            if (future == null)
+            if (futures.TryAdd(key, null!))
             {
-                var proxy = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-                Task<V>? prior = Cache.PutIfAbsent(key, proxy.Task);
-                if (prior == null)
-                {
-                    future = proxy.Task;
-                    proxies[key] = proxy;
-                }
-                else
-                {
-                    future = prior; // someone else is already loading it
-                }
+                uniqueKeys.Add(key);
             }
-            futures[key] = future;
+        }
+
+        // Snapshot each key's current future. Any key without a future gets a proxy future inserted
+        // atomically so concurrent readers coalesce onto it.
+        var proxies = new Dictionary<K, TaskCompletionSource<V>>();
+        try
+        {
+            foreach (K key in uniqueKeys)
+            {
+                Task<V>? future = Cache.GetIfPresent(key, recordStats: false);
+                if (future == null)
+                {
+                    var proxy = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Task<V>? prior = Cache.PutIfAbsent(key, proxy.Task);
+                    if (prior == null)
+                    {
+                        future = proxy.Task;
+                        proxies[key] = proxy;
+                    }
+                    else
+                    {
+                        future = prior; // someone else is already loading it
+                    }
+                }
+                futures[key] = future;
+            }
+        }
+        catch (Exception e)
+        {
+            // Roll back only this call's own proxies and fault them, so neither a later load nor a
+            // reader that coalesced onto one of them waits forever.
+            FailProxies(proxies, e);
+            throw;
         }
 
         Cache.StatsCounter.RecordMisses(proxies.Count);
@@ -243,7 +264,8 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         Task<IReadOnlyDictionary<K, V>> loaded;
         try
         {
-            loaded = mappingFunction(missing, CancellationToken.None);
+            loaded = mappingFunction(missing, CancellationToken.None)
+                ?? throw new InvalidOperationException("The bulk mapping function returned a null task");
         }
         catch (Exception e)
         {
@@ -322,9 +344,25 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         long loadTime = Cache.StatsTicker.Read() - startTime;
         Cache.StatsCounter.RecordLoadFailure(loadTime);
+        FailProxies(proxies, failure);
+    }
+
+    /// <summary>
+    /// Removes each proxy only if it is still mapped (a concurrent write is preserved) and faults it.
+    /// Every proxy is faulted even if removing another one throws.
+    /// </summary>
+    private void FailProxies(Dictionary<K, TaskCompletionSource<V>> proxies, Exception failure)
+    {
         foreach (KeyValuePair<K, TaskCompletionSource<V>> entry in proxies)
         {
-            Cache.Remove(entry.Key, entry.Value.Task);
+            try
+            {
+                Cache.Remove(entry.Key, entry.Value.Task);
+            }
+            catch
+            {
+                // The proxy is still faulted below, so it cannot strand a reader.
+            }
             entry.Value.TrySetException(failure);
         }
     }
