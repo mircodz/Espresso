@@ -535,8 +535,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (updated != null)
         {
-            // Propagate the weight change and wheel reschedule through the policy.
-            AfterWrite(new UpdateTask(this, updated, weightDifference));
+            // Propagate the weight change and wheel reschedule through the policy. A reload is not a
+            // use of the entry, so neither the admission sketch nor the climber observes it.
+            AfterWrite(new UpdateTask(this, updated, weightDifference, Access.Quiet));
             if (!ReferenceEquals(newValue, oldValue))
             {
                 NotifyRemoval(key, oldValue, RemovalCause.Replaced);

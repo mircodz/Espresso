@@ -485,6 +485,38 @@ public sealed class HillClimberTest : CacheTestBase
         AssertThat(cache.Sketch.Frequency(0)).IsEqualTo(frequency + 1);
     }
 
+    [Fact]
+    public void RefreshCommit_RecordsNoAccess()
+    {
+        var ticker = new FakeTicker();
+        var cache = Probe.Of(Cache.NewBuilder<int, string>()
+            .MaximumSize(Full)
+            .RefreshAfterWrite(TimeSpan.FromMinutes(1))
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .Build(key => "r" + key));
+        for (int i = 0; i < Full; i++)
+        {
+            cache.Cache.Put(i, "v" + i);
+        }
+        cache.Cache.CleanUp();
+        cache.Sketch.EnsureCapacity(Full);
+        int frequency = cache.Sketch.Frequency(0);
+        long hits = cache.Climber.sample.hits;
+        long misses = cache.Climber.sample.misses;
+
+        // the read is served the current value and reloads it in place on the direct executor
+        ticker.Advance(TimeSpan.FromMinutes(2));
+        AssertThat(cache.Cache.GetIfPresent(0)).IsEqualTo("v0");
+        cache.Cache.CleanUp();
+
+        // only the read is observed, not the committed reload
+        AssertThat(cache.Climber.sample.hits).IsEqualTo(hits + 1);
+        AssertThat(cache.Climber.sample.misses).IsEqualTo(misses);
+        AssertThat(cache.Sketch.Frequency(0)).IsEqualTo(frequency + 1);
+        AssertThat(cache.Cache.GetIfPresent(0)).IsEqualTo("r0");
+    }
+
     /* --------------- Demotion --------------- */
 
     [Fact]
