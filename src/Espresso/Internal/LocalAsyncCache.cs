@@ -100,7 +100,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
                 {
                     // Replace the future with itself → re-runs the weigher and resets the expiry
                     // timestamps to now, so the real timers start from completion.
-                    Cache.Replace(key, future, future);
+                    Cache.Replace(key, future, future, quietly: true);
                     Cache.StatsCounter.RecordLoadSuccess(loadTime);
                 }
                 catch
@@ -292,7 +292,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             if (result.TryGetValue(key, out V? value) && value != null)
             {
                 proxy.TrySetResult(value);
-                try { Cache.Replace(key, proxy.Task, proxy.Task); } // re-weigh + reset timers
+                try { Cache.Replace(key, proxy.Task, proxy.Task, quietly: true); } // re-weigh + reset timers
                 catch { Cache.Remove(key, proxy.Task); }
             }
             else
