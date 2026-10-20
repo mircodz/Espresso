@@ -2176,6 +2176,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     bool writeExceeds = ExceedsWriteTimeTolerance(prior, now);
                     bool varExceeds = _expiresVariable && Math.Abs(varTime - oldVarTime) > ExpireTolerance;
                     exceedsTolerance = writeExceeds || varExceeds;
+                    // Invalidate the refresh (hashing the key can throw) before mutating the node.
+                    DiscardRefresh(prior.KeyReference);
                     // Publish the value and weight before the timestamps: a lock-free reader samples
                     // the timestamps first, so it can never pair the old value with the new write time.
                     prior.Value = value;
@@ -2184,7 +2186,6 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     {
                         if (_expiresAfterWrite || _refreshAfterWrite) prior.WriteTime = now;
                     }
-                    DiscardRefresh(prior.KeyReference);
                 }
 
                 SetVariableTime(prior, varTime);
@@ -2316,6 +2317,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     now = _ticker.Read();
                     newWeight = WeighEntry(key, newValue);
                     long varTime = ExpireAfterCreate(key, newValue, now);
+                    // Everything that can throw (user callbacks, and the refresh invalidation, which
+                    // hashes the key) runs before the node is mutated, so a failure retires the node
+                    // at the weight the policy credited.
+                    DiscardRefresh(keyRef);
 
                     n.Value = newValue;
                     n.Weight = newWeight;
@@ -2323,16 +2328,22 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     if (_expiresAfterAccess) n.AccessTime = expirationTime;
                     if (_expiresAfterWrite || _refreshAfterWrite) n.WriteTime = expirationTime;
                     SetVariableTime(n, varTime);
-                    DiscardRefresh(keyRef);
                     return n;
                 }
                 catch (Exception e)
                 {
                     newValue = null;
-                    DiscardRefresh(keyRef);
                     failure = ExceptionDispatchInfo.Capture(e);
                     removed = n;
                     n.Retire();
+                    try
+                    {
+                        DiscardRefresh(keyRef);
+                    }
+                    catch
+                    {
+                        // The original failure is reported; the node is retired regardless.
+                    }
                     return null;
                 }
             }
@@ -2554,6 +2565,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 oldWeight = n.Weight;
                 long oldVarTime = n.VariableTime;
                 long varTime = ExpireAfterUpdate(n, key, newValue, now);
+                // Invalidate the refresh (hashing the key can throw) before mutating the node.
+                DiscardRefresh(n.KeyReference);
                 n.Value = newValue;
                 n.Weight = weight;
 
@@ -2569,7 +2582,6 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 if (_expiresAfterAccess) n.AccessTime = expirationTime;
                 SetVariableTime(n, varTime);
-                DiscardRefresh(n.KeyReference);
                 replaced = current;
             }
             return n;
