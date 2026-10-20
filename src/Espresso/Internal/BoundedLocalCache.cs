@@ -1724,7 +1724,6 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
         if (removed)
         {
-            DiscardRefresh(keyRef); // cancel any in-flight reload for the evicted key
             _statsCounter.RecordEviction(node.Weight, actualCause);
             NotifyRemoval(key, value, actualCause);
         }
@@ -1772,6 +1771,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     }
                 }
 
+                // Discard the evicted entry's refresh while the bin is still locked, so it can never
+                // cancel the refresh of an entry re-inserted for the same key after the eviction.
+                st.Cache.DiscardRefresh(n.KeyReference);
                 st.Removed = true;
                 n.Retire();
                 return null; // remove from the map
