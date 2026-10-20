@@ -5,7 +5,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Load-time statistics must be measured whenever stats are recorded (Caffeine's stats ticker).</summary>
+/// <summary>Load-time statistics are measured whenever stats are recorded, independent of the expiration features.</summary>
 public class StatsLoadTimeTest
 {
     private static string SlowLoad(int key)

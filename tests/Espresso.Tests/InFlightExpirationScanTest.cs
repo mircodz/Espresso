@@ -55,7 +55,7 @@ public class InFlightExpirationScanTest
     private const int A = 1, B = 2, C = 3;
 
     /// <summary>
-    /// The reviewer's two shapes. Write: <c>b</c>, <c>a</c> written at 0s, <c>a</c> rewritten with an
+    /// Two entry shapes. Write: <c>b</c>, <c>a</c> written at 0s, <c>a</c> rewritten with an
     /// in-flight future at 2s, <c>c</c> written at 3s. Access: <c>b</c> written and <c>a</c> loaded
     /// asynchronously at 0s, <c>a</c> read at 2s, <c>c</c> written at 3s. In both, at 20s every entry's
     /// timestamps say expired, and the in-flight <c>a</c> sits ahead of <c>c</c> in the scanned deque.
@@ -124,7 +124,7 @@ public class InFlightExpirationScanTest
         s.Store.CleanUp();
 
         Assert.Null(NodeOf(s.Store, B));
-        Assert.Null(NodeOf(s.Store, C)); // was starved behind the in-flight head
+        Assert.Null(NodeOf(s.Store, C)); // not starved behind the in-flight head
         Assert.NotNull(NodeOf(s.Store, A));
         Assert.Equal(2, s.Async.Stats().EvictionCount);
         Assert.Equal(0, DrainStatus(s.Store)); // Idle: the budget was not exhausted, nothing re-armed

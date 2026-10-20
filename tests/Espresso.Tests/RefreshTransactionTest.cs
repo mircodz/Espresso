@@ -103,7 +103,7 @@ public class RefreshTransactionTest
     private static Node<int, string>? NodeOf(object cache, int key)
         => Field<ConcurrentHashMap<int, Node<int, string>>>(cache, "_data").GetOrDefault(key);
 
-    // ----- failure paths release the registration and never reach the reader (C31) -----
+    // ----- failure paths release the registration and never reach the reader -----
 
     [Fact]
     public void ThrowingCommit_LeavesEntryUntouchedAndReleasesRegistration()
@@ -192,7 +192,7 @@ public class RefreshTransactionTest
         Assert.Equal("v1", await cache.GetIfPresent(1)!);
     }
 
-    // ----- the commit serializes with the node-locked Put (C15, refresh part) -----
+    // ----- the commit serializes with the node-locked Put -----
 
     [Fact]
     public async Task Commit_SerializesWithPut()
@@ -220,7 +220,7 @@ public class RefreshTransactionTest
         Assert.Equal("put", cache.GetIfPresent(1));
     }
 
-    // ----- a null reload retires the node (C32) -----
+    // ----- a null reload retires the node -----
 
     [Fact]
     public void NullReload_RetiresAndUnlinksNode()
@@ -272,7 +272,7 @@ public class RefreshTransactionTest
         Assert.Equal(1, cache.EstimatedSize());
     }
 
-    // ----- a discarded reload is reported (C34) -----
+    // ----- a discarded reload is reported -----
 
     [Fact]
     public void SupersededReload_NotifiesReloadedValueAsReplaced()

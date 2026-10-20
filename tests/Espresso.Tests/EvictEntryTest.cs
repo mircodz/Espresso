@@ -6,7 +6,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for <c>BoundedLocalCache.EvictEntry</c> on retired nodes and refresh cleanup.</summary>
+/// <summary>Tests for <c>BoundedLocalCache.EvictEntry</c> on retired nodes and refresh cleanup.</summary>
 public class EvictEntryTest
 {
     private static T Field<T>(object o, string name)

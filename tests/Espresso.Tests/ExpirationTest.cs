@@ -257,7 +257,7 @@ public sealed class ExpirationTest : CacheTestBase
         Assert.Null(cache.GetIfPresent(1));
     }
 
-    // Regression: GetAllPresent must honor expiration like every other read path — an expired entry
+    // GetAllPresent must honor expiration like every other read path — an expired entry
     // must be a miss (not leaked to the caller, not counted as a hit).
     [Fact]
     public void GetAllPresent_SkipsExpiredEntries()
@@ -420,7 +420,7 @@ public sealed class ExpirationTest : CacheTestBase
             bool terminated = await Task.WhenAny(cleanup, Task.Delay(TimeSpan.FromSeconds(2))) == cleanup;
             if (!terminated)
             {
-                // Release the broken baseline scan before asserting; never abandon a spinning worker.
+                // Release a scan that did not terminate before asserting; never abandon a spinning worker.
                 long recoveryTime = TimeSpan.FromSeconds(62).Ticks * 100L;
                 Volatile.Write(ref now, recoveryTime);
                 capturedTail.AccessTime = recoveryTime;

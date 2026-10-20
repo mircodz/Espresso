@@ -351,7 +351,7 @@ public sealed class AsyncLoadingCacheTest
             => Task.FromResult<IReadOnlyDictionary<int, string>>(new Dictionary<int, string>());
     }
 
-    // Regression (#6): a best-effort async refresh reload that FAILS or resolves to NULL must preserve
+    // A best-effort async refresh reload that FAILS or resolves to NULL must preserve
     // the last good value — refresh must never remove the entry on a transient reload error.
     [Theory]
     [InlineData(false)] // reload faults
@@ -385,7 +385,7 @@ public sealed class AsyncLoadingCacheTest
         Assert.Equal("v1", await present!);
     }
 
-    // Regression (#6): a reload that is genuinely in-flight and THEN faults (completing after it was
+    // A reload that is genuinely in-flight and THEN faults (completing after it was
     // installed as the value) must revert the entry to the old value via the completion handler.
     [Fact]
     public async Task RefreshAfterWrite_InFlightReloadThenFails_PreservesOldValue()

@@ -5,7 +5,7 @@ using Xunit;
 
 namespace Espresso.Tests;
 
-/// <summary>Regression tests for the <c>BoundedLocalCache.ComputeIfAbsent</c> (<c>Get(key, fn)</c>) hit path.</summary>
+/// <summary>Tests for the <c>BoundedLocalCache.ComputeIfAbsent</c> (<c>Get(key, fn)</c>) hit path.</summary>
 public class ComputeIfAbsentTest
 {
     private const long Hour = 3_600_000_000_000L;

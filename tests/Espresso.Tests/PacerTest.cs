@@ -84,7 +84,7 @@ public sealed class PacerTest
             maximumDepth = Math.Max(maximumDepth, depth);
             try
             {
-                // Bound the broken baseline's recursion; Schedule catches this exception.
+                // Bound any recursive inline scheduling; Schedule catches this exception.
                 if (depth > 8) throw new InvalidOperationException("recursive inline scheduling");
                 pacer.Cancel();
                 pacer.Schedule(DirectExecutor.Instance, command, Now, OneMinute);

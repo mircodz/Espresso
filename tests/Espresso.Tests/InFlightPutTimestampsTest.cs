@@ -72,7 +72,7 @@ public class InFlightPutTimestampsTest
     [Fact]
     public async Task ExpireAfterAccess_LoadOutlivingTheExpiry_IsKeptOnCompletion()
     {
-        // The reviewer's repro: the access deque ends up [x@5, k@1, y@9.5], so the scan at 11.5s stops
+        // The access deque ends up [x@5, k@1, y@9.5], so the scan at 11.5s stops
         // at x and never reaches k to re-stamp it.
         Setup s = Create(b => b.ExpireAfterAccess(TimeSpan.FromSeconds(10)));
         s.Async.Put(K, Task.FromResult("k"));

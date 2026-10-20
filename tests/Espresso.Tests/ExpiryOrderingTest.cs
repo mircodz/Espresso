@@ -55,7 +55,7 @@ public class ExpiryOrderingTest
         }
     }
 
-    // ----- C19: a read never returns a value that expired (and was notified) before the read finished -----
+    // ----- a read never returns a value that expired (and was notified) before the read finished -----
 
     [Fact]
     public async Task GetIfPresent_NeverReturnsExpiredValueAfterRewrite()
@@ -115,7 +115,7 @@ public class ExpiryOrderingTest
         Assert.NotEqual("old", await reader.WaitAsync(TimeSpan.FromSeconds(10)));
     }
 
-    // ----- C26: quiet reads hide expired entries; reads of an expired entry schedule cleanup -----
+    // ----- quiet reads hide expired entries; reads of an expired entry schedule cleanup -----
 
     [Fact]
     public void GetIfPresentQuietly_HidesExpiredEntry()
@@ -152,7 +152,7 @@ public class ExpiryOrderingTest
         Assert.Equal(0, cache.EstimatedSize());
     }
 
-    // ----- C27: every caller exempts an in-flight async load whose timestamps say it has expired -----
+    // ----- every caller exempts an in-flight async load whose timestamps say it has expired -----
 
     private sealed class InFlight
     {

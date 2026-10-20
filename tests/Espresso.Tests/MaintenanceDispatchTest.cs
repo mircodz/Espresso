@@ -10,7 +10,7 @@ using Xunit;
 namespace Espresso.Tests;
 
 /// <summary>
-/// Regression tests for how maintenance is dispatched: exception isolation, rescheduling of incomplete
+/// Tests for how maintenance is dispatched: exception isolation, rescheduling of incomplete
 /// work, and not rooting a dropped cache from a pending scheduler timer.
 /// </summary>
 public class MaintenanceDispatchTest
@@ -160,7 +160,7 @@ public class MaintenanceDispatchTest
         Assert.Equal(1, executor.MaxDepth);
         for (int i = 0; i < 10 && cache.EstimatedSize() > 1; i++)
         {
-            cache.CleanUp(); // like Java, a custom executor's backlog is finished by later activity
+            cache.CleanUp(); // a custom executor's backlog is finished by later activity
         }
         Assert.Equal(1, cache.EstimatedSize());
     }
