@@ -174,52 +174,6 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     }
 
     /// <summary>
-    /// Attaches a continuation that finalizes a refresh once its in-flight future resolves. Unlike an
-    /// initial load, a failed or null-completing refresh must PRESERVE the previous value (refresh is
-    /// best-effort): the failing future is reverted to <paramref name="oldFuture"/> rather than
-    /// removing the entry. A successful refresh is committed like a normal completion.
-    /// </summary>
-    private protected void HandleRefreshCompletion(K key, Task<V> refreshed, Task<V> oldFuture, long startTime)
-    {
-        refreshed.ContinueWith(t =>
-        {
-            long loadTime = Cache.StatsTicker.Read() - startTime;
-            V? value = t.IsCompletedSuccessfully ? t.Result : null;
-            if (value == null)
-            {
-                // Refresh failed (faulted, cancelled, or null result): keep the last good value by
-                // reverting the entry from the failing future back to the previous one. Never remove.
-                Cache.Replace(key, refreshed, oldFuture);
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
-            }
-            else
-            {
-                try
-                {
-                    // Replace the future with itself → re-runs the weigher and resets the expiry
-                    // timers now that the value is ready.
-                    Cache.Replace(key, refreshed, refreshed);
-                    Cache.StatsCounter.RecordLoadSuccess(loadTime);
-                }
-                catch
-                {
-                    Cache.StatsCounter.RecordLoadFailure(loadTime);
-                    Cache.Replace(key, refreshed, oldFuture);
-                }
-            }
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-    }
-
-    /// <summary>Adapts a <c>Task&lt;V?&gt;</c> loader result to the stored <c>Task&lt;V&gt;</c>; a null result faults.</summary>
-    private protected static Task<V> Adapt(Task<V?> source)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        var tcs = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Link(source, tcs);
-        return tcs.Task;
-    }
-
-    /// <summary>
     /// Completes <paramref name="tcs"/> with the outcome of <paramref name="source"/>: a fault or a
     /// cancellation is propagated, and a null result faults it.
     /// </summary>

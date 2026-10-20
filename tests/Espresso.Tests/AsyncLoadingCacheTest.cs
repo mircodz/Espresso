@@ -351,12 +351,12 @@ public sealed class AsyncLoadingCacheTest
             => Task.FromResult<IReadOnlyDictionary<int, string>>(new Dictionary<int, string>());
     }
 
-    // A best-effort async refresh reload that FAILS or resolves to NULL must preserve
-    // the last good value — refresh must never remove the entry on a transient reload error.
+    // A best-effort async refresh whose reload faults keeps the last good value, while a reload that
+    // resolves to null removes the entry.
     [Theory]
     [InlineData(false)] // reload faults
     [InlineData(true)]  // reload resolves to null
-    public async Task RefreshAfterWrite_BadReload_PreservesOldValue(bool nullReload)
+    public async Task RefreshAfterWrite_BadReload(bool nullReload)
     {
         var ticker = new FakeTicker();
         bool badReload = false;
@@ -379,14 +379,19 @@ public sealed class AsyncLoadingCacheTest
         _ = cache.GetIfPresent(1); // triggers a reload that faults / resolves to null
         await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
 
-        // The entry must still be present with the old value (not removed).
         Task<string>? present = cache.GetIfPresent(1);
-        Assert.NotNull(present);
-        Assert.Equal("v1", await present!);
+        if (nullReload)
+        {
+            Assert.Null(present);
+        }
+        else
+        {
+            Assert.NotNull(present);
+            Assert.Equal("v1", await present!);
+        }
     }
 
-    // A reload that is genuinely in-flight and THEN faults (completing after it was
-    // installed as the value) must revert the entry to the old value via the completion handler.
+    // A reload that is genuinely in flight and then faults leaves the old value in place.
     [Fact]
     public async Task RefreshAfterWrite_InFlightReloadThenFails_PreservesOldValue()
     {
@@ -405,9 +410,9 @@ public sealed class AsyncLoadingCacheTest
 
         gatedReload = true;
         ticker.Advance(TimeSpan.FromSeconds(61));
-        _ = cache.GetIfPresent(1); // installs an in-flight reload future as the value
+        _ = cache.GetIfPresent(1); // starts a reload that stays in flight
 
-        // Now fail the in-flight reload; the completion must revert to the old value.
+        // Fail the in-flight reload; the old value must still be served.
         gate.SetException(new InvalidOperationException("late boom"));
         await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
 
