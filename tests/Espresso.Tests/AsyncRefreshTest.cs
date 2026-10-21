@@ -300,4 +300,48 @@ public sealed class AsyncRefreshTest
             new[] { new Removal(1, "v1", RemovalCause.Explicit), new Removal(1, "v2", RemovalCause.Explicit) },
             removals.ToArray());
     }
+
+    [Fact]
+    public async Task ReloadCompletingAfterTheEntryExpired_IsDiscarded()
+    {
+        var clock = new Clock();
+        var loader = new Loader();
+        var gate = new TaskCompletionSource<string?>(); // the commit runs inline on completion
+        loader.Reload = (_, _) => gate.Task;
+        var removals = new ConcurrentQueue<Removal>();
+        var cache = Build(loader, clock, removals, expireAfterWrite: TimeSpan.FromMinutes(2));
+
+        Assert.Equal("v1", await cache.Get(1));
+        clock.Advance(TimeSpan.FromSeconds(90));
+        Assert.Equal("v1", await cache.GetIfPresent(1)!); // starts the reload
+        clock.Advance(TimeSpan.FromSeconds(90)); // expired, not yet removed
+        gate.SetResult("v2");
+
+        Assert.Null(cache.GetIfPresent(1));
+        Assert.Equal(
+            new[] { new Removal(1, "v1", RemovalCause.Expired), new Removal(1, "v2", RemovalCause.Explicit) },
+            removals.ToArray());
+        Assert.Equal(1, cache.Stats().EvictionCount);
+    }
+
+    [Fact]
+    public async Task DiscardedReload_OfTheValueAWriteStored_IsNotNotified()
+    {
+        var clock = new Clock();
+        var loader = new Loader();
+        var gate = new TaskCompletionSource<string?>(); // the commit runs inline on completion
+        loader.Reload = (_, _) => gate.Task;
+        var removals = new ConcurrentQueue<Removal>();
+        var cache = Build(loader, clock, removals);
+        string stored = new('s', 3);
+
+        Assert.Equal("v1", await cache.Get(1));
+        clock.Advance(TimeSpan.FromSeconds(61));
+        _ = cache.GetIfPresent(1); // starts the reload
+        cache.Put(1, Task.FromResult(stored));
+        gate.SetResult(stored);
+
+        Assert.Same(stored, await cache.GetIfPresent(1)!);
+        Assert.Equal(new[] { new Removal(1, "v1", RemovalCause.Replaced) }, removals.ToArray());
+    }
 }

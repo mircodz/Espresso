@@ -354,4 +354,51 @@ public class RefreshTransactionTest
         }
         Assert.True(notified);
     }
+
+    [Fact]
+    public void ReloadCompletingAfterTheEntryExpired_IsDiscarded()
+    {
+        var clock = new Clock();
+        var removals = new List<(int, string?, RemovalCause)>();
+        var inReload = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        bool reloading = false;
+        var cache = Cache.NewBuilder<int, string>()
+            .RefreshAfterWrite(TimeSpan.FromMinutes(1))
+            .ExpireAfterWrite(TimeSpan.FromMinutes(2))
+            .Ticker(clock.Read).Executor(DirectExecutor.Instance)
+            .RecordStats()
+            .RemovalListener((k, v, c) => { lock (removals) removals.Add((k, v, c)); })
+            .Build(_ =>
+            {
+                if (!Volatile.Read(ref reloading))
+                {
+                    return "v1";
+                }
+                inReload.Set();
+                Assert.True(release.Wait(TimeSpan.FromSeconds(30)));
+                return "v2";
+            });
+        Assert.Equal("v1", cache.Get(1));
+        clock.Advance(TimeSpan.FromSeconds(90));
+        Volatile.Write(ref reloading, true);
+
+        // The reload runs on the reader (direct executor) and completes after the entry expired.
+        string? served = null;
+        var reader = new Thread(() => served = cache.Get(1)) { IsBackground = true };
+        reader.Start();
+        Assert.True(inReload.Wait(TimeSpan.FromSeconds(30)));
+        clock.Advance(TimeSpan.FromSeconds(90)); // expired, not yet removed
+        release.Set();
+        Assert.True(reader.Join(TimeSpan.FromSeconds(30)));
+
+        Assert.Equal("v1", served);
+        Assert.Null(cache.GetIfPresent(1));
+        lock (removals)
+        {
+            Assert.Equal(new[] { (1, (string?)"v1", RemovalCause.Expired), (1, "v2", RemovalCause.Explicit) },
+                removals.ToArray());
+        }
+        Assert.Equal(1, cache.Stats().EvictionCount);
+    }
 }

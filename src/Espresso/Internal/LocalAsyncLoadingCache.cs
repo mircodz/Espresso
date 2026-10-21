@@ -44,6 +44,10 @@ internal sealed class LocalAsyncLoadingCache<K, V> : LocalAsyncCache<K, V>, IAsy
                 return ReferenceEquals(value, current) ? oldFuture : Task.FromResult(value);
             }, (oldFuture, current), CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }, static (currentFuture, newFuture) =>
+        {
+            V? value = AsyncValue.GetIfReady(newFuture);
+            return (value != null) && ReferenceEquals(value, AsyncValue.GetIfReady(currentFuture));
         });
     }
 

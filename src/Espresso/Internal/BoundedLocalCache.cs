@@ -94,7 +94,15 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     // loading wrapper; null for sync caches.
     private volatile Func<K, V, Task<V?>?>? _asyncReload;
 
-    internal void SetAsyncReload(Func<K, V, Task<V?>?> asyncReload) => _asyncReload = asyncReload;
+    // For an async cache, whether two stored futures hold the same ready value instance, so that a
+    // discarded reload of a value that is still cached is not reported as removed.
+    private Func<V, V, bool>? _holdsSameValue;
+
+    internal void SetAsyncReload(Func<K, V, Task<V?>?> asyncReload, Func<V, V, bool> holdsSameValue)
+    {
+        _holdsSameValue = holdsSameValue;
+        _asyncReload = asyncReload;
+    }
 
     // Feature predicates: each gates the code for an enabled feature so a configuration only pays for
     // what it uses.
@@ -480,6 +488,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     {
         Node<K, V>? updated = null;
         Node<K, V>? removed = null;
+        Node<K, V>? expired = null;
+        V? expiredValue = default;
+        int expiredWeight = 0;
         int weightDifference = 0;
         RemovalCause? discardCause = null;
         try
@@ -496,10 +507,27 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 lock (current)
                 {
+                    long now = _ticker.Read();
+                    V? currentValue = current.Value;
+                    if (current.IsAlive && (currentValue != null)
+                        && HasExpired(current, now) && !IsComputingAsync(currentValue))
+                    {
+                        // The entry expired while the reload was in flight: evict it as expired and
+                        // drop the reload, as for an entry that is gone.
+                        expired = current;
+                        expiredValue = currentValue;
+                        expiredWeight = current.Weight;
+                        current.Retire();
+                        if (newValue != null)
+                        {
+                            discardCause = RemovalCause.Explicit;
+                        }
+                        return null;
+                    }
                     if (!IsUnmodifiedSinceRefresh(current, oldValue, keyRef, token, writeTime))
                     {
                         // Superseded by a concurrent write: discard the reload, preserving the entry.
-                        if (newValue != null && !ReferenceEquals(current.Value, newValue))
+                        if (newValue != null && !HoldsSameValue(currentValue, newValue))
                         {
                             discardCause = RemovalCause.Replaced;
                         }
@@ -512,7 +540,6 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                         return null;
                     }
                     // Evaluate the user callbacks before mutating so a throw leaves the node untouched.
-                    long now = _ticker.Read();
                     long varTime = ExpireAfterUpdate(current, key, newValue, now);
                     int newWeight = WeighEntry(key, newValue);
                     weightDifference = newWeight - current.Weight;
@@ -547,6 +574,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             AfterWrite(new RemovalTask(this, removed));
             NotifyRemoval(key, oldValue, RemovalCause.Explicit);
+        }
+        else if (expired != null)
+        {
+            AfterWrite(new RemovalTask(this, expired));
+            _statsCounter.RecordEviction(expiredWeight, RemovalCause.Expired);
+            NotifyRemoval(key, expiredValue, RemovalCause.Expired);
         }
         if (discardCause != null)
         {
@@ -590,6 +623,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             && ReferenceEquals(_refreshes.GetOrDefault(keyRef), token)
             && ReferenceEquals(current.Value, oldValue)
             && (current.WriteTime & ~1L) == writeTime;
+
+    /// <summary>
+    /// Returns whether a reloaded value is the instance the entry already holds: the same stored value,
+    /// or for an async cache a future that holds the same ready value.
+    /// </summary>
+    private bool HoldsSameValue(V? currentValue, V newValue)
+        => ReferenceEquals(currentValue, newValue)
+            || ((currentValue != null) && (_holdsSameValue != null) && _holdsSameValue(currentValue, newValue));
 
     public V? GetIfPresentQuietly(K key)
     {
