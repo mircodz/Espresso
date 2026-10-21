@@ -39,7 +39,9 @@ public interface IAsyncCacheLoader<K, V>
 
     /// <summary>
     /// Asynchronously reloads the value for <paramref name="key"/> given its current value. The
-    /// default implementation delegates to <see cref="AsyncLoad"/>.
+    /// default implementation delegates to <see cref="AsyncLoad"/>. During a refresh the current value
+    /// stays mapped and is served until the reload completes; a reloaded value then replaces it, a
+    /// null result removes the entry, and a failed or canceled reload leaves the entry unchanged.
     /// </summary>
     Task<V?> AsyncReload(K key, V oldValue, CancellationToken cancellationToken)
         => AsyncLoad(key, cancellationToken);

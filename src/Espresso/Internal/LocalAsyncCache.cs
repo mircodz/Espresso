@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Espresso.Stats;
@@ -16,9 +18,9 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     where K : notnull
     where V : class
 {
-    private protected readonly ILocalCache<K, Task<V>> Cache;
+    private protected readonly BoundedLocalCache<K, Task<V>> Cache;
 
-    internal LocalAsyncCache(ILocalCache<K, Task<V>> cache) => Cache = cache;
+    internal LocalAsyncCache(BoundedLocalCache<K, Task<V>> cache) => Cache = cache;
 
     public Task<V>? GetIfPresent(K key) => Cache.GetIfPresent(key, recordStats: true);
 
@@ -47,23 +49,114 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             return present;
         }
 
-        long startTime = Cache.StatsTicker.Read();
-        Task<V>? created = null;
-        Task<V> future = Cache.ComputeIfAbsent(key, k =>
-        {
-            // The mapping function's task is stored immediately, still in-flight. Its result type is
-            // Task<V?> (the loader may produce null); we adapt it to the stored Task<V> whose null/failed
-            // completion triggers removal in HandleCompletion.
-            Task<V> stored = Adapt(mappingFunction(k, CancellationToken.None));
-            created = stored;
-            return stored;
-        }, recordStats, recordLoad: false)!;
+        return Load(key, mappingFunction, recordStats);
+    }
 
-        if (created != null && ReferenceEquals(created, future))
+    /// <summary>
+    /// The miss path of <see cref="GetInternal"/>. Under the map's bin lock only an in-flight
+    /// placeholder is installed; the mapping function runs after the lock is released and its outcome
+    /// completes the placeholder. So a mapping function's synchronous prefix may itself read or load
+    /// other keys (including keys in the same bin) and never blocks writers, while concurrent callers
+    /// for the key still coalesce onto the one placeholder and the function runs at most once.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Task<V> Load(K key, Func<K, CancellationToken, Task<V?>> mappingFunction, bool recordStats)
+    {
+        long startTime = Cache.StatsTicker.Read();
+        var load = new PendingLoad(key, mappingFunction);
+        Task<V> future;
+        try
         {
-            HandleCompletion(key, future, startTime);
+            // The mapping function starts as soon as the placeholder is published (outside the bin lock),
+            // ahead of the insertion's policy work, so its own work is never queued behind maintenance.
+            future = Cache.ComputeIfAbsent(key, load.Install, recordStats, recordLoad: false, onInserted: load)!;
         }
-        return future;
+        catch when (load.Started)
+        {
+            // The insertion failed after the load started: settle the placeholder, then propagate.
+            Settle(key, load, startTime, recordStats);
+            throw;
+        }
+        if (!load.Started)
+        {
+            return future; // another caller's load (or a concurrent write) won
+        }
+
+        Settle(key, load, startTime, recordStats);
+        load.StartFailure?.Throw();
+        return load.Task;
+    }
+
+    /// <summary>
+    /// Completes a published placeholder from its load. A load that failed to start drops the
+    /// placeholder (unless it was already replaced) and fails it for any caller that coalesced onto it;
+    /// otherwise the load's outcome completes it and finalizes the entry.
+    /// </summary>
+    private void Settle(K key, PendingLoad load, long startTime, bool recordStats)
+    {
+        Task<V> pending = load.Task;
+        if (load.StartFailure != null)
+        {
+            try
+            {
+                if (recordStats)
+                {
+                    Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
+                }
+                Cache.Remove(key, pending);
+            }
+            finally
+            {
+                load.TrySetException(load.StartFailure.SourceException);
+                _ = pending.Exception; // observed here; coalesced callers observe their own copy
+            }
+            return;
+        }
+
+        // Link first, so that a source that has already completed completes the placeholder now and its
+        // finalization below runs before the caller returns.
+        Link(load.Source!, load);
+        HandleCompletion(key, pending, startTime, deferred: true, computed: true);
+    }
+
+    /// <summary>
+    /// The in-flight placeholder of a load. Once the cache publishes it, it starts the mapping function
+    /// and keeps the returned task (or the failure to start) for the caller to link.
+    /// </summary>
+    private sealed class PendingLoad : TaskCompletionSource<V>, IInsertionCallback
+    {
+        private readonly K _key;
+        private readonly Func<K, CancellationToken, Task<V?>> _mappingFunction;
+
+        public PendingLoad(K key, Func<K, CancellationToken, Task<V?>> mappingFunction)
+            : base(TaskCreationOptions.RunContinuationsAsynchronously)
+        {
+            _key = key;
+            _mappingFunction = mappingFunction;
+            Install = _ => Task;
+        }
+
+        /// <summary>The insertion's mapping function: installs this placeholder.</summary>
+        public Func<K, Task<V>?> Install { get; }
+
+        public Task<V?>? Source { get; private set; }
+
+        public ExceptionDispatchInfo? StartFailure { get; private set; }
+
+        public bool Started => (Source != null) || (StartFailure != null);
+
+        public void OnInserted()
+        {
+            try
+            {
+                Source = _mappingFunction(_key, CancellationToken.None)
+                    ?? throw new ArgumentNullException("mappingFunction", "The mapping function returned a null task");
+            }
+            catch (Exception e)
+            {
+                StartFailure = ExceptionDispatchInfo.Capture(e);
+            }
+        }
     }
 
     /// <summary>Stores a future, replacing any prior mapping, and attaches the completion handler.</summary>
@@ -71,41 +164,93 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         ArgumentNullException.ThrowIfNull(valueFuture);
         long startTime = Cache.StatsTicker.Read();
+        // Read before the store: a future observed in flight here may complete before the insertion
+        // evaluates it, which the completion detects from the entry itself. A future that completed
+        // without a value is not ready either: its completion removes the entry and records the failure.
+        bool deferred = AsyncValue.GetIfReady(valueFuture) == null;
         Task<V>? prior = Cache.Put(key, valueFuture);
         if (!ReferenceEquals(prior, valueFuture))
         {
-            HandleCompletion(key, valueFuture, startTime);
+            HandleCompletion(key, valueFuture, startTime, deferred, computed: false);
+        }
+        else if (deferred)
+        {
+            HandleRewrite(key, valueFuture);
+        }
+    }
+
+    /// <summary>
+    /// Finalizes a future that was written over itself if it completed during the write. The write
+    /// weighs the value before it locks the entry, so it may have stored the in-flight weight over the
+    /// one that the insertion's completion finalized; a future still in flight is left to that
+    /// completion.
+    /// </summary>
+    private void HandleRewrite(K key, Task<V> valueFuture)
+    {
+        if (AsyncValue.GetIfReady(valueFuture) == null)
+        {
+            return;
+        }
+        try
+        {
+            Cache.FinalizeAsyncCompletion(key, valueFuture);
+        }
+        catch
+        {
+            Cache.Remove(key, valueFuture);
         }
     }
 
     /// <summary>
     /// Attaches a continuation that finalizes an entry once its future resolves: a failed or
-    /// null-completing future removes the entry (only if still mapped to it); a successful future is
-    /// replaced with itself to refresh the weight and expiry timers now that the value is ready.
+    /// null-completing future removes the entry (only if still mapped to it). A successful future whose
+    /// insertion deferred its weight and expiration (it was not ready) is finalized now that the value
+    /// is ready; an already-ready insertion was accounted for by the store. A load is recorded only if
+    /// the caller computed the value or the accounting was deferred to the completion, so an explicit
+    /// write of a ready future records nothing.
     /// </summary>
-    private protected void HandleCompletion(K key, Task<V> future, long startTime)
+    private protected void HandleCompletion(K key, Task<V> future, long startTime, bool deferred, bool computed)
     {
+        bool recordLoad = computed || deferred;
+        if (!deferred)
+        {
+            // Ready when inserted (deferred is read from the same future), so nothing is left to finalize.
+            if (recordLoad)
+            {
+                Cache.StatsCounter.RecordLoadSuccess(Cache.StatsTicker.Read() - startTime);
+            }
+            return;
+        }
         future.ContinueWith(t =>
         {
             long loadTime = Cache.StatsTicker.Read() - startTime;
             V? value = t.IsCompletedSuccessfully ? t.Result : null;
             if (value == null)
             {
+                // Record before removing, so an observer that sees the entry gone also sees the failure.
+                if (recordLoad)
+                {
+                    Cache.StatsCounter.RecordLoadFailure(loadTime);
+                }
                 Cache.Remove(key, future);
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
             }
             else
             {
                 try
                 {
-                    // Replace the future with itself → re-runs the weigher and resets the expiry
-                    // timestamps to now, so the real timers start from completion.
-                    Cache.Replace(key, future, future, quietly: true);
-                    Cache.StatsCounter.RecordLoadSuccess(loadTime);
+                    // Re-weigh the entry and start its expiry timers now that the value is ready.
+                    Cache.FinalizeAsyncCompletion(key, future);
+                    if (recordLoad)
+                    {
+                        Cache.StatsCounter.RecordLoadSuccess(loadTime);
+                    }
                 }
                 catch
                 {
-                    Cache.StatsCounter.RecordLoadFailure(loadTime);
+                    if (recordLoad)
+                    {
+                        Cache.StatsCounter.RecordLoadFailure(loadTime);
+                    }
                     Cache.Remove(key, future);
                 }
             }
@@ -113,49 +258,14 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     }
 
     /// <summary>
-    /// Attaches a continuation that finalizes a refresh once its in-flight future resolves. Unlike an
-    /// initial load, a failed or null-completing refresh must PRESERVE the previous value (refresh is
-    /// best-effort): the failing future is reverted to <paramref name="oldFuture"/> rather than
-    /// removing the entry. A successful refresh is committed like a normal completion.
+    /// Completes <paramref name="tcs"/> with the outcome of <paramref name="source"/>: a fault or a
+    /// cancellation is propagated, and a null result faults it.
     /// </summary>
-    private protected void HandleRefreshCompletion(K key, Task<V> refreshed, Task<V> oldFuture, long startTime)
+    private static void Link(Task<V?> source, TaskCompletionSource<V> tcs)
     {
-        refreshed.ContinueWith(t =>
+        source.ContinueWith(static (t, state) =>
         {
-            long loadTime = Cache.StatsTicker.Read() - startTime;
-            V? value = t.IsCompletedSuccessfully ? t.Result : null;
-            if (value == null)
-            {
-                // Refresh failed (faulted, cancelled, or null result): keep the last good value by
-                // reverting the entry from the failing future back to the previous one. Never remove.
-                Cache.Replace(key, refreshed, oldFuture);
-                Cache.StatsCounter.RecordLoadFailure(loadTime);
-            }
-            else
-            {
-                try
-                {
-                    // Replace the future with itself → re-runs the weigher and resets the expiry
-                    // timers now that the value is ready.
-                    Cache.Replace(key, refreshed, refreshed);
-                    Cache.StatsCounter.RecordLoadSuccess(loadTime);
-                }
-                catch
-                {
-                    Cache.StatsCounter.RecordLoadFailure(loadTime);
-                    Cache.Replace(key, refreshed, oldFuture);
-                }
-            }
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-    }
-
-    /// <summary>Adapts a <c>Task&lt;V?&gt;</c> loader result to the stored <c>Task&lt;V&gt;</c>; a null result faults.</summary>
-    private protected static Task<V> Adapt(Task<V?> source)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        var tcs = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-        source.ContinueWith(t =>
-        {
+            var tcs = (TaskCompletionSource<V>)state!;
             if (t.IsFaulted)
             {
                 tcs.TrySetException(t.Exception!.InnerExceptions);
@@ -173,8 +283,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             {
                 tcs.TrySetResult(t.Result);
             }
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return tcs.Task;
+        }, tcs, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     /// <summary>Runs a synchronous mapping on the cache executor, producing a Task.</summary>
@@ -202,32 +311,53 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         IEnumerable<K> keys,
         Func<IReadOnlyCollection<K>, CancellationToken, Task<IReadOnlyDictionary<K, V>>> mappingFunction)
     {
-        // Snapshot the requested keys (deduplicated) and their current futures. Any key without a
-        // future gets a proxy future inserted atomically so concurrent readers coalesce onto it.
+        // Validate and de-duplicate the requested keys before touching the store, so an invalid key or
+        // a failing enumeration cannot leave proxies behind.
         var futures = new Dictionary<K, Task<V>>();
-        var proxies = new Dictionary<K, TaskCompletionSource<V>>();
+        var uniqueKeys = new List<K>();
         foreach (K key in keys)
         {
-            if (futures.ContainsKey(key))
+            if (key is null)
             {
-                continue;
+                throw new ArgumentNullException(nameof(keys), "A requested key is null");
             }
-            Task<V>? future = Cache.GetIfPresent(key, recordStats: false);
-            if (future == null)
+            if (futures.TryAdd(key, null!))
             {
-                var proxy = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-                Task<V>? prior = Cache.PutIfAbsent(key, proxy.Task);
-                if (prior == null)
-                {
-                    future = proxy.Task;
-                    proxies[key] = proxy;
-                }
-                else
-                {
-                    future = prior; // someone else is already loading it
-                }
+                uniqueKeys.Add(key);
             }
-            futures[key] = future;
+        }
+
+        // Snapshot each key's current future. Any key without a future gets a proxy future inserted
+        // atomically so concurrent readers coalesce onto it.
+        var proxies = new Dictionary<K, TaskCompletionSource<V>>();
+        try
+        {
+            foreach (K key in uniqueKeys)
+            {
+                Task<V>? future = Cache.GetIfPresent(key, recordStats: false);
+                if (future == null)
+                {
+                    var proxy = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Task<V>? prior = Cache.PutIfAbsent(key, proxy.Task);
+                    if (prior == null)
+                    {
+                        future = proxy.Task;
+                        proxies[key] = proxy;
+                    }
+                    else
+                    {
+                        future = prior; // someone else is already loading it
+                    }
+                }
+                futures[key] = future;
+            }
+        }
+        catch (Exception e)
+        {
+            // Roll back only this call's own proxies and fault them, so neither a later load nor a
+            // reader that coalesced onto one of them waits forever.
+            FailProxies(proxies, e);
+            throw;
         }
 
         Cache.StatsCounter.RecordMisses(proxies.Count);
@@ -243,7 +373,8 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         Task<IReadOnlyDictionary<K, V>> loaded;
         try
         {
-            loaded = mappingFunction(missing, CancellationToken.None);
+            loaded = mappingFunction(missing, CancellationToken.None)
+                ?? throw new InvalidOperationException("The bulk mapping function returned a null task");
         }
         catch (Exception e)
         {
@@ -292,7 +423,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             if (result.TryGetValue(key, out V? value) && value != null)
             {
                 proxy.TrySetResult(value);
-                try { Cache.Replace(key, proxy.Task, proxy.Task, quietly: true); } // re-weigh + reset timers
+                try { Cache.FinalizeAsyncCompletion(key, proxy.Task); } // re-weigh + start timers
                 catch { Cache.Remove(key, proxy.Task); }
             }
             else
@@ -322,9 +453,25 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     {
         long loadTime = Cache.StatsTicker.Read() - startTime;
         Cache.StatsCounter.RecordLoadFailure(loadTime);
+        FailProxies(proxies, failure);
+    }
+
+    /// <summary>
+    /// Removes each proxy only if it is still mapped (a concurrent write is preserved) and faults it.
+    /// Every proxy is faulted even if removing another one throws.
+    /// </summary>
+    private void FailProxies(Dictionary<K, TaskCompletionSource<V>> proxies, Exception failure)
+    {
         foreach (KeyValuePair<K, TaskCompletionSource<V>> entry in proxies)
         {
-            Cache.Remove(entry.Key, entry.Value.Task);
+            try
+            {
+                Cache.Remove(entry.Key, entry.Value.Task);
+            }
+            catch
+            {
+                // The proxy is still faulted below, so it cannot strand a reader.
+            }
             entry.Value.TrySetException(failure);
         }
     }

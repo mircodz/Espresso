@@ -34,13 +34,11 @@ public class InFlightExpirationScanTest
     private sealed class CountingExecutor : IExecutor
     {
         public int Submissions;
-        public readonly ManualResetEventSlim Ran = new();
 
         public void Execute(Action action)
         {
             Interlocked.Increment(ref Submissions);
             action();
-            Ran.Set();
         }
     }
 
@@ -168,13 +166,12 @@ public class InFlightExpirationScanTest
         Node<int, Task<string>> a = NodeOf(s.Store, A)!;
         Assert.Equal(0, DrainStatus(s.Store));
 
-        // The completion handler (asynchronous on the thread pool for a loaded future) replaces the
-        // future with itself, which restamps the timers and then submits a drain to the executor. With
-        // the drain status idle, that submission is the next executor run, so it signals the restamp.
-        executor.Ran.Reset();
+        // The completion handler (asynchronous on the thread pool for a loaded future) quietly replaces
+        // the future with itself, which restamps the timers; wait for that restamp itself, since a quiet
+        // completion that changes no weight submits no maintenance.
         s.Load.SetResult("a");
-        Assert.True(executor.Ran.Wait(TimeSpan.FromSeconds(30)), "the completion handler never ran");
-        Assert.Equal(20 * Second, Timestamp(a, shape)); // completion restarted the real timer at 20s
+        Assert.True(SpinWait.SpinUntil(() => Timestamp(a, shape) == 20 * Second, TimeSpan.FromSeconds(30)),
+            "the completion handler never restarted the timer");
 
         s.Clock.Now = 29 * Second;
         s.Store.CleanUp();

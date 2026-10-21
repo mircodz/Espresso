@@ -340,7 +340,7 @@ public sealed class EspressoBuilder<K, V>
     }
 
     /// <summary>Constructs the future-typed backing store for an async cache.</summary>
-    private ILocalCache<K, Task<V>> BuildAsyncStore()
+    private BoundedLocalCache<K, Task<V>> BuildAsyncStore()
     {
         var inner = new EspressoBuilder<K, Task<V>>
         {
@@ -363,6 +363,8 @@ public sealed class EspressoBuilder<K, V>
                 : new AsyncRemovalListener<K, V>(_removalListener, _executor ?? ThreadPoolExecutor.Instance),
         };
 
-        return new BoundedLocalCache<K, Task<V>>(inner.ToConfiguration(), loader: null);
+        // The wrapper is always present, so weights vary only if the user configured a weigher.
+        CacheConfiguration<K, Task<V>> config = inner.ToConfiguration() with { IsWeighted = IsWeighted };
+        return new BoundedLocalCache<K, Task<V>>(config, loader: null);
     }
 }
