@@ -2245,6 +2245,15 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     public V? ComputeIfAbsent(K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad = true)
+        => ComputeIfAbsent(key, mappingFunction, recordStats, recordLoad, onInserted: null);
+
+    /// <summary>
+    /// Like <see cref="ComputeIfAbsent(K, Func{K, V}, bool, bool)"/>; when this call installs the mapping
+    /// function's value, <paramref name="onInserted"/> runs once the entry is published, outside the map's
+    /// lock but before the insertion's policy work is submitted, so work that it starts (an async load) is
+    /// never queued behind that maintenance. The callback must not throw.
+    /// </summary>
+    internal V? ComputeIfAbsent(K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad, IInsertionCallback? onInserted)
     {
         ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(mappingFunction);
@@ -2270,18 +2279,19 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
         }
 
-        return DoComputeIfAbsent(key, mappingFunction, recordStats, recordLoad, readNow);
+        return DoComputeIfAbsent(key, mappingFunction, recordStats, recordLoad, readNow, onInserted);
     }
 
     /// <summary>
-    /// The miss path of <see cref="ComputeIfAbsent"/>. An absent
+    /// The miss path of <see cref="ComputeIfAbsent(K, Func{K, V}, bool, bool, IInsertionCallback)"/>. An absent
     /// key is loaded under the bin lock. A present node is re-validated under its own monitor (which
     /// optimized puts use), and if it has expired it is recomputed while that monitor is held: a
     /// replacement is weighed and timed before the node is mutated, while a null or throwing
     /// recomputation retires the node and enqueues its removal. The expired value is reported as an
     /// eviction either way.
     /// </summary>
-    private V? DoComputeIfAbsent(K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad, long now)
+    private V? DoComputeIfAbsent(
+        K key, Func<K, V?> mappingFunction, bool recordStats, bool recordLoad, long now, IInsertionCallback? onInserted)
     {
         V? oldValue = null;
         V? newValue = null;
@@ -2373,6 +2383,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             }
         });
 
+        if ((node != null) && (newValue != null))
+        {
+            // This call installed the value: start the dependent work before the policy work below.
+            onInserted?.OnInserted();
+        }
         if (cause != null)
         {
             _statsCounter.RecordEviction(oldWeight, cause.Value);
@@ -2887,6 +2902,15 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             throw new InvalidOperationException("this cache was built without a loader");
         }
     }
+}
+
+/// <summary>
+/// Work that starts once a computation's value is published (see <c>BoundedLocalCache.ComputeIfAbsent</c>).
+/// </summary>
+internal interface IInsertionCallback
+{
+    /// <summary>Runs outside the map's lock, before the insertion's policy work; must not throw.</summary>
+    void OnInserted();
 }
 
 /// <summary>What an access records beyond the reorder.</summary>

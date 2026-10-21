@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -33,6 +34,44 @@ public sealed class AsyncLoaderOutsideLockTest
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .BuildAsync();
+
+    /// <summary>Records each submission, then runs it inline.</summary>
+    private sealed class RecordingExecutor(List<string> events) : IExecutor
+    {
+        public void Execute(Action action)
+        {
+            lock (events)
+            {
+                events.Add("maintenance");
+            }
+            action();
+        }
+    }
+
+    [Fact]
+    public async Task Loader_StartsBeforeTheInsertionsMaintenanceIsSubmitted()
+    {
+        var events = new List<string>();
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumSize(100)
+            .Executor(new RecordingExecutor(events))
+            .BuildAsync();
+
+        Task<string> loaded = cache.Get(1, (_, _) =>
+        {
+            lock (events)
+            {
+                events.Add("loader");
+            }
+            return Task.FromResult<string?>("v");
+        });
+
+        Assert.Equal("v", await loaded.WaitAsync(Timeout));
+        lock (events)
+        {
+            Assert.Equal("loader", events[0]);
+        }
+    }
 
     [Fact]
     public async Task DependentLoadInSameBin_IsNotLost()

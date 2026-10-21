@@ -240,7 +240,7 @@ public class ExpiryOrderingTest
         MethodInfo doCompute = typeof(BoundedLocalCache<int, Task<string>>)
             .GetMethod("DoComputeIfAbsent", BindingFlags.Instance | BindingFlags.NonPublic)!;
         Func<int, Task<string>?> mapping = _ => throw new InvalidOperationException();
-        object? result = doCompute.Invoke(c.Store, new object[] { 1, mapping, false, true, 0L });
+        object? result = doCompute.Invoke(c.Store, new object?[] { 1, mapping, false, true, 0L, null });
         Assert.Same(c.Load.Task, result);
         Assert.Equal(0, c.Async.Stats().EvictionCount);
     }

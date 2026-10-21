@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Espresso.Stats;
@@ -62,45 +63,100 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     private Task<V> Load(K key, Func<K, CancellationToken, Task<V?>> mappingFunction, bool recordStats)
     {
         long startTime = Cache.StatsTicker.Read();
-        var placeholder = new TaskCompletionSource<V>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Task<V> pending = placeholder.Task;
-        Task<V> future = Cache.ComputeIfAbsent(key, _ => pending, recordStats, recordLoad: false)!;
-        if (!ReferenceEquals(future, pending))
+        var load = new PendingLoad(key, mappingFunction);
+        Task<V> future;
+        try
+        {
+            // The mapping function starts as soon as the placeholder is published (outside the bin lock),
+            // ahead of the insertion's policy work, so its own work is never queued behind maintenance.
+            future = Cache.ComputeIfAbsent(key, load.Install, recordStats, recordLoad: false, onInserted: load)!;
+        }
+        catch when (load.Started)
+        {
+            // The insertion failed after the load started: settle the placeholder, then propagate.
+            Settle(key, load, startTime, recordStats);
+            throw;
+        }
+        if (!load.Started)
         {
             return future; // another caller's load (or a concurrent write) won
         }
 
-        Task<V?> source;
-        try
+        Settle(key, load, startTime, recordStats);
+        load.StartFailure?.Throw();
+        return load.Task;
+    }
+
+    /// <summary>
+    /// Completes a published placeholder from its load. A load that failed to start drops the
+    /// placeholder (unless it was already replaced) and fails it for any caller that coalesced onto it;
+    /// otherwise the load's outcome completes it and finalizes the entry.
+    /// </summary>
+    private void Settle(K key, PendingLoad load, long startTime, bool recordStats)
+    {
+        Task<V> pending = load.Task;
+        if (load.StartFailure != null)
         {
-            source = mappingFunction(key, CancellationToken.None)
-                ?? throw new ArgumentNullException(nameof(mappingFunction), "The mapping function returned a null task");
-        }
-        catch (Exception e)
-        {
-            // The load failed before it started: drop the placeholder (unless it was already replaced),
-            // fail it for any caller that coalesced onto it, and surface the error to this caller.
             try
             {
-                Cache.Remove(key, pending);
-            }
-            finally
-            {
-                placeholder.TrySetException(e);
-                _ = pending.Exception; // observed here; coalesced callers observe their own copy
                 if (recordStats)
                 {
                     Cache.StatsCounter.RecordLoadFailure(Cache.StatsTicker.Read() - startTime);
                 }
+                Cache.Remove(key, pending);
             }
-            throw;
+            finally
+            {
+                load.TrySetException(load.StartFailure.SourceException);
+                _ = pending.Exception; // observed here; coalesced callers observe their own copy
+            }
+            return;
         }
 
         // Link first, so that a source that has already completed completes the placeholder now and its
-        // finalization below runs before this call returns.
-        Link(source, placeholder);
+        // finalization below runs before the caller returns.
+        Link(load.Source!, load);
         HandleCompletion(key, pending, startTime, deferred: true, computed: true);
-        return pending;
+    }
+
+    /// <summary>
+    /// The in-flight placeholder of a load. Once the cache publishes it, it starts the mapping function
+    /// and keeps the returned task (or the failure to start) for the caller to link.
+    /// </summary>
+    private sealed class PendingLoad : TaskCompletionSource<V>, IInsertionCallback
+    {
+        private readonly K _key;
+        private readonly Func<K, CancellationToken, Task<V?>> _mappingFunction;
+
+        public PendingLoad(K key, Func<K, CancellationToken, Task<V?>> mappingFunction)
+            : base(TaskCreationOptions.RunContinuationsAsynchronously)
+        {
+            _key = key;
+            _mappingFunction = mappingFunction;
+            Install = _ => Task;
+        }
+
+        /// <summary>The insertion's mapping function: installs this placeholder.</summary>
+        public Func<K, Task<V>?> Install { get; }
+
+        public Task<V?>? Source { get; private set; }
+
+        public ExceptionDispatchInfo? StartFailure { get; private set; }
+
+        public bool Started => (Source != null) || (StartFailure != null);
+
+        public void OnInserted()
+        {
+            try
+            {
+                Source = _mappingFunction(_key, CancellationToken.None)
+                    ?? throw new ArgumentNullException("mappingFunction", "The mapping function returned a null task");
+            }
+            catch (Exception e)
+            {
+                StartFailure = ExceptionDispatchInfo.Capture(e);
+            }
+        }
     }
 
     /// <summary>Stores a future, replacing any prior mapping, and attaches the completion handler.</summary>
