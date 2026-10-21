@@ -109,12 +109,39 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
         ArgumentNullException.ThrowIfNull(valueFuture);
         long startTime = Cache.StatsTicker.Read();
         // Read before the store: a future observed in flight here may complete before the insertion
-        // evaluates it, which the completion detects from the entry itself.
-        bool deferred = !AsyncValue.IsReady(valueFuture);
+        // evaluates it, which the completion detects from the entry itself. A future that completed
+        // without a value is not ready either: its completion removes the entry and records the failure.
+        bool deferred = AsyncValue.GetIfReady(valueFuture) == null;
         Task<V>? prior = Cache.Put(key, valueFuture);
         if (!ReferenceEquals(prior, valueFuture))
         {
             HandleCompletion(key, valueFuture, startTime, deferred, computed: false);
+        }
+        else if (deferred)
+        {
+            HandleRewrite(key, valueFuture);
+        }
+    }
+
+    /// <summary>
+    /// Finalizes a future that was written over itself if it completed during the write. The write
+    /// weighs the value before it locks the entry, so it may have stored the in-flight weight over the
+    /// one that the insertion's completion finalized; a future still in flight is left to that
+    /// completion.
+    /// </summary>
+    private void HandleRewrite(K key, Task<V> valueFuture)
+    {
+        if (AsyncValue.GetIfReady(valueFuture) == null)
+        {
+            return;
+        }
+        try
+        {
+            Cache.FinalizeAsyncCompletion(key, valueFuture);
+        }
+        catch
+        {
+            Cache.Remove(key, valueFuture);
         }
     }
 
@@ -129,7 +156,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     private protected void HandleCompletion(K key, Task<V> future, long startTime, bool deferred, bool computed)
     {
         bool recordLoad = computed || deferred;
-        if (!deferred && future.Result != null)
+        if (!deferred)
         {
             // Ready when inserted (deferred is read from the same future), so nothing is left to finalize.
             if (recordLoad)

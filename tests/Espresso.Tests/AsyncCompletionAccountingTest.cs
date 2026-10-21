@@ -1,6 +1,8 @@
 using System;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Espresso.Internal;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -189,6 +191,135 @@ public sealed class AsyncCompletionAccountingTest
         Assert.Equal(1, cache.Stats().LoadSuccessCount);
         Assert.Equal(1, cache.Stats().MissCount);
     }
+
+    [Fact]
+    public void Put_FutureCompletedWithoutAValue_RecordsALoadFailure()
+    {
+        var cache = NewStatsCache();
+
+        cache.Put(1, Task.FromResult<string>(null!));
+
+        Assert.Null(cache.GetIfPresent(1));
+        Assert.Equal(1, cache.Stats().LoadFailureCount);
+        Assert.Equal(0, cache.Stats().LoadSuccessCount);
+    }
+
+    [Fact]
+    public void Put_SameFutureCompletingDuringTheWrite_KeepsTheCompletedWeight()
+    {
+        WarmUpPutPaths();
+        var cache = NewWeightedCache((_, v) => v.Length);
+        var store = StoreOf(cache);
+        var load = new TaskCompletionSource<string>(); // continuations run inline on completion
+        cache.Put(1, load.Task); // in flight: weighs nothing until its completion finalizes the weight
+        var node = NodeOf(store, 1);
+
+        RewriteWhileCompleting(cache, node, load, "vvvvv");
+        cache.CleanUp();
+
+        Assert.Same(load.Task, cache.GetIfPresent(1));
+        Assert.Equal(5, node.Weight);
+        Assert.Equal(5, node.PolicyWeight);
+        Assert.Equal(5, Field<long>(store, "_weightedSize"));
+    }
+
+    [Fact]
+    public void Put_SameFutureCompletingDuringTheWrite_CountsTowardsTheMaximumSize()
+    {
+        WarmUpPutPaths();
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumSize(100)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync();
+        var store = StoreOf(cache);
+        var load = new TaskCompletionSource<string>();
+        cache.Put(1, load.Task);
+        var node = NodeOf(store, 1);
+
+        RewriteWhileCompleting(cache, node, load, "v");
+        cache.CleanUp();
+
+        Assert.Same(load.Task, cache.GetIfPresent(1));
+        Assert.Equal(1, node.Weight);
+        Assert.Equal(1, node.PolicyWeight);
+        Assert.Equal(1, Field<long>(store, "_weightedSize"));
+    }
+
+    [Fact]
+    public void Put_SameFutureCompletingDuringTheWrite_RemovesTheEntryWhenWeighingFails()
+    {
+        WarmUpPutPaths();
+        int weighs = 0;
+        var cache = NewWeightedCache((_, v) => Interlocked.Increment(ref weighs) == 1
+            ? v.Length
+            : throw new InvalidOperationException("weigher failure"));
+        var store = StoreOf(cache);
+        var load = new TaskCompletionSource<string>();
+        cache.Put(1, load.Task);
+        var node = NodeOf(store, 1);
+
+        RewriteWhileCompleting(cache, node, load, "vvvvv");
+        cache.CleanUp();
+
+        // The insertion's completion weighs the value, the write's finalization weighs it again, and
+        // that failure removes the entry as a failed completion does.
+        Assert.Equal(2, weighs);
+        Assert.Null(cache.GetIfPresent(1));
+        Assert.Equal(0, Field<long>(store, "_weightedSize"));
+    }
+
+    private static IAsyncCache<int, string> NewWeightedCache(Func<int, string, int> weigher)
+        => Cache.NewBuilder<int, string>()
+            .MaximumWeight(100)
+            .Weigher(weigher)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync();
+
+    /// <summary>
+    /// Writes an in-flight future over itself while the entry's lock is held, so the write weighs the
+    /// future (nothing, while in flight) and then blocks on that lock; completes the future meanwhile, so
+    /// the insertion's completion finalizes the weight inline (the lock is reentrant); then lets the
+    /// write store its weight.
+    /// </summary>
+    private static void RewriteWhileCompleting(
+        IAsyncCache<int, string> cache, Node<int, Task<string>> node, TaskCompletionSource<string> load, string value)
+    {
+        Thread writer;
+        lock (node)
+        {
+            long contended = Monitor.LockContentionCount;
+            writer = new Thread(() => cache.Put(1, load.Task)) { IsBackground = true };
+            writer.Start();
+            Assert.True(SpinWait.SpinUntil(
+                () => ((writer.ThreadState & ThreadState.WaitSleepJoin) != 0)
+                    && (Monitor.LockContentionCount > contended), Timeout),
+                "the write did not block on the entry's lock");
+            load.SetResult(value);
+        }
+        Assert.True(writer.Join(Timeout));
+    }
+
+    /// <summary>Compiles the write paths, so the racing write blocks only on the entry's lock.</summary>
+    private static void WarmUpPutPaths()
+    {
+        var cache = NewWeightedCache((_, v) => v.Length);
+        var load = new TaskCompletionSource<string>();
+        cache.Put(1, load.Task);
+        cache.Put(1, load.Task);
+        load.SetResult("x");
+        cache.Put(1, load.Task);
+        cache.CleanUp();
+    }
+
+    private static BoundedLocalCache<int, Task<string>> StoreOf(IAsyncCache<int, string> cache)
+        => (BoundedLocalCache<int, Task<string>>)typeof(LocalAsyncCache<int, string>)
+            .GetField("Cache", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(cache)!;
+
+    private static T Field<T>(object target, string name)
+        => (T)target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
+
+    private static Node<int, Task<string>> NodeOf(BoundedLocalCache<int, Task<string>> store, int key)
+        => Field<ConcurrentHashMap<int, Node<int, Task<string>>>>(store, "_data").GetOrDefault(key)!;
 
     private static async Task WaitUntil(Func<bool> condition)
     {
