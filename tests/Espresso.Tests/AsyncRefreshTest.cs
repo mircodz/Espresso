@@ -81,7 +81,7 @@ public sealed class AsyncRefreshTest
     {
         var clock = new Clock();
         var loader = new Loader();
-        var gate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource<string?>(); // the commit runs inline on completion
         loader.Reload = (_, _) => gate.Task;
         var cache = Build(loader, clock);
 
@@ -100,7 +100,7 @@ public sealed class AsyncRefreshTest
         Assert.Equal(1, loader.Reloads); // the in-flight reload debounces later reads
 
         gate.SetResult("v2");
-        await WaitUntil(() => cache.GetIfPresent(1) is { IsCompletedSuccessfully: true, Result: "v2" });
+        Assert.Equal("v2", await cache.GetIfPresent(1)!);
         Assert.Equal(2, cache.Stats().LoadSuccessCount);
     }
 
@@ -193,7 +193,7 @@ public sealed class AsyncRefreshTest
     {
         var clock = new Clock();
         var loader = new Loader();
-        var gate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource<string?>(); // the commit runs inline on completion
         loader.Reload = (_, _) => gate.Task;
         var removals = new ConcurrentQueue<Removal>();
         var cache = Build(loader, clock, removals, expireAfterWrite: TimeSpan.FromMinutes(2));
@@ -203,7 +203,6 @@ public sealed class AsyncRefreshTest
         _ = cache.GetIfPresent(1);
         clock.Advance(TimeSpan.FromSeconds(4));
         gate.SetResult("v2");
-        await WaitUntil(() => !removals.IsEmpty);
 
         Assert.Equal(new[] { new Removal(1, "v1", RemovalCause.Replaced) }, removals.ToArray());
         Assert.Equal(2, cache.Stats().LoadSuccessCount);
@@ -239,7 +238,7 @@ public sealed class AsyncRefreshTest
     {
         var clock = new Clock();
         var loader = new Loader();
-        var gate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource<string?>(); // the commit runs inline on completion
         loader.Reload = (_, _) => gate.Task;
         var removals = new ConcurrentQueue<Removal>();
         var cache = Build(loader, clock, removals);
@@ -248,7 +247,6 @@ public sealed class AsyncRefreshTest
         clock.Advance(TimeSpan.FromSeconds(61));
         _ = cache.GetIfPresent(1);
         gate.SetResult(null);
-        await WaitUntil(() => !removals.IsEmpty);
 
         Assert.Equal(new[] { new Removal(1, "v1", RemovalCause.Explicit) }, removals.ToArray());
         Assert.Equal(1, cache.Stats().LoadFailureCount);
