@@ -171,11 +171,12 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             V? value = t.IsCompletedSuccessfully ? t.Result : null;
             if (value == null)
             {
-                Cache.Remove(key, future);
+                // Record before removing, so an observer that sees the entry gone also sees the failure.
                 if (recordLoad)
                 {
                     Cache.StatsCounter.RecordLoadFailure(loadTime);
                 }
+                Cache.Remove(key, future);
             }
             else
             {

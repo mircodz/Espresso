@@ -194,7 +194,8 @@ public sealed class AsyncLoaderOutsideLockTest
         }
 
         await Assert.ThrowsAnyAsync<Exception>(() => future.WaitAsync(Timeout));
-        for (int i = 0; i < 400 && cache.Stats().LoadFailureCount == 0; i++)
+        // The completion records the failure, then removes the entry, so the removal implies both.
+        for (int i = 0; i < 400 && cache.GetIfPresent(1) != null; i++)
         {
             await Task.Delay(5);
         }
