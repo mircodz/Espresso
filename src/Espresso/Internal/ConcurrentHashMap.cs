@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Espresso.Internal;
@@ -28,7 +29,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private const int DefaultCapacity = 16;
     private const int MaximumCapacity = 1 << 30;
     private const int HashBits = 0x7fffffff;
-    private const int ReservedHash = -3; // Spread keeps user hashes non-negative.
+
+    // Special bin heads carry negative hashes; Spread keeps user hashes non-negative, so a lookup can
+    // tell them apart from entries with a single compare instead of type tests.
+    private const int MovedHash = -1;    // ForwardingNode
+    private const int TreeBinHash = -2;  // TreeBin
+    private const int ReservedHash = -3; // ReservationNode
 
     // Treeification thresholds (mirrors JDK ConcurrentHashMap). A bin whose chain grows to
     // TreeifyThreshold nodes converts to a red-black tree, but only once the table is at least
@@ -62,7 +68,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private sealed class ForwardingNode : Node
     {
         internal readonly Node?[] NextTable;
-        internal ForwardingNode(Node?[] nextTable) : base(0, default!, default!, null) => NextTable = nextTable;
+        internal ForwardingNode(Node?[] nextTable) : base(MovedHash, default!, default!, null) => NextTable = nextTable;
     }
 
     private sealed class ReservationNode : Node
@@ -159,7 +165,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         private const int Reader = 4; // increment per active reader
 
         /// <summary>Builds a tree from an already-threaded list of tree nodes (its <c>First</c>).</summary>
-        internal TreeBin(TreeNode b, ConcurrentHashMap<TKey, TValue> map) : base(0, default!, default!, null)
+        internal TreeBin(TreeNode b, ConcurrentHashMap<TKey, TValue> map) : base(TreeBinHash, default!, default!, null)
         {
             First = b;
             TreeNode? r = null;
@@ -981,25 +987,39 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     public bool IsEmpty => Count == 0;
 
     /// <summary>Returns the value for the key, or <c>null</c> if absent.</summary>
+    /// <remarks>
+    /// The bin head, each chain link and the value are read with acquire semantics. Updates publish a
+    /// value by writing a node's <c>Value</c> or a predecessor's <c>Next</c> without changing the bin
+    /// head, so these reads are what make a retrieval that returns a value observe every write the
+    /// updating thread made before the update, not only the fields the value references.
+    /// </remarks>
     public TValue? GetOrDefault(TKey key)
     {
         int h = HashOf(key);
         Node?[] tab = _table;
         while (true)
         {
-            int n = tab.Length;
-            Node? e = TabAt(tab, (n - 1) & h);
-            if (e is ForwardingNode fwd)
+            Node? e = Volatile.Read(ref BinAt(tab, h));
+            if (e == null)
             {
-                tab = fwd.NextTable;
-                continue;
+                return null;
             }
-            if (e is TreeBin tb)
+            int eh = e.Hash;
+            if (eh < 0)
             {
-                Node? found = tb.Find(h, key, this);
-                return found == null ? null : Volatile.Read(ref found.Value);
+                if (eh == MovedHash)
+                {
+                    tab = Unsafe.As<ForwardingNode>(e).NextTable;
+                    continue;
+                }
+                if (eh == TreeBinHash)
+                {
+                    Node? found = Unsafe.As<TreeBin>(e).Find(h, key, this);
+                    return found == null ? null : Volatile.Read(ref found.Value);
+                }
+                return null; // a reservation holds no value
             }
-            while (e != null)
+            do
             {
                 if (e.Hash == h && KeyEquals(e.Key, key))
                 {
@@ -1007,9 +1027,18 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 }
                 e = Volatile.Read(ref e.Next);
             }
+            while (e != null);
             return null;
         }
     }
+
+    /// <summary>
+    /// The bin for a hash. Tables are never empty and their length is a power of two, so the masked
+    /// index is always in range and the bounds check can be skipped.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ref Node? BinAt(Node?[] tab, int h)
+        => ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(tab), (nint)(uint)((tab.Length - 1) & h));
 
     public bool TryGetValue(TKey key, out TValue value)
     {
