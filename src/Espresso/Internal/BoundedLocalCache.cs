@@ -1679,14 +1679,11 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         if (candidateFreq >= AdmitHashDosThreshold)
         {
             // Random tie-break to resist hash-collision attacks on the frequency filter.
-            int random = ThreadLocalRandomNext();
+            int random = Random.Shared.Next();
             return (random & 127) == 0;
         }
         return false;
     }
-
-    [ThreadStatic] private static Random? _rng;
-    private static int ThreadLocalRandomNext() => (_rng ??= new Random()).Next();
 
     /// <summary>Removes a victim from the map and policy. Caller holds the eviction lock.</summary>
     public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now = 0L)

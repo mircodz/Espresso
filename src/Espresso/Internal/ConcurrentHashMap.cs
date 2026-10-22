@@ -850,23 +850,13 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         => System.Numerics.BitOperations.LeadingZeroCount((uint)n) | (1 << (ResizeStampBits - 1));
 
     // Striped size counter: threads add into per-thread cells to avoid a single hot counter. Cells are
-    // strided by CounterCellStride longs so each active counter owns a 128-byte cache sector.
+    // strided by CounterCellStride longs so each active counter owns a 128-byte cache sector. A thread
+    // picks its cell by its ThreadProbe, which is advanced on CAS contention so colliding threads
+    // migrate to different cells.
     private const int CounterCellStride = 16;
     private long _baseCount;
     private volatile long[]? _counterCells;
     private int _cellsBusy;
-
-    // Per-thread hash into the counter cells. Seeded lazily; advanced (xorshift) on CAS contention so
-    // colliding threads migrate to different cells.
-    [ThreadStatic] private static int _cellProbe;
-
-    private static int AdvanceProbe(int probe)
-    {
-        probe ^= probe << 13;
-        probe ^= probe >>> 17;
-        probe ^= probe << 5;
-        return probe;
-    }
 
     private static int LogicalCell(long[] cells, int probe) => (probe & (cells.Length / CounterCellStride - 1)) * CounterCellStride;
 
@@ -1844,7 +1834,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         long s;
         if (cells != null)
         {
-            int probe = _cellProbe;
+            int probe = ThreadProbe.Get();
             ref long cell = ref cells[LogicalCell(cells, probe)];
             long v = Interlocked.Read(ref cell);
             if (Interlocked.CompareExchange(ref cell, v + x, v) != v)
@@ -1926,11 +1916,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     // is nothing to grow into.
     private void FullAddCount(long x)
     {
-        int probe = _cellProbe;
-        if (probe == 0)
-        {
-            probe = InitProbe();
-        }
+        int probe = ThreadProbe.Get();
         while (true)
         {
             long[]? cells = _counterCells;
@@ -1942,7 +1928,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 {
                     break;
                 }
-                probe = AdvanceProbe(probe);
+                probe = ThreadProbe.Advance(probe);
             }
             else if (Interlocked.CompareExchange(ref _cellsBusy, 1, 0) == 0)
             {
@@ -1968,15 +1954,6 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 }
             }
         }
-        _cellProbe = probe;
-    }
-
-    private static int InitProbe()
-    {
-        int probe = Environment.CurrentManagedThreadId * unchecked((int)0x9E3779B1);
-        probe = AdvanceProbe(probe == 0 ? 1 : probe);
-        _cellProbe = probe;
-        return probe;
     }
 
     /// <summary>
