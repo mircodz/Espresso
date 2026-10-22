@@ -280,12 +280,21 @@ internal sealed class BoundedBuffer<E> where E : class
             }
             if (Interlocked.CompareExchange(ref _writeCounter, tail + 1, tail) == tail)
             {
-                int index = (int)(tail & Mask);
-                Volatile.Write(ref _buffer[index], e);
+                Volatile.Write(ref Slot(tail), e);
                 return BufferResult.Success;
             }
             return BufferResult.Failed;
         }
+
+        /// <summary>
+        /// The slot for a counter value. The array always holds exactly <see cref="BufferSize"/> elements
+        /// and the index is masked, so the access is in range; addressing it directly skips the bounds
+        /// check and the array-covariance type check that <c>ref _buffer[i]</c> pays in shared generic
+        /// code on every offer.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ref E? Slot(long counter)
+            => ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_buffer), (nint)(counter & Mask));
 
         public void DrainTo(Action<E> consumer)
         {
@@ -297,13 +306,13 @@ internal sealed class BoundedBuffer<E> where E : class
             }
             do
             {
-                int index = (int)(head & Mask);
-                E? e = Volatile.Read(ref _buffer[index]);
+                ref E? slot = ref Slot(head);
+                E? e = Volatile.Read(ref slot);
                 if (e == null)
                 {
                     break; // not published yet
                 }
-                Volatile.Write(ref _buffer[index], null);
+                Volatile.Write(ref slot, null);
                 consumer(e);
                 head++;
             }
