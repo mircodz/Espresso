@@ -1067,9 +1067,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             Node<K, V>? next = ReferenceEquals(node, last) ? null : node.GetNextInAccessOrder();
             if ((now - node.AccessTime) < duration)
             {
-                // A stale position can arise from lock-free access-time updates; re-sort and continue.
-                bool stalePosition = (last.AccessTime - node.AccessTime) < 0;
-                if (stalePosition || IsComputingAsync(node))
+                // Only an in-flight head moves aside. These deques are also the eviction order, and
+                // transfers into a region's tail and the access-time tolerance keep them out of time
+                // order, so moving a live head that is fresher than the tail would reorder the LRU
+                // with nothing expired. A head whose reorder was lost delays reaping the entries
+                // behind it until it is read again or expires.
+                if (IsComputingAsync(node))
                 {
                     deque.MoveToBack(node);
                     node = next;

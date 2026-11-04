@@ -528,6 +528,52 @@ public sealed class ExpirationTest : CacheTestBase
         }
     }
 
+    [Fact]
+    public void AccessScan_DemotedTail_KeepsProbationOrder()
+    {
+        // A protected entry demoted to probation's tail keeps its older access time, so the region is
+        // not in access-time order, and a scan that expires nothing must leave the eviction order alone
+        var ticker = new FakeTicker();
+        using var cache = Cache.NewBuilder<int, string>().MaximumSize(10).ExpireAfterAccess(OneMinute)
+            .Ticker(ticker.Read).Executor(DirectExecutor.Instance).Build();
+        for (int i = 1; i <= 8; i++)
+        {
+            ticker.Advance(TimeSpan.FromSeconds(1));
+            cache.Put(i, "v" + i);
+        }
+        ticker.Advance(TimeSpan.FromSeconds(2));
+        for (int i = 1; i <= 7; i++)
+        {
+            Assert.NotNull(cache.GetIfPresent(i));
+        }
+        cache.CleanUp();
+
+        const int demoted = 1, promoted = 8, graduate = 9;
+        ticker.Advance(TimeSpan.FromSeconds(20));
+        cache.Put(graduate, "v" + graduate);
+        ticker.Advance(TimeSpan.FromSeconds(1));
+        cache.Put(10, "v10");
+        ticker.Advance(TimeSpan.FromSeconds(9));
+        Assert.NotNull(cache.GetIfPresent(promoted));
+        cache.CleanUp();
+        var probation = Field<ILinkedDeque<Node<int, string>>>(cache, "_probationDeque");
+        Assert.Equal(new[] { graduate, demoted }, KeysOf(probation));
+
+        ticker.Advance(TimeSpan.FromSeconds(5));
+        cache.CleanUp();
+        Assert.Equal(new[] { graduate, demoted }, KeysOf(probation));
+    }
+
+    private static List<int> KeysOf(ILinkedDeque<Node<int, string>> deque)
+    {
+        var keys = new List<int>();
+        foreach (var node in deque)
+        {
+            keys.Add(node.Key);
+        }
+        return keys;
+    }
+
     private sealed class Listener : IRemovalListener<int, string>
     {
         private readonly Action<int, string?, RemovalCause> _onRemoval;
