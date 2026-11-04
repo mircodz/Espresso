@@ -291,6 +291,87 @@ public sealed class ConcurrentHashMapTest
         Assert.Equal(enumerated, map.Count);
     }
 
+    // A lookup that returns a value must observe every write the updating thread made before the
+    // update, including writes the value does not reference. Writers replace, remove and re-append
+    // freshly built payloads in one short collision chain, so values are published through a node's
+    // Value or a predecessor's Next while the bin head stays the same. Before each put a writer stamps
+    // the payload's generation into an array the payload does not reference. Readers check the
+    // payload's fields and the stamp right after each lookup without synchronizing themselves, so only
+    // the lookup's own loads order those reads.
+    [Fact]
+    public async Task ChainPublication_LookupSeesWritesMadeBeforeThePut()
+    {
+        const int keys = 4;      // one bin, below the treeify threshold
+        const int writers = 2;   // each owns every second key, so a key's stamp only grows
+        const int readers = 2;
+        const int generations = 200_000;
+        const int stride = 16;   // one stamp per cache line
+        var map = new ConcurrentHashMap<int, Payload>(64, 1, new CollidingComparer());
+        var stamps = new long[keys * stride];
+        for (int k = 0; k < keys; k++)
+        {
+            map.Put(k, new Payload(0));
+        }
+
+        int writing = writers;
+        long observed = 0;
+        string? failure = null;
+        using var start = new Barrier(writers + readers);
+        var tasks = new List<Task>();
+        for (int w = 0; w < writers; w++)
+        {
+            int first = w;
+            tasks.Add(DedicatedThread.Run(() =>
+            {
+                start.SignalAndWait();
+                for (long g = 1; g <= generations; g++)
+                {
+                    for (int k = first; k < keys; k += writers)
+                    {
+                        stamps[k * stride] = g;
+                        if ((g & 7) == 0)
+                        {
+                            map.Remove(k); // the next put appends the key at the chain's tail
+                        }
+                        map.Put(k, new Payload(g));
+                    }
+                }
+                Interlocked.Decrement(ref writing);
+            }));
+        }
+        for (int r = 0; r < readers; r++)
+        {
+            tasks.Add(DedicatedThread.Run(() =>
+            {
+                start.SignalAndWait();
+                long seen = 0;
+                while (Volatile.Read(ref writing) > 0 && Volatile.Read(ref failure) == null)
+                {
+                    for (int k = 0; k < keys; k++)
+                    {
+                        Payload? p = map.GetOrDefault(k);
+                        if (p == null)
+                        {
+                            continue;
+                        }
+                        long stamp = stamps[k * stride];
+                        if (p.Check != Payload.Mix(p.Generation) || stamp < p.Generation)
+                        {
+                            Interlocked.CompareExchange(ref failure,
+                                $"key {k}: generation {p.Generation}, check {p.Check:X}, stamp {stamp}", null);
+                        }
+                        seen++;
+                    }
+                }
+                Interlocked.Add(ref observed, seen);
+            }));
+        }
+        await Task.WhenAll(tasks);
+
+        Assert.Null(failure);
+        Assert.True(observed > 0);
+    }
+
     [Fact]
     public void ConcurrentInsertDistinctKeys_CountExact()
     {
@@ -407,6 +488,22 @@ public sealed class ConcurrentHashMapTest
     {
         public bool Equals(int a, int b) => a == b;
         public int GetHashCode(int _) => 0;
+    }
+
+    // A freshly built value whose second field is derived from the first, so a reader can tell whether
+    // it saw the fields initialized.
+    private sealed class Payload
+    {
+        public readonly long Generation;
+        public readonly long Check;
+
+        public Payload(long generation)
+        {
+            Generation = generation;
+            Check = Mix(generation);
+        }
+
+        public static long Mix(long g) => unchecked(g * (long)0x9E3779B97F4A7C15UL ^ 0x5DEECE66DL);
     }
 
     // Buckets keys into a few hash slots so bins grow long enough to treeify (and shrink to untreeify),

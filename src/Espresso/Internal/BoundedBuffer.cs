@@ -48,42 +48,13 @@ internal sealed class BoundedBuffer<E> where E : class
     /// <summary>Spinlock (locked via CAS) used when resizing and/or creating buffers.</summary>
     private int _tableBusy;
 
-    /// <summary>
-    /// Per-thread hash used to pick a stripe, cached so the common (uncontended) offer avoids recomputing
-    /// the thread-id mix on every read. Initialized lazily from the managed thread id and advanced by an
-    /// xorshift only when a stripe collision forces a rehash — the same scheme the counter-cell striping
-    /// in <see cref="ConcurrentHashMap{K,V}"/> uses. Zero means "not yet initialized".
-    /// </summary>
-    [ThreadStatic] private static int _probe;
-
     private bool CasTableBusy() => Interlocked.CompareExchange(ref _tableBusy, 1, 0) == 0;
-
-    /// <summary>Returns this thread's cached stripe probe, initializing it on first use (never zero).</summary>
-    private static int GetProbe()
-    {
-        int p = _probe;
-        if (p == 0)
-        {
-            p = (int)Mix64(Environment.CurrentManagedThreadId);
-            _probe = p == 0 ? 1 : p; // guard against a zero mix so the field stays "initialized"
-            p = _probe;
-        }
-        return p;
-    }
-
-    /// <summary>Advances the probe via xorshift (Marsaglia) and writes it back to the thread-local slot.</summary>
-    private static int AdvanceProbe(int probe)
-    {
-        probe ^= probe << 13;
-        probe ^= probe >>> 17;
-        probe ^= probe << 5;
-        _probe = probe;
-        return probe;
-    }
 
     public int Offer(E e)
     {
-        int h = GetProbe();
+        // The stripe is picked by the thread's probe, which is advanced only when a stripe collision
+        // forces a rehash.
+        int h = ThreadProbe.Get();
 
         bool uncontended = true;
         RingBuffer?[]? buffers = _table;
@@ -177,7 +148,7 @@ internal sealed class BoundedBuffer<E> where E : class
                     collide = false;
                     continue; // retry with expanded table
                 }
-                h = AdvanceProbe(h);
+                h = ThreadProbe.Advance(h);
             }
             else if (_tableBusy == 0 && _table == buffers && CasTableBusy())
             {
@@ -267,14 +238,6 @@ internal sealed class BoundedBuffer<E> where E : class
 
     public long Size => Writes - Reads;
 
-    /// <summary>Computes Stafford variant 13 of the 64-bit mix function.</summary>
-    private static long Mix64(long z)
-    {
-        z = (z ^ (z >>> 30)) * unchecked((long)0xbf58476d1ce4e5b9L);
-        z = (z ^ (z >>> 27)) * unchecked((long)0x94d049bb133111ebL);
-        return z ^ (z >>> 31);
-    }
-
     /// <summary>
     /// A single ring buffer stripe. The read and write counters sit on separate 128-byte cache sectors
     /// (15 padding longs each side) to avoid false sharing between the producer's write counter and the
@@ -317,12 +280,21 @@ internal sealed class BoundedBuffer<E> where E : class
             }
             if (Interlocked.CompareExchange(ref _writeCounter, tail + 1, tail) == tail)
             {
-                int index = (int)(tail & Mask);
-                Volatile.Write(ref _buffer[index], e);
+                Volatile.Write(ref Slot(tail), e);
                 return BufferResult.Success;
             }
             return BufferResult.Failed;
         }
+
+        /// <summary>
+        /// The slot for a counter value. The array always holds exactly <see cref="BufferSize"/> elements
+        /// and the index is masked, so the access is in range; addressing it directly skips the bounds
+        /// check and the array-covariance type check that <c>ref _buffer[i]</c> pays in shared generic
+        /// code on every offer.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ref E? Slot(long counter)
+            => ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_buffer), (nint)(counter & Mask));
 
         public void DrainTo(Action<E> consumer)
         {
@@ -334,13 +306,13 @@ internal sealed class BoundedBuffer<E> where E : class
             }
             do
             {
-                int index = (int)(head & Mask);
-                E? e = Volatile.Read(ref _buffer[index]);
+                ref E? slot = ref Slot(head);
+                E? e = Volatile.Read(ref slot);
                 if (e == null)
                 {
                     break; // not published yet
                 }
-                Volatile.Write(ref _buffer[index], null);
+                Volatile.Write(ref slot, null);
                 consumer(e);
                 head++;
             }
