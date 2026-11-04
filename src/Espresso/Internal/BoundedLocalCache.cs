@@ -34,7 +34,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private const long MaximumCapacity = long.MaxValue - int.MaxValue;
 
     // Expiration constants.
-    private const int ExpirationThreshold = 1_000;      // max entries expired per maintenance cycle
+    private const int ExpirationThreshold = 1_000;      // expirations per policy after which a cycle defers the rest
     private const long ExpireTolerance = 1_000_000_000; // 1 second, in nanoseconds
 
     // The maximum number of entries that can be transferred between queues per maintenance cycle.
@@ -1017,7 +1017,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         if (_expiresVariable)
         {
-            delay = Math.Min(delay, _timerWheel!.GetExpirationDelay());
+            delay = Math.Min(delay, _timerWheel!.GetExpirationDelay(now));
         }
         return delay;
     }

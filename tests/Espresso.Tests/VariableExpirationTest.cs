@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
+using Espresso.Internal;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -33,6 +35,24 @@ public sealed class VariableExpirationTest : CacheTestBase
         public void OnRemoval(int key, string? value, RemovalCause cause) => _onRemoval(key, value, cause);
     }
 
+    /// <summary>Records each scheduled maintenance task and its delay without running it.</summary>
+    private sealed class CapturingScheduler : IScheduler
+    {
+        public readonly List<(Action Command, long DelayNanos)> Scheduled = new();
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Scheduled.Add((command, delay.Ticks * 100L));
+            return new PendingFuture();
+        }
+
+        private sealed class PendingFuture : IScheduledFuture
+        {
+            public bool IsDone { get; private set; }
+            public void Cancel() => IsDone = true;
+        }
+    }
+
     private static ICache<int, string> New(IExpiry<int, string> expiry, FakeTicker ticker)
         => Cache.NewBuilder<int, string>()
             .ExpireAfter(expiry)
@@ -40,6 +60,39 @@ public sealed class VariableExpirationTest : CacheTestBase
             .Executor(DirectExecutor.Instance)
             .RecordStats()
             .Build();
+
+    [Fact]
+    public void Schedule_SpentBudget_OverdueBucket()
+    {
+        // The fire flushes the minute's bucket whole, which spends the expiration budget, so the hour's
+        // entry is overdue when the next fire is scheduled and must not wait for its bucket's original time
+        var ticker = new FakeTicker();
+        var scheduler = new CapturingScheduler();
+        using var cache = Cache.NewBuilder<int, string>()
+            .ExpireAfter(new FuncExpiry<int, string>(
+                (_, v) => v == "hour" ? TimeSpan.FromHours(1) : TimeSpan.FromMinutes(1)))
+            .Scheduler(scheduler)
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .Build();
+        for (int i = 0; i <= 1_000; i++)
+        {
+            cache.Put(i, "minute");
+        }
+        cache.Put(-1, "hour");
+        Assert.Single(scheduler.Scheduled);
+
+        ticker.Advance(TimeSpan.FromHours(2));
+        scheduler.Scheduled[0].Command();
+
+        Assert.Equal(2, scheduler.Scheduled.Count);
+        Assert.Equal(1, cache.EstimatedSize());
+        Assert.True(scheduler.Scheduled[1].DelayNanos <= Pacer.Tolerance,
+            $"next fire in {scheduler.Scheduled[1].DelayNanos} ns");
+        ticker.Advance(TimeSpan.FromTicks(scheduler.Scheduled[1].DelayNanos / 100L));
+        scheduler.Scheduled[1].Command();
+        Assert.Equal(0, cache.EstimatedSize());
+    }
 
     [Theory]
     [InlineData(long.MinValue, long.MinValue)]

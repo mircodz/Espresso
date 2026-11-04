@@ -70,9 +70,9 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
     }
 
     /// <summary>
-    /// Advances the timer and expires entries that are due, up to <paramref name="limit"/> evictions;
-    /// returns the unused budget. When the limit is reached the timer rewinds so the next advance
-    /// processes the remaining backlog.
+    /// Advances the timer and expires entries that are due, flushing whole buckets until
+    /// <paramref name="limit"/> evictions are reached; returns the unused budget. When the limit is
+    /// reached the timer rewinds so the next advance processes the remaining buckets.
     /// </summary>
     public int Advance(ITimerWheelCache<K, V> cache, long currentTimeNanos, int limit)
     {
@@ -122,6 +122,12 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
         return limit;
     }
 
+    /// <summary>
+    /// Expires the due entries of the buckets between <paramref name="previousTicks"/> and the current
+    /// time, rescheduling the live ones. A bucket is flushed whole and the limit is checked only
+    /// between buckets: stopping mid-bucket would make every later advance re-walk the survivors it
+    /// had already rescheduled.
+    /// </summary>
     private int Expire(ITimerWheelCache<K, V> cache, int index, long previousTicks, long delta, int limit)
     {
         Node<K, V>[] timerWheel = _wheel[index];
@@ -149,10 +155,7 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
                         }
                         else if (cache.EvictEntry(node, RemovalCause.Expired, Nanos))
                         {
-                            if (--limit == 0)
-                            {
-                                return 0;
-                            }
+                            limit--;
                         }
                         else
                         {
@@ -169,6 +172,10 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
             finally
             {
                 Transfer(_pending, sentinel);
+            }
+            if (limit <= 0)
+            {
+                return 0; // leave the remaining buckets for the next advance
             }
         }
         return limit;
@@ -261,8 +268,12 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
         }
     }
 
-    /// <summary>Returns the duration until the next bucket expires, or <see cref="long.MaxValue"/> if none.</summary>
-    public long GetExpirationDelay()
+    /// <summary>
+    /// Returns the duration until the next bucket expires, or <see cref="long.MaxValue"/> if none.
+    /// The timer lags <paramref name="currentTimeNanos"/> after an advance stops at its limit, so the
+    /// lag is subtracted and an overdue bucket reads as due.
+    /// </summary>
+    public long GetExpirationDelay(long currentTimeNanos)
     {
         for (int i = 0; i < Shift.Length; i++)
         {
@@ -291,7 +302,7 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
                     delay = Math.Min(delay, nextDelay);
                 }
 
-                return delay;
+                return delay - Math.Max(0, currentTimeNanos - Nanos);
             }
         }
         return long.MaxValue;

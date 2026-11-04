@@ -564,6 +564,60 @@ public sealed class ExpirationTest : CacheTestBase
         Assert.Equal(new[] { graduate, demoted }, KeysOf(probation));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Schedule_WriteDuringCycle_WaitsForNextExpiration(bool access)
+    {
+        // The listener's write stands in for a concurrent write landing while the cycle runs. The fire
+        // expires the first entry and nothing reaches a limit, so the next fire waits for the second
+        // entry rather than coming at once
+        var ticker = new FakeTicker();
+        var scheduler = new CapturingScheduler();
+        ICache<int, string>? cache = null;
+        var builder = Cache.NewBuilder<int, string>()
+            .Scheduler(scheduler)
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((_, _, _) => cache!.Put(3, "c")));
+        if (access) builder.ExpireAfterAccess(OneMinute);
+        else builder.ExpireAfterWrite(OneMinute);
+        cache = builder.Build();
+        using (cache)
+        {
+            cache.Put(1, "a");
+            ticker.Advance(TimeSpan.FromSeconds(50));
+            cache.Put(2, "b");
+            Assert.Single(scheduler.Scheduled);
+
+            ticker.Advance(TimeSpan.FromSeconds(11));
+            scheduler.Scheduled[0].Command();
+
+            Assert.Equal(2, scheduler.Scheduled.Count);
+            long expected = TimeSpan.FromSeconds(49).Ticks * 100L;
+            long delay = scheduler.Scheduled[1].DelayNanos;
+            Assert.InRange(delay, expected - Pacer.Tolerance, expected + Pacer.Tolerance);
+        }
+    }
+
+    /// <summary>Records each scheduled maintenance task and its delay without running it.</summary>
+    private sealed class CapturingScheduler : IScheduler
+    {
+        public readonly List<(Action Command, long DelayNanos)> Scheduled = new();
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Scheduled.Add((command, delay.Ticks * 100L));
+            return new PendingFuture();
+        }
+
+        private sealed class PendingFuture : IScheduledFuture
+        {
+            public bool IsDone { get; private set; }
+            public void Cancel() => IsDone = true;
+        }
+    }
+
     private static List<int> KeysOf(ILinkedDeque<Node<int, string>> deque)
     {
         var keys = new List<int>();
