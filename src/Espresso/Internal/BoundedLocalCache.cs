@@ -1249,25 +1249,30 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _mainProtectedMaximum += quota;
         _windowMaximum -= quota;
 
-        for (int i = 0; i < QueueTransferThreshold; i++)
+        // Zero-weight entries (in-flight async loads) stay in the window, as when evicting from it. In
+        // probation, a completing load would be promoted to protected at full weight without facing
+        // admission.
+        int remaining = QueueTransferThreshold;
+        Node<K, V>? candidate = _windowDeque.PeekFirst;
+        while (candidate != null && remaining > 0)
         {
-            Node<K, V>? candidate = _windowDeque.PeekFirst;
-            if (candidate == null)
-            {
-                break;
-            }
-
+            Node<K, V>? next = candidate.GetNextInAccessOrder();
             long weight = candidate.PolicyWeight;
-            if (quota < weight)
+            if (weight != 0)
             {
-                break;
-            }
+                if (quota < weight)
+                {
+                    break;
+                }
 
-            quota -= weight;
-            _windowWeightedSize -= weight;
-            _windowDeque.Remove(candidate);
-            _probationDeque.OfferLast(candidate);
-            candidate.MakeMainProbation();
+                quota -= weight;
+                _windowWeightedSize -= weight;
+                _windowDeque.Remove(candidate);
+                _probationDeque.OfferLast(candidate);
+                candidate.MakeMainProbation();
+                remaining--;
+            }
+            candidate = next;
         }
 
         _mainProtectedMaximum -= quota;
