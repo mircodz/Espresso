@@ -269,7 +269,8 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
     }
 
     /// <summary>
-    /// Returns the duration until the next bucket expires, or <see cref="long.MaxValue"/> if none.
+    /// Returns the delay until the wheel next flushes a bucket holding a timer, which either expires
+    /// the entry or cascades it to a finer wheel, or <see cref="long.MaxValue"/> if the wheel is empty.
     /// The timer lags <paramref name="currentTimeNanos"/> after an advance stops at its limit, so the
     /// lag is subtracted and an overdue bucket reads as due.
     /// </summary>
@@ -292,9 +293,9 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
                 {
                     continue;
                 }
-                long buckets = j - start;
+                // An occupied current bucket is flushed when the wheel next ticks, not a full span later
+                long buckets = Math.Max(1, j - start);
                 long delay = (buckets << Shift[i]) - (Nanos & spanMask);
-                delay = (delay > 0) ? delay : Spans[i];
 
                 for (int k = i + 1; k < Shift.Length; k++)
                 {
@@ -308,6 +309,11 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
         return long.MaxValue;
     }
 
+    /// <summary>
+    /// Returns the delay until a higher wheel next ticks if that tick flushes a bucket holding a timer:
+    /// the upcoming bucket, or the current one, whose tick has passed and which holds only timers that
+    /// wrapped a full revolution.
+    /// </summary>
     private long PeekAhead(int index)
     {
         long ticks = Nanos >>> Shift[index];
@@ -315,10 +321,11 @@ internal sealed class TimerWheel<K, V> : IEnumerable<Node<K, V>>
 
         long spanMask = Spans[index] - 1;
         int mask = timerWheel.Length - 1;
-        int probe = (int)((ticks + 1) & mask);
-        Node<K, V> sentinel = timerWheel[probe];
-        Node<K, V>? next = sentinel.NextInVariableOrder;
-        return ReferenceEquals(next, sentinel) ? long.MaxValue : (Spans[index] - (Nanos & spanMask));
+        Node<K, V> current = timerWheel[(int)(ticks & mask)];
+        Node<K, V> upcoming = timerWheel[(int)((ticks + 1) & mask)];
+        bool empty = ReferenceEquals(current.NextInVariableOrder, current)
+            && ReferenceEquals(upcoming.NextInVariableOrder, upcoming);
+        return empty ? long.MaxValue : (Spans[index] - (Nanos & spanMask));
     }
 
     // ----- iterators (roughly ordered by expiration; used later by Policy introspection) -----

@@ -462,6 +462,103 @@ public sealed class TimerWheelTest
     }
 
     [Fact]
+    public void GetExpirationDelay_OccupiedCurrentBucket()
+    {
+        var cache = new CountingCache();
+        var wheel = new TimerWheel<long, string>();
+        long clock = Spans[1];
+        wheel.Nanos = clock;
+
+        // Due at the next wheel[1] tick, so held one bucket ahead of the current one
+        wheel.Schedule(new Timer(clock + Spans[1]));
+
+        // Advance to just shy of that tick, leaving the event Spans[0] away
+        long offset = Spans[1] - Spans[0];
+        wheel.Advance(cache, clock + offset, int.MaxValue);
+
+        // A timer a full wheel[1] revolution out wraps onto the current bucket; it must not mask the
+        // event in the next one
+        wheel.Schedule(new Timer(clock + offset + Spans[2] - 1));
+
+        Assert.True(wheel.GetExpirationDelay(clock + offset) <= Spans[1] - offset);
+    }
+
+    [Fact]
+    public void GetExpirationDelay_OccupiedCurrentBucket_HigherWheel()
+    {
+        // Just shy of a wheel[1] tick
+        var wheel = new TimerWheel<long, string>();
+        long clock = 2 * Spans[1] - Spans[0];
+        wheel.Nanos = clock;
+
+        // A timer a full wheel[1] revolution out wraps onto the current bucket
+        wheel.Schedule(new Timer(clock + Spans[2] - 1));
+
+        // A later timer in wheel[0] is found first, so wheel[1] is only peeked at
+        wheel.Schedule(new Timer(clock + 10 * Spans[0]));
+
+        // The occupied current bucket is flushed when wheel[1] next ticks
+        Assert.Equal(Spans[0], wheel.GetExpirationDelay(clock));
+    }
+
+    [Theory]
+    [MemberData(nameof(FuzzyData))]
+    public void GetExpirationDelay_Fuzzy(long clock, long duration, long[] times)
+    {
+        var wheel = new TimerWheel<long, string>();
+        wheel.Nanos = clock;
+        foreach (long timeout in times)
+        {
+            wheel.Schedule(new Timer(timeout));
+        }
+        wheel.Advance(new CountingCache(), duration, int.MaxValue);
+
+        Assert.Equal(NextFlushDelay(wheel), wheel.GetExpirationDelay(duration));
+    }
+
+    public static IEnumerable<object[]> FuzzyData()
+    {
+        for (int seed = 0; seed < 8; seed++)
+        {
+            var random = new Random(seed);
+            long clock = random.NextInt64(long.MinValue / 2, long.MaxValue / 2);
+            long bound = clock + Days(1) + Spans[^1];
+            var times = new long[5_000];
+            for (int i = 0; i < times.Length; i++)
+            {
+                times[i] = random.NextInt64(clock + 1, bound);
+            }
+            yield return new object[] { clock, random.NextInt64(clock + 1, bound), times };
+        }
+    }
+
+    /// <summary>
+    /// The delay until the wheel next flushes a bucket that holds a timer, or <see cref="long.MaxValue"/>
+    /// if it is empty. A bucket is flushed when the wheel reaches its tick, so the current bucket, whose
+    /// tick has passed, is flushed by the next tick.
+    /// </summary>
+    private static long NextFlushDelay(TimerWheel<long, string> wheel)
+    {
+        long delay = long.MaxValue;
+        for (int i = 0; i < Shift.Length; i++)
+        {
+            long ticks = wheel.Nanos >>> Shift[i];
+            Node<long, string>[] buckets = Wheel(wheel)[i];
+            int mask = buckets.Length - 1;
+            for (int j = 0; j < buckets.Length; j++)
+            {
+                if (GetTimers(buckets[j]).Count == 0)
+                {
+                    continue;
+                }
+                long ahead = Math.Max(1, (j - ticks) & mask);
+                delay = Math.Min(delay, (ahead << Shift[i]) - (wheel.Nanos & (Spans[i] - 1)));
+            }
+        }
+        return delay;
+    }
+
+    [Fact]
     public void GetExpirationDelay_MeasuredFromCurrentTime()
     {
         // An advance that stops at its limit leaves the wheel's clock behind the current time, so the
