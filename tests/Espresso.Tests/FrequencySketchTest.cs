@@ -42,7 +42,7 @@ public sealed class FrequencySketchTest
         sketch.EnsureCapacity(size / 2);
         Assert.Equal(size, sketch.table!.Length);
         Assert.Equal(10 * size / 2, sketch.sampleSize);
-        Assert.Equal((size >> 3) - 1, sketch.blockMask);
+        Assert.Equal(BitOperations.LeadingZeroCount((uint)((size >> 3) - 1)), sketch.blockShift);
     }
 
     [Fact]
@@ -128,7 +128,7 @@ public sealed class FrequencySketchTest
         sketch.EnsureCapacity(2L * size);
         Assert.Equal(2 * size, sketch.table!.Length);
         Assert.Equal(10 * 2 * size, sketch.sampleSize);
-        Assert.Equal(((2 * size) >> 3) - 1, sketch.blockMask);
+        Assert.Equal(BitOperations.LeadingZeroCount((uint)(((2 * size) >> 3) - 1)), sketch.blockShift);
     }
 
     [Fact]
@@ -139,7 +139,7 @@ public sealed class FrequencySketchTest
         sketch.EnsureCapacity(size);
         Assert.Equal(int.MaxValue, sketch.sampleSize);
         Assert.Equal(Common.CeilingPowerOfTwo(size), sketch.table!.Length);
-        Assert.Equal((sketch.table!.Length >> 3) - 1, sketch.blockMask);
+        Assert.Equal(BitOperations.LeadingZeroCount((uint)((sketch.table!.Length >> 3) - 1)), sketch.blockShift);
     }
 
     [Fact]
@@ -199,6 +199,38 @@ public sealed class FrequencySketchTest
         Assert.Equal(1, sketch.Frequency(_item));
         Assert.Equal(1, sketch.Frequency(_item + 1));
         Assert.Equal(0, sketch.Frequency(_item + 2));
+    }
+
+    [Fact]
+    public void Increment_SpreadsAcrossBlock()
+    {
+        // An element's four counters are selected from the four 16-byte segments of its block, so 64
+        // distinct additions per block leave about e^-2 (14%) of each segment's counters unused
+        for (int maximum = 1 << 14; maximum <= 1 << 22; maximum <<= 2)
+        {
+            var sketch = MakeSketch(maximum);
+            for (int i = 0; i < 8 * maximum; i++)
+            {
+                sketch.Increment(i);
+            }
+            var unused = new long[4];
+            long[] table = sketch.table!;
+            for (int i = 0; i < table.Length; i++)
+            {
+                for (int j = 0; j < 64; j += 4)
+                {
+                    if (((table[i] >>> j) & 0xfL) == 0)
+                    {
+                        unused[(i >>> 1) & 3]++;
+                    }
+                }
+            }
+            for (int segment = 0; segment < 4; segment++)
+            {
+                Assert.True(unused[segment] < table.Length,
+                    $"maximum {maximum}, segment {segment}: {unused[segment]} unused of {table.Length * 4}");
+            }
+        }
     }
 
     [Fact]

@@ -19,7 +19,11 @@ internal sealed class FrequencySketch
      * A 4-bit CountMinSketch with periodic aging providing the popularity history for the TinyLFU
      * admission policy. The counter matrix is a single long[] holding 16 counters per slot, with an
      * item's counters constrained to a 64-byte block to keep the memory accesses within one L1 cache
-     * line. Frequencies are aged periodically (the reset operation) by halving every counter.
+     * line. Items are distributed to blocks by the high bits of their hash, and each counter is
+     * selected from a distinct 16-byte segment by a byte of the item's rehash; the rehash's low bits
+     * depend only on the hash's low bits, so a block chosen from those same bits would correlate the
+     * counters of every item in it. Frequencies are aged periodically (the reset operation) by
+     * halving every counter.
      */
 
     internal const long ResetMask = 0x7777777777777777L;
@@ -27,7 +31,7 @@ internal sealed class FrequencySketch
     internal const int MinSketchSize = 256;
 
     internal int sampleSize;
-    internal int blockMask;
+    internal int blockShift;
     internal long[]? table;
     internal int size;
 
@@ -62,7 +66,7 @@ internal sealed class FrequencySketch
         }
 
         table = new long[Common.CeilingPowerOfTwo(maximum)];
-        blockMask = (table.Length >>> 3) - 1;
+        blockShift = BitOperations.LeadingZeroCount((uint)((table.Length >>> 3) - 1));
         sampleSize = sample;
         size = 0;
     }
@@ -87,7 +91,7 @@ internal sealed class FrequencySketch
         int frequency = int.MaxValue;
         int blockHash = Spread(e.GetHashCode());
         int counterHash = Rehash(blockHash);
-        int block = (blockHash & blockMask) << 3;
+        int block = (blockHash >>> blockShift) << 3;
         for (int i = 0; i < 4; i++)
         {
             int h = counterHash >>> (i << 3);
@@ -115,7 +119,7 @@ internal sealed class FrequencySketch
 
         int blockHash = Spread(e.GetHashCode());
         int counterHash = Rehash(blockHash);
-        int block = (blockHash & blockMask) << 3;
+        int block = (blockHash >>> blockShift) << 3;
 
         // Loop unrolling improves throughput.
         int h0 = counterHash;

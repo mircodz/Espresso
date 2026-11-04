@@ -34,7 +34,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private const long MaximumCapacity = long.MaxValue - int.MaxValue;
 
     // Expiration constants.
-    private const int ExpirationThreshold = 1_000;      // max entries expired per maintenance cycle
+    private const int ExpirationThreshold = 1_000;      // expirations per policy after which a cycle defers the rest
     private const long ExpireTolerance = 1_000_000_000; // 1 second, in nanoseconds
 
     // The maximum number of entries that can be transferred between queues per maintenance cycle.
@@ -1017,7 +1017,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         }
         if (_expiresVariable)
         {
-            delay = Math.Min(delay, _timerWheel!.GetExpirationDelay());
+            delay = Math.Min(delay, _timerWheel!.GetExpirationDelay(now));
         }
         return delay;
     }
@@ -1067,9 +1067,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             Node<K, V>? next = ReferenceEquals(node, last) ? null : node.GetNextInAccessOrder();
             if ((now - node.AccessTime) < duration)
             {
-                // A stale position can arise from lock-free access-time updates; re-sort and continue.
-                bool stalePosition = (last.AccessTime - node.AccessTime) < 0;
-                if (stalePosition || IsComputingAsync(node))
+                // Only an in-flight head moves aside. These deques are also the eviction order, and
+                // transfers into a region's tail and the access-time tolerance keep them out of time
+                // order, so moving a live head that is fresher than the tail would reorder the LRU
+                // with nothing expired. A head whose reorder was lost delays reaping the entries
+                // behind it until it is read again or expires.
+                if (IsComputingAsync(node))
                 {
                     deque.MoveToBack(node);
                     node = next;
@@ -1249,25 +1252,30 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _mainProtectedMaximum += quota;
         _windowMaximum -= quota;
 
-        for (int i = 0; i < QueueTransferThreshold; i++)
+        // Zero-weight entries (in-flight async loads) stay in the window, as when evicting from it. In
+        // probation, a completing load would be promoted to protected at full weight without facing
+        // admission.
+        int remaining = QueueTransferThreshold;
+        Node<K, V>? candidate = _windowDeque.PeekFirst;
+        while (candidate != null && quota > 0 && remaining > 0)
         {
-            Node<K, V>? candidate = _windowDeque.PeekFirst;
-            if (candidate == null)
-            {
-                break;
-            }
-
+            Node<K, V>? next = candidate.GetNextInAccessOrder();
             long weight = candidate.PolicyWeight;
-            if (quota < weight)
+            if (weight != 0)
             {
-                break;
-            }
+                if (quota < weight)
+                {
+                    break;
+                }
 
-            quota -= weight;
-            _windowWeightedSize -= weight;
-            _windowDeque.Remove(candidate);
-            _probationDeque.OfferLast(candidate);
-            candidate.MakeMainProbation();
+                quota -= weight;
+                _windowWeightedSize -= weight;
+                _windowDeque.Remove(candidate);
+                _probationDeque.OfferLast(candidate);
+                candidate.MakeMainProbation();
+                remaining--;
+            }
+            candidate = next;
         }
 
         _mainProtectedMaximum -= quota;

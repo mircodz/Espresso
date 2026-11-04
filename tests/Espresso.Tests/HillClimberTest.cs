@@ -820,6 +820,40 @@ public sealed class HillClimberTest : CacheTestBase
     }
 
     [Fact]
+    public void Adapt_DecreaseWindow_InFlightLoadFacesAdmission()
+    {
+        // An in-flight load weighs zero, so it fits any shrink remainder. Moved to probation, its
+        // completion would promote it to protected at full weight without facing the admission filter
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumWeight(Full)
+            .Weigher((_, v) => v.Length)
+            .Executor(DirectExecutor.Instance)
+            .BuildAsync();
+        var local = AsyncLocal.Of(cache);
+        local.WindowMaximum = 10;
+        local.MainProtectedMaximum = (long)(PercentMainProtected * (local.Maximum - local.WindowMaximum));
+        var future = new TaskCompletionSource<string>();
+        cache.Put(-1, future.Task);
+        for (int i = 0; i < local.Maximum; i++)
+        {
+            cache.Put(i, Task.FromResult("v"));
+            AssertThat(cache.GetIfPresent(i)).IsNotNull();
+        }
+        cache.CleanUp();
+
+        lock (local.EvictionLock)
+        {
+            local.Cache.Climber!.CarryOver(-5);
+            local.DecreaseWindow();
+        }
+        future.SetResult(new string('v', 20));
+        cache.CleanUp();
+
+        AssertThat(cache.GetIfPresent(-1)).IsNull();
+        AssertThat(cache.EstimatedSize()).IsEqualTo(local.Maximum);
+    }
+
+    [Fact]
     public void Adapt_IncreaseWindow_TransferCapsAtThreshold()
     {
         // The mirror: growing the window demotes at most QueueTransferThreshold candidates from the
@@ -1270,6 +1304,26 @@ public sealed class HillClimberTest : CacheTestBase
         }
 
         public static AsyncLocal Of(IAsyncCache<int, string> cache) => new(cache);
+
+        private static FieldInfo Field(string name)
+            => Type.GetField(name, Flags) ?? throw new InvalidOperationException($"field {name} not found");
+
+        private long Get(string name) => (long)Field(name).GetValue(Cache)!;
+
+        private void Set(string name, long value) => Field(name).SetValue(Cache, value);
+
+        public object EvictionLock => Field("_evictionLock").GetValue(Cache)!;
+        public long Maximum => Get("_maximum");
+        public long WindowMaximum { get => Get("_windowMaximum"); set => Set("_windowMaximum", value); }
+        public long MainProtectedMaximum
+        {
+            get => Get("_mainProtectedMaximum");
+            set => Set("_mainProtectedMaximum", value);
+        }
+
+        public void DecreaseWindow()
+            => (Type.GetMethod("DecreaseWindow", Flags)
+                ?? throw new InvalidOperationException("method DecreaseWindow not found")).Invoke(Cache, null);
 
         public FrequencySketch Sketch => (FrequencySketch)Type.GetField("_sketch", Flags)!.GetValue(Cache)!;
 

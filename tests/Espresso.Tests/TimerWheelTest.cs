@@ -278,23 +278,27 @@ public sealed class TimerWheelTest
     [Fact]
     public void Advance_ReentrantDeschedule_PreservesRemainderAfterBudget()
     {
+        // The budget runs out in the first bucket, which is flushed whole while an eviction callback
+        // deschedules one of its timers; the second bucket is left intact for the next advance
         var wheel = new TimerWheel<long, string>();
         var timers = Enumerable.Range(0, 4).Select(_ => new Timer(Spans[0])).ToArray();
-        foreach (var timer in timers) wheel.Schedule(timer);
+        var later = Enumerable.Range(0, 2).Select(_ => new Timer(2 * Spans[0])).ToArray();
+        foreach (var timer in timers.Concat(later)) wheel.Schedule(timer);
         var cache = new CountingCache(_ =>
         {
             wheel.Deschedule(timers[1]);
             return true;
         });
 
-        Assert.Equal(0, wheel.Advance(cache, 2 * Spans[0], 1));
+        Assert.Equal(0, wheel.Advance(cache, 3 * Spans[0], 1));
 
         Assert.Equal(0L, wheel.Nanos);
-        Assert.Equal(new Node<long, string>[] { timers[2], timers[3] }, wheel.ToArray());
-        Assert.Same(timers[2], timers[3].PreviousInVariableOrder);
+        Assert.Equal(new Node<long, string>[] { timers[0], timers[2], timers[3] }, cache.Evicted);
+        Assert.Equal(new Node<long, string>[] { later[0], later[1] }, wheel.ToArray());
+        Assert.Same(later[0], later[1].PreviousInVariableOrder);
         var retry = new CountingCache();
-        Assert.Equal(8, wheel.Advance(retry, 2 * Spans[0], 10));
-        Assert.Equal(new Node<long, string>[] { timers[2], timers[3] }, retry.Evicted);
+        Assert.Equal(8, wheel.Advance(retry, 3 * Spans[0], 10));
+        Assert.Equal(new Node<long, string>[] { later[0], later[1] }, retry.Evicted);
         CheckEmpty(wheel);
     }
 
@@ -366,18 +370,21 @@ public sealed class TimerWheelTest
         {
             wheel.Schedule(new Timer(Spans[0]));
         }
+        var next = new Timer(2 * Spans[0]);
+        wheel.Schedule(next);
 
+        // The limit is checked between buckets, so the advance flushes the first bucket whole and
+        // rewinds before the next one
         long advanceTo = 13 * Spans[0];
         Assert.Equal(0, wheel.Advance(cache, advanceTo, ExpirationThreshold));
         Assert.Equal(0L, wheel.Nanos);
-        Assert.Equal(ExpirationThreshold, cache.Evicted.Count);
+        Assert.Equal(count, cache.Evicted.Count);
+        Assert.Equal(new Node<long, string>[] { next }, wheel.ToArray());
 
-        Assert.Equal(0, wheel.Advance(cache, advanceTo, ExpirationThreshold));
-        Assert.Equal(2 * ExpirationThreshold, cache.Evicted.Count);
-
+        // The final advance drains the last bucket and fully advances the clock with budget to spare
         Assert.True(wheel.Advance(cache, advanceTo, ExpirationThreshold) > 0);
         Assert.Equal(advanceTo, wheel.Nanos);
-        Assert.Equal(count, cache.Evicted.Count);
+        Assert.Equal(count + 1, cache.Evicted.Count);
         CheckTimerWheel(wheel, advanceTo);
     }
 
@@ -417,7 +424,7 @@ public sealed class TimerWheelTest
     {
         var wheel = new TimerWheel<long, string>();
         wheel.Nanos = clock;
-        Assert.Equal(long.MaxValue, wheel.GetExpirationDelay());
+        Assert.Equal(long.MaxValue, wheel.GetExpirationDelay(clock));
     }
 
     [Theory]
@@ -427,7 +434,7 @@ public sealed class TimerWheelTest
         var wheel = new TimerWheel<long, string>();
         wheel.Nanos = clock;
         wheel.Schedule(new Timer(clock + Seconds(1)));
-        long result = wheel.GetExpirationDelay();
+        long result = wheel.GetExpirationDelay(clock);
         Assert.True(result > 0L);
         Assert.True(result <= Spans[0]);
     }
@@ -440,7 +447,7 @@ public sealed class TimerWheelTest
         wheel.Nanos = clock;
         long delay = Days(14);
         wheel.Schedule(new Timer(clock + delay));
-        long result = wheel.GetExpirationDelay();
+        long result = wheel.GetExpirationDelay(clock);
         Assert.True(result > 0L);
         Assert.True(result <= delay);
     }
@@ -451,7 +458,119 @@ public sealed class TimerWheelTest
         var wheel = new TimerWheel<long, string>();
         wheel.Nanos = 0L;
         wheel.Schedule(new Timer(Spans[0]));
-        Assert.True(wheel.GetExpirationDelay() < Spans[1]);
+        Assert.True(wheel.GetExpirationDelay(0L) < Spans[1]);
+    }
+
+    [Fact]
+    public void GetExpirationDelay_OccupiedCurrentBucket()
+    {
+        var cache = new CountingCache();
+        var wheel = new TimerWheel<long, string>();
+        long clock = Spans[1];
+        wheel.Nanos = clock;
+
+        // Due at the next wheel[1] tick, so held one bucket ahead of the current one
+        wheel.Schedule(new Timer(clock + Spans[1]));
+
+        // Advance to just shy of that tick, leaving the event Spans[0] away
+        long offset = Spans[1] - Spans[0];
+        wheel.Advance(cache, clock + offset, int.MaxValue);
+
+        // A timer a full wheel[1] revolution out wraps onto the current bucket; it must not mask the
+        // event in the next one
+        wheel.Schedule(new Timer(clock + offset + Spans[2] - 1));
+
+        Assert.True(wheel.GetExpirationDelay(clock + offset) <= Spans[1] - offset);
+    }
+
+    [Fact]
+    public void GetExpirationDelay_OccupiedCurrentBucket_HigherWheel()
+    {
+        // Just shy of a wheel[1] tick
+        var wheel = new TimerWheel<long, string>();
+        long clock = 2 * Spans[1] - Spans[0];
+        wheel.Nanos = clock;
+
+        // A timer a full wheel[1] revolution out wraps onto the current bucket
+        wheel.Schedule(new Timer(clock + Spans[2] - 1));
+
+        // A later timer in wheel[0] is found first, so wheel[1] is only peeked at
+        wheel.Schedule(new Timer(clock + 10 * Spans[0]));
+
+        // The occupied current bucket is flushed when wheel[1] next ticks
+        Assert.Equal(Spans[0], wheel.GetExpirationDelay(clock));
+    }
+
+    [Theory]
+    [MemberData(nameof(FuzzyData))]
+    public void GetExpirationDelay_Fuzzy(long clock, long duration, long[] times)
+    {
+        var wheel = new TimerWheel<long, string>();
+        wheel.Nanos = clock;
+        foreach (long timeout in times)
+        {
+            wheel.Schedule(new Timer(timeout));
+        }
+        wheel.Advance(new CountingCache(), duration, int.MaxValue);
+
+        Assert.Equal(NextFlushDelay(wheel), wheel.GetExpirationDelay(duration));
+    }
+
+    public static IEnumerable<object[]> FuzzyData()
+    {
+        for (int seed = 0; seed < 8; seed++)
+        {
+            var random = new Random(seed);
+            long clock = random.NextInt64(long.MinValue / 2, long.MaxValue / 2);
+            long bound = clock + Days(1) + Spans[^1];
+            var times = new long[5_000];
+            for (int i = 0; i < times.Length; i++)
+            {
+                times[i] = random.NextInt64(clock + 1, bound);
+            }
+            yield return new object[] { clock, random.NextInt64(clock + 1, bound), times };
+        }
+    }
+
+    /// <summary>
+    /// The delay until the wheel next flushes a bucket that holds a timer, or <see cref="long.MaxValue"/>
+    /// if it is empty. A bucket is flushed when the wheel reaches its tick, so the current bucket, whose
+    /// tick has passed, is flushed by the next tick.
+    /// </summary>
+    private static long NextFlushDelay(TimerWheel<long, string> wheel)
+    {
+        long delay = long.MaxValue;
+        for (int i = 0; i < Shift.Length; i++)
+        {
+            long ticks = wheel.Nanos >>> Shift[i];
+            Node<long, string>[] buckets = Wheel(wheel)[i];
+            int mask = buckets.Length - 1;
+            for (int j = 0; j < buckets.Length; j++)
+            {
+                if (GetTimers(buckets[j]).Count == 0)
+                {
+                    continue;
+                }
+                long ahead = Math.Max(1, (j - ticks) & mask);
+                delay = Math.Min(delay, (ahead << Shift[i]) - (wheel.Nanos & (Spans[i] - 1)));
+            }
+        }
+        return delay;
+    }
+
+    [Fact]
+    public void GetExpirationDelay_MeasuredFromCurrentTime()
+    {
+        // An advance that stops at its limit leaves the wheel's clock behind the current time, so the
+        // delay is measured from the current time and an overdue bucket reads as due
+        var wheel = new TimerWheel<long, string>();
+        wheel.Nanos = 0L;
+        wheel.Schedule(new Timer(2 * Spans[0]));
+        long delay = wheel.GetExpirationDelay(0L);
+
+        Assert.Equal(delay - Spans[0], wheel.GetExpirationDelay(Spans[0]));
+        Assert.True(wheel.GetExpirationDelay(4 * Spans[0]) < 0);
+        Assert.Equal(delay, wheel.GetExpirationDelay(-Spans[0]));
     }
 
     [Theory]

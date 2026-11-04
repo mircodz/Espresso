@@ -528,6 +528,106 @@ public sealed class ExpirationTest : CacheTestBase
         }
     }
 
+    [Fact]
+    public void AccessScan_DemotedTail_KeepsProbationOrder()
+    {
+        // A protected entry demoted to probation's tail keeps its older access time, so the region is
+        // not in access-time order, and a scan that expires nothing must leave the eviction order alone
+        var ticker = new FakeTicker();
+        using var cache = Cache.NewBuilder<int, string>().MaximumSize(10).ExpireAfterAccess(OneMinute)
+            .Ticker(ticker.Read).Executor(DirectExecutor.Instance).Build();
+        for (int i = 1; i <= 8; i++)
+        {
+            ticker.Advance(TimeSpan.FromSeconds(1));
+            cache.Put(i, "v" + i);
+        }
+        ticker.Advance(TimeSpan.FromSeconds(2));
+        for (int i = 1; i <= 7; i++)
+        {
+            Assert.NotNull(cache.GetIfPresent(i));
+        }
+        cache.CleanUp();
+
+        const int demoted = 1, promoted = 8, graduate = 9;
+        ticker.Advance(TimeSpan.FromSeconds(20));
+        cache.Put(graduate, "v" + graduate);
+        ticker.Advance(TimeSpan.FromSeconds(1));
+        cache.Put(10, "v10");
+        ticker.Advance(TimeSpan.FromSeconds(9));
+        Assert.NotNull(cache.GetIfPresent(promoted));
+        cache.CleanUp();
+        var probation = Field<ILinkedDeque<Node<int, string>>>(cache, "_probationDeque");
+        Assert.Equal(new[] { graduate, demoted }, KeysOf(probation));
+
+        ticker.Advance(TimeSpan.FromSeconds(5));
+        cache.CleanUp();
+        Assert.Equal(new[] { graduate, demoted }, KeysOf(probation));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Schedule_WriteDuringCycle_WaitsForNextExpiration(bool access)
+    {
+        // The listener's write stands in for a concurrent write landing while the cycle runs. The fire
+        // expires the first entry and nothing reaches a limit, so the next fire waits for the second
+        // entry rather than coming at once
+        var ticker = new FakeTicker();
+        var scheduler = new CapturingScheduler();
+        ICache<int, string>? cache = null;
+        var builder = Cache.NewBuilder<int, string>()
+            .Scheduler(scheduler)
+            .Ticker(ticker.Read)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener(new Listener((_, _, _) => cache!.Put(3, "c")));
+        if (access) builder.ExpireAfterAccess(OneMinute);
+        else builder.ExpireAfterWrite(OneMinute);
+        cache = builder.Build();
+        using (cache)
+        {
+            cache.Put(1, "a");
+            ticker.Advance(TimeSpan.FromSeconds(50));
+            cache.Put(2, "b");
+            Assert.Single(scheduler.Scheduled);
+
+            ticker.Advance(TimeSpan.FromSeconds(11));
+            scheduler.Scheduled[0].Command();
+
+            Assert.Equal(2, scheduler.Scheduled.Count);
+            long expected = TimeSpan.FromSeconds(49).Ticks * 100L;
+            long delay = scheduler.Scheduled[1].DelayNanos;
+            Assert.InRange(delay, expected - Pacer.Tolerance, expected + Pacer.Tolerance);
+        }
+    }
+
+    /// <summary>Records each scheduled maintenance task and its delay without running it.</summary>
+    private sealed class CapturingScheduler : IScheduler
+    {
+        public readonly List<(Action Command, long DelayNanos)> Scheduled = new();
+
+        public IScheduledFuture Schedule(IExecutor executor, Action command, TimeSpan delay)
+        {
+            Scheduled.Add((command, delay.Ticks * 100L));
+            return new PendingFuture();
+        }
+
+        private sealed class PendingFuture : IScheduledFuture
+        {
+            public bool IsDone { get; private set; }
+            public void Cancel() => IsDone = true;
+        }
+    }
+
+    private static List<int> KeysOf(ILinkedDeque<Node<int, string>> deque)
+    {
+        var keys = new List<int>();
+        foreach (var node in deque)
+        {
+            keys.Add(node.Key);
+        }
+        return keys;
+    }
+
     private sealed class Listener : IRemovalListener<int, string>
     {
         private readonly Action<int, string?, RemovalCause> _onRemoval;
