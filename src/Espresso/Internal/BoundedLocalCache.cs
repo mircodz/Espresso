@@ -1257,7 +1257,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         // admission.
         int remaining = QueueTransferThreshold;
         Node<K, V>? candidate = _windowDeque.PeekFirst;
-        while (candidate != null && remaining > 0)
+        while (candidate != null && quota > 0 && remaining > 0)
         {
             Node<K, V>? next = candidate.GetNextInAccessOrder();
             long weight = candidate.PolicyWeight;
