@@ -60,6 +60,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly Ticker _statsTicker;
     private readonly IWeigher<K, V> _weigher;
     private readonly ICacheLoader<K, V>? _loader;
+    private readonly bool _hasLoadAll;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ThrowIfKeyNull(K key, [CallerArgumentExpression(nameof(key))] string? param = null)
@@ -176,6 +177,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _statsTicker = config.StatsTicker;
         _weigher = config.Weigher;
         _loader = loader;
+        _hasLoadAll = loader != null && LocalLoadingCache.HasLoadAll(loader);
 
         _evicts = config.Evicts;
         _isWeighted = config.IsWeighted;
@@ -2878,18 +2880,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     IReadOnlyDictionary<K, V> ILoadingCache<K, V>.GetAll(IEnumerable<K> keys)
     {
         RequireLoader();
-        ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        foreach (K key in keys)
-        {
-            if (result.ContainsKey(key)) continue;
-            V? value = ComputeIfAbsent(key, k => _loader!.Load(k), recordStats: true);
-            if (value != null)
-            {
-                result[key] = value;
-            }
-        }
-        return result;
+        return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _statsTicker, keys);
     }
 
     void ILoadingCache<K, V>.Refresh(K key)

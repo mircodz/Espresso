@@ -26,7 +26,10 @@ public interface ILoadingCache<K, V> : ICache<K, V>
 
     /// <summary>
     /// Returns the values for <paramref name="keys"/>, loading any that are absent. The returned map
-    /// contains the entries that were cached or successfully loaded.
+    /// contains the entries that were cached or successfully loaded. If the loader overrides
+    /// <see cref="ICacheLoader{K,V}.LoadAll"/>, the absent keys are loaded in one call and every entry
+    /// it returns is cached, including keys that were not requested; otherwise each absent key is
+    /// loaded with <see cref="ICacheLoader{K,V}.Load"/>, once per distinct key.
     /// </summary>
     IReadOnlyDictionary<K, V> GetAll(IEnumerable<K> keys);
 

@@ -19,6 +19,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     private readonly IExecutor _executor;
     private readonly Ticker _ticker;
     private readonly ICacheLoader<K, V>? _loader;
+    private readonly bool _hasLoadAll;
 
     internal UnboundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)
     {
@@ -28,6 +29,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         _executor = config.Executor;
         _ticker = config.StatsTicker; // used only to time loads
         _loader = loader;
+        _hasLoadAll = loader != null && LocalLoadingCache.HasLoadAll(loader);
     }
 
     // ----- Cache -----
@@ -204,22 +206,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     public IReadOnlyDictionary<K, V> GetAll(IEnumerable<K> keys)
     {
         RequireLoader();
-        ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        foreach (K key in keys)
-        {
-            ThrowIfKeyNull(key);
-            if (result.ContainsKey(key))
-            {
-                continue;
-            }
-            V? value = Get(key);
-            if (value != null)
-            {
-                result[key] = value;
-            }
-        }
-        return result;
+        return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _ticker, keys);
     }
 
     public void Refresh(K key)

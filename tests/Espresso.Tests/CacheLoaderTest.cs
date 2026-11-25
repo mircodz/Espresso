@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Espresso.Internal;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -76,5 +77,39 @@ public sealed class CacheLoaderTest
         Assert.Equal("v4", result);
         Assert.Equal(1, loader.Calls);
         Assert.Equal(source.Token, loader.LastToken);
+    }
+
+    private class ImplicitBulkLoader : ICacheLoader<int, string>
+    {
+        public string? Load(int key) => null;
+        public IReadOnlyDictionary<int, string> LoadAll(IEnumerable<int> keys) => new Dictionary<int, string>();
+    }
+
+    private sealed class DerivedBulkLoader : ImplicitBulkLoader;
+
+    private sealed class ExplicitBulkLoader : ICacheLoader<int, string>
+    {
+        public string? Load(int key) => null;
+        IReadOnlyDictionary<int, string> ICacheLoader<int, string>.LoadAll(IEnumerable<int> keys) => new Dictionary<int, string>();
+    }
+
+    private interface IBulkLoader : ICacheLoader<int, string>
+    {
+        IReadOnlyDictionary<int, string> ICacheLoader<int, string>.LoadAll(IEnumerable<int> keys) => new Dictionary<int, string>();
+    }
+
+    private sealed class InterfaceBulkLoader : IBulkLoader
+    {
+        public string? Load(int key) => null;
+    }
+
+    [Fact]
+    public void HasLoadAll_DetectsAnOverrideOfTheDefaultImplementation()
+    {
+        Assert.False(LocalLoadingCache.HasLoadAll<int, string>(new SyncLoader()));
+        Assert.True(LocalLoadingCache.HasLoadAll<int, string>(new ImplicitBulkLoader()));
+        Assert.True(LocalLoadingCache.HasLoadAll<int, string>(new DerivedBulkLoader()));
+        Assert.True(LocalLoadingCache.HasLoadAll<int, string>(new ExplicitBulkLoader()));
+        Assert.True(LocalLoadingCache.HasLoadAll<int, string>(new InterfaceBulkLoader()));
     }
 }
