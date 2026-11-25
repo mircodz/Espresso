@@ -14,7 +14,8 @@ public interface IAsyncCacheLoader<K, V>
 {
     /// <summary>
     /// Asynchronously computes or retrieves the value for <paramref name="key"/>. The returned task
-    /// should complete with <c>null</c> (or fault) if there is no value; the entry is then not cached.
+    /// should complete with <c>null</c> (or fault) if there is no value; the entry is then not cached,
+    /// and a caller's future completes with <c>null</c> (or faults) likewise.
     /// </summary>
     Task<V?> AsyncLoad(K key, CancellationToken cancellationToken);
 

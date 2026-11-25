@@ -95,7 +95,7 @@ public class InFlightPutTimestampsTest
         s.Clock.Set(12);
         load.SetResult("loaded");
 
-        Task<string>? hit = s.Async.GetIfPresent(K);
+        Task<string?>? hit = s.Async.GetIfPresent(K);
         Assert.NotNull(hit);
         Assert.Equal("loaded", await hit!);
         AssertWeightsConsistent(s);
@@ -123,7 +123,7 @@ public class InFlightPutTimestampsTest
 
         load.SetResult("loaded");
 
-        Task<string>? hit = s.Async.GetIfPresent(K);
+        Task<string?>? hit = s.Async.GetIfPresent(K);
         Assert.NotNull(hit);
         Assert.Equal("loaded", await hit!);
         AssertWeightsConsistent(s);

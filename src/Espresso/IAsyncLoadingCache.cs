@@ -12,9 +12,15 @@ public interface IAsyncLoadingCache<K, V> : IAsyncCache<K, V>
     where K : notnull
     where V : class
 {
-    /// <summary>Returns the future for <paramref name="key"/>, loading it via the loader if absent.</summary>
-    Task<V> Get(K key);
+    /// <summary>
+    /// Returns the future for <paramref name="key"/>, loading it via the loader if absent. If the load
+    /// produces <c>null</c> the future completes with <c>null</c> and the entry is removed.
+    /// </summary>
+    Task<V?> Get(K key);
 
-    /// <summary>Returns a future of the values for <paramref name="keys"/>, bulk-loading any absent.</summary>
+    /// <summary>
+    /// Returns a future of the values for <paramref name="keys"/>, bulk-loading any absent. A key whose
+    /// load produces no value is left out of the result.
+    /// </summary>
     Task<IReadOnlyDictionary<K, V>> GetAll(IEnumerable<K> keys);
 }

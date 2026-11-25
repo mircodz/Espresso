@@ -90,11 +90,11 @@ public sealed class AsyncRefreshTest
         _ = cache.GetIfPresent(1); // starts the reload
         Assert.Equal(1, loader.Reloads);
 
-        Task<string>? present = cache.GetIfPresent(1);
+        Task<string?>? present = cache.GetIfPresent(1);
         Assert.NotNull(present);
         Assert.True(present!.IsCompletedSuccessfully);
         Assert.Equal("v1", await present);
-        Task<string> loaded = cache.Get(1);
+        Task<string?> loaded = cache.Get(1);
         Assert.True(loaded.IsCompletedSuccessfully);
         Assert.Equal("v1", await loaded);
         Assert.Equal(1, loader.Reloads); // the in-flight reload debounces later reads
@@ -117,14 +117,14 @@ public sealed class AsyncRefreshTest
         clock.Advance(TimeSpan.FromSeconds(61));
         _ = cache.GetIfPresent(1); // starts a reload that never completes
 
-        Task<string> served = cache.Get(1);
+        Task<string?> served = cache.Get(1);
         Assert.True(served.IsCompletedSuccessfully);
         Assert.Equal("v1", await served);
 
         // The old value keeps its original write time, so it expires on schedule.
         clock.Advance(TimeSpan.FromSeconds(64)); // 125s after the write
         Assert.Null(cache.GetIfPresent(1));
-        Task<string> reloaded = cache.Get(1);
+        Task<string?> reloaded = cache.Get(1);
         Assert.True(reloaded.IsCompletedSuccessfully);
         Assert.Equal(2, loader.Loads);
     }
@@ -183,7 +183,7 @@ public sealed class AsyncRefreshTest
 
         Assert.Equal("v1", await cache.Get(1));
         clock.Advance(TimeSpan.FromSeconds(61));
-        Task<string>? present = cache.GetIfPresent(1);
+        Task<string?>? present = cache.GetIfPresent(1);
         Assert.Equal("v1", await present!);
         Assert.Equal("v1", await cache.GetIfPresent(1)!);
         Assert.Equal(2, loader.Reloads); // nothing stays registered after a failure to start

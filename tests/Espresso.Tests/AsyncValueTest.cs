@@ -30,10 +30,18 @@ public sealed class AsyncValueTest
     [Fact]
     public void IsReady_NullOrIncompleteOrFailed_False()
     {
-        Assert.False(AsyncValue.IsReady(null));
+        Assert.False(AsyncValue.IsReady<string>(null));
         Assert.False(AsyncValue.IsReady(new TaskCompletionSource<string>().Task)); // in-flight
         Assert.False(AsyncValue.IsReady(Faulted()));
         Assert.False(AsyncValue.IsReady(Canceled()));
+    }
+
+    [Fact]
+    public void IsReady_CompletedWithNull_False()
+    {
+        // Caffeine's Async.isReady: a future without a value is not ready, so the engine keeps treating
+        // it as in flight until its completion removes it.
+        Assert.False(AsyncValue.IsReady(Task.FromResult<string>(null!)));
     }
 
     [Fact]

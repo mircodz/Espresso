@@ -27,6 +27,8 @@ internal readonly struct CacheConfiguration<K, V>
     public bool Evicts { get; init; }
     public bool IsWeighted { get; init; }
     public bool IsAsync { get; init; }
+    /// <summary>For an async cache, whether a stored future holds its value (see <see cref="AsyncValue.IsReady"/>).</summary>
+    public System.Func<V, bool>? IsAsyncValueReady { get; init; }
     public bool ExpiresAfterWrite { get; init; }
     public bool ExpiresAfterAccess { get; init; }
     public bool ExpiresVariable { get; init; }

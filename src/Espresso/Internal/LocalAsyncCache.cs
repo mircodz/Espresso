@@ -13,6 +13,12 @@ namespace Espresso.Internal;
 /// itself (<c>Task&lt;V&gt;</c>). Loading stores the incomplete future immediately and atomically; a
 /// completion continuation then either removes the entry (on failure/null) or refreshes its weight and
 /// expiry timestamps (on success).
+/// <para>
+/// The store declares its futures as <c>Task&lt;V&gt;</c>, but as in Caffeine a stored future may
+/// complete with <c>null</c> (a load that produced no value, or a written future that did): the caller
+/// observes <c>null</c>, and the completion removes the entry. The public API surfaces them as
+/// <c>Task&lt;V?&gt;</c> (the same runtime type).
+/// </para>
 /// </summary>
 internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     where K : notnull
@@ -22,21 +28,21 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
 
     internal LocalAsyncCache(BoundedLocalCache<K, Task<V>> cache) => Cache = cache;
 
-    public Task<V>? GetIfPresent(K key) => Cache.GetIfPresent(key, recordStats: true);
+    public Task<V?>? GetIfPresent(K key) => Cache.GetIfPresent(key, recordStats: true)!;
 
-    public Task<V> Get(K key, Func<K, V?> mappingFunction)
+    public Task<V?> Get(K key, Func<K, V?> mappingFunction)
     {
         ArgumentNullException.ThrowIfNull(mappingFunction);
         return Get(key, (k, _) => RunOnExecutor(() => mappingFunction(k)));
     }
 
-    public Task<V> Get(K key, Func<K, CancellationToken, Task<V?>> mappingFunction)
+    public Task<V?> Get(K key, Func<K, CancellationToken, Task<V?>> mappingFunction)
     {
         ArgumentNullException.ThrowIfNull(mappingFunction);
         return GetInternal(key, mappingFunction, recordStats: true);
     }
 
-    private protected Task<V> GetInternal(
+    private protected Task<V?> GetInternal(
         K key, Func<K, CancellationToken, Task<V?>> mappingFunction, bool recordStats)
     {
         Task<V>? present = Cache.GetIfPresent(key, recordStats: false);
@@ -46,10 +52,10 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             {
                 Cache.StatsCounter.RecordHits(1);
             }
-            return present;
+            return present!;
         }
 
-        return Load(key, mappingFunction, recordStats);
+        return Load(key, mappingFunction, recordStats)!;
     }
 
     /// <summary>
@@ -258,8 +264,9 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
     }
 
     /// <summary>
-    /// Completes <paramref name="tcs"/> with the outcome of <paramref name="source"/>: a fault or a
-    /// cancellation is propagated, and a null result faults it.
+    /// Completes <paramref name="tcs"/> with the outcome of <paramref name="source"/>: a fault, a
+    /// cancellation or a result (including <c>null</c>, which <see cref="HandleCompletion"/> then
+    /// removes and records as a failure, as Caffeine does) is propagated.
     /// </summary>
     private static void Link(Task<V?> source, TaskCompletionSource<V> tcs)
     {
@@ -274,14 +281,9 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
             {
                 tcs.TrySetCanceled();
             }
-            else if (t.Result == null)
-            {
-                // A null load fails the stored future so HandleCompletion removes the entry.
-                tcs.TrySetException(new NullValueException());
-            }
             else
             {
-                tcs.TrySetResult(t.Result);
+                tcs.TrySetResult(t.Result!);
             }
         }, tcs, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
@@ -473,6 +475,7 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
                 // The proxy is still faulted below, so it cannot strand a reader.
             }
             entry.Value.TrySetException(failure);
+            _ = entry.Value.Task.Exception; // reported to the caller; coalesced readers observe it too
         }
     }
 
@@ -525,9 +528,4 @@ internal class LocalAsyncCache<K, V> : IAsyncCache<K, V>
 
     /// <summary>Releases background resources by disposing the underlying future-typed store.</summary>
     public void Dispose() => Cache.Dispose();
-
-    /// <summary>Marks a null async load so the stored future faults and the entry is removed.</summary>
-    internal sealed class NullValueException : Exception
-    {
-    }
 }

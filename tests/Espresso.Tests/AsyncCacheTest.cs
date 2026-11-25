@@ -35,7 +35,7 @@ public sealed class AsyncCacheTest
     {
         var cache = NewCache();
 
-        Task<string> future = cache.Get(1, k => "v" + k);
+        Task<string?> future = cache.Get(1, k => "v" + k);
 
         Assert.Equal("v1", await future);
     }
@@ -48,8 +48,8 @@ public sealed class AsyncCacheTest
         int loaderCalls = 0;
 
         // Task-returning overload lets the test control completion timing.
-        Task<string> f1 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
-        Task<string> f2 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
+        Task<string?> f1 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
+        Task<string?> f2 = cache.Get(1, (_, _) => { Interlocked.Increment(ref loaderCalls); return gate.Task!; });
 
         Assert.Same(f1, f2);
         Assert.Equal(1, loaderCalls);
@@ -63,7 +63,7 @@ public sealed class AsyncCacheTest
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
+        Task<string?> f = cache.Get(1, (_, _) => gate.Task!);
 
         // While loading, the entry is present and counted.
         Assert.NotNull(cache.GetIfPresent(1));
@@ -79,7 +79,7 @@ public sealed class AsyncCacheTest
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
+        Task<string?> f = cache.Get(1, (_, _) => gate.Task!);
 
         Assert.NotNull(cache.GetIfPresent(1)); // present while loading
         gate.SetException(new InvalidOperationException("boom"));
@@ -93,14 +93,15 @@ public sealed class AsyncCacheTest
     }
 
     [Fact]
-    public async Task Get_NullLoad_RemovesEntry()
+    public async Task Get_NullLoad_CompletesWithNullAndRemovesEntry()
     {
         var cache = NewCache();
 
-        Task<string> f = cache.Get(1, k => null);
+        Task<string?> f = cache.Get(1, k => null);
 
-        await Assert.ThrowsAnyAsync<Exception>(async () => await f);
+        Assert.Null(await f); // completes with null, as in Caffeine, rather than faulting
         Assert.Null(cache.GetIfPresent(1));
+        Assert.Equal(1, cache.Stats().LoadFailureCount);
     }
 
     [Fact]
@@ -110,7 +111,7 @@ public sealed class AsyncCacheTest
 
         cache.Put(1, Task.FromResult("v"));
 
-        Task<string>? f = cache.GetIfPresent(1);
+        Task<string?>? f = cache.GetIfPresent(1);
         Assert.NotNull(f);
         Assert.Equal("v", await f!);
     }
@@ -174,7 +175,7 @@ public sealed class AsyncCacheTest
     public async Task Stats_SuccessfulLoad_CountedExactlyOnce()
     {
         var cache = NewCache();
-        Task<string> f = cache.Get(1, k => "v" + k);
+        Task<string?> f = cache.Get(1, k => "v" + k);
         await f;
         await WaitUntil(() => cache.Stats().LoadSuccessCount == 1);
 
@@ -189,7 +190,7 @@ public sealed class AsyncCacheTest
     {
         var cache = NewCache();
         var gate = new TaskCompletionSource<string>();
-        Task<string> f = cache.Get(1, (_, _) => gate.Task!);
+        Task<string?> f = cache.Get(1, (_, _) => gate.Task!);
         gate.SetException(new InvalidOperationException("x"));
 
         await Assert.ThrowsAnyAsync<Exception>(async () => await f);

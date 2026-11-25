@@ -372,7 +372,11 @@ public sealed class EspressoBuilder<K, V>
         };
 
         // The wrapper is always present, so weights vary only if the user configured a weigher.
-        CacheConfiguration<K, Task<V>> config = inner.ToConfiguration() with { IsWeighted = IsWeighted };
+        CacheConfiguration<K, Task<V>> config = inner.ToConfiguration() with
+        {
+            IsWeighted = IsWeighted,
+            IsAsyncValueReady = AsyncValue.IsReady,
+        };
         return new BoundedLocalCache<K, Task<V>>(config, loader: null);
     }
 }
