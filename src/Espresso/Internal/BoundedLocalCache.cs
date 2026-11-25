@@ -879,8 +879,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 task?.Run();
             }
 
-            ExpireEntries();        // access / write / variable expiration
-            EvictEntries();         // size / weight eviction
+            long now = _ticker.Read();
+            ExpireEntries(now);     // access / write / variable expiration
+            EvictEntries(now);      // size / weight eviction
             Climb();                // adaptive window climbing
         }
         finally
@@ -915,9 +916,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         Volatile.Write(ref _drainStatus, ProcessingToRequired);
     }
 
-    private void ExpireEntries()
+    private void ExpireEntries(long now)
     {
-        long now = _ticker.Read();
         ExpireAfterAccessEntries(now);
         ExpireAfterWriteEntries(now);
         ExpireVariableEntries(now);
@@ -1533,14 +1533,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     // ----- eviction -----
 
-    private void EvictEntries()
+    private void EvictEntries(long now)
     {
         if (!Evicts)
         {
             return;
         }
         Node<K, V>? candidate = EvictFromWindow();
-        EvictFromMain(candidate);
+        EvictFromMain(candidate, now);
     }
 
     private Node<K, V>? EvictFromWindow()
@@ -1567,7 +1567,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         return first;
     }
 
-    private void EvictFromMain(Node<K, V>? candidate)
+    private void EvictFromMain(Node<K, V>? candidate, long now)
     {
         int victimQueue = Node<K, V>.Probation;
         int candidateQueue = Node<K, V>.Probation;
@@ -1614,14 +1614,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = candidate!;
                 candidate = candidate!.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
             if (candidate == null)
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1629,7 +1629,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             if (ReferenceEquals(candidate, victim))
             {
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(candidate, RemovalCause.Size);
+                EvictEntry(candidate, RemovalCause.Size, now);
                 candidate = null;
                 continue;
             }
@@ -1639,14 +1639,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
             if (!candidate.IsAlive)
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1655,7 +1655,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1664,14 +1664,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 candidate = candidate.GetNextInAccessOrder();
             }
             else
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
             }
         }
     }
@@ -1694,7 +1694,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     /// <summary>Removes a victim from the map and policy. Caller holds the eviction lock.</summary>
-    public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now = 0L)
+    public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now)
     {
         // Capture the key reference before the remap can retire the node (retiring swaps it for a
         // sentinel). A node already retired by a concurrent removal is no longer in the map under its
@@ -1771,17 +1771,33 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             lock (n)
             {
                 st.Value = n.Value;
-                st.ActualCause = (n.Key == null || st.Value == null) ? RemovalCause.Collected : st.Cause;
+                // Each predicate is evaluated once: a lock-free writer or a completing future could
+                // otherwise make two evaluations disagree. An expired victim is reported as EXPIRED
+                // whatever the reason it was chosen; an in-flight entry keeps the requested cause.
+                bool expired = st.Cache.HasExpired(n, st.Now);
+                bool computing = st.Cache.IsComputingAsync(st.Value);
+                if (n.Key == null || st.Value == null)
+                {
+                    st.ActualCause = RemovalCause.Collected;
+                }
+                else if (expired && !computing)
+                {
+                    st.ActualCause = RemovalCause.Expired;
+                }
+                else
+                {
+                    st.ActualCause = st.Cause;
+                }
 
                 if (st.ActualCause == RemovalCause.Expired)
                 {
                     // Re-verify: the entry may have been touched since it was queued for expiration.
-                    if (!st.Cache.HasExpired(n, st.Now))
+                    if (!expired)
                     {
                         st.Resurrect = true;
                         return n;
                     }
-                    if (st.Cache.IsComputingAsync(st.Value))
+                    if (computing)
                     {
                         // An in-flight async load never expires. Push its timestamps out to the async
                         // sentinel (restored when the load completes) so the expiration scans and the
@@ -1880,7 +1896,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     if (c._weightedSize > MaximumCapacity)
                     {
-                        c.EvictEntries();
+                        c.EvictEntries(c._ticker.Read());
                     }
                     else
                     {
@@ -1924,7 +1940,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 if (_weight > c._maximum)
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
             else if (c.ExpiresAfterAccess)
@@ -2025,7 +2041,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 c._windowWeightedSize += _weightDifference;
                 if (_node.PolicyWeight > c._maximum)
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
                 else if (_node.PolicyWeight <= c._windowMaximum)
                 {
@@ -2044,7 +2060,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 else
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
             else
@@ -2056,14 +2072,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 else
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
 
             c._weightedSize += _weightDifference;
             if (c._weightedSize > MaximumCapacity)
             {
-                c.EvictEntries();
+                c.EvictEntries(c._ticker.Read());
             }
         }
     }
