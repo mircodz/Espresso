@@ -43,7 +43,7 @@ public sealed class ConcurrentHashMapRecursiveUpdateTest
     [InlineData(true)]
     public void RecursiveAppendMustNotSilentlyOverwriteInnerInsert(bool compute)
     {
-        var map = new ConcurrentHashMap<int, string>(64);
+        var map = new ConcurrentHashMap<int, string>(32); // 64 bins: keys 0, 64 and 128 share bin 0
         map.Put(0, "head");
         string Mapping(int _)
         {
@@ -133,7 +133,8 @@ public sealed class ConcurrentHashMapRecursiveUpdateTest
     [InlineData(true, true)]
     public void CacheGet_RecursivePutThrowsAndPreservesAllCompletedWrites(bool bounded, bool append)
     {
-        var builder = Cache.NewBuilder<int, string>().InitialCapacity(64).Executor(DirectExecutor.Instance);
+        // 64 bins: keys 0, 64 and 128 share bin 0.
+        var builder = Cache.NewBuilder<int, string>().InitialCapacity(32).Executor(DirectExecutor.Instance);
         if (bounded) builder.MaximumSize(100);
         using var cache = builder.Build();
         cache.Put(1, "retained");

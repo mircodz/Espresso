@@ -459,6 +459,37 @@ public sealed class ConcurrentHashMapTest
         }
     }
 
+    // The JDK sizes the table to 1 + initialCapacity / 0.75 bins, so the map holds initialCapacity
+    // entries before its first resize (the builder documents InitialCapacity as the minimum total size).
+    [Theory]
+    [InlineData(12)]
+    [InlineData(100)]
+    [InlineData(1000)]
+    [InlineData(1_000_000)]
+    public void InitialCapacity_HoldsThatManyEntriesWithoutResizing(int capacity)
+    {
+        var map = new ConcurrentHashMap<int, string>(capacity);
+        int before = GetTable(map).Length;
+        for (int k = 0; k < capacity; k++)
+        {
+            map.Put(k, "v");
+        }
+        Assert.Equal(before, GetTable(map).Length);
+        Assert.Equal(capacity, map.Count);
+    }
+
+    [Theory]
+    [InlineData(0, 16)]
+    [InlineData(11, 16)]
+    [InlineData(12, 32)]
+    [InlineData(16, 32)]
+    [InlineData(1000, 2048)]
+    public void InitialCapacity_SizesTableLikeTheJdk(int capacity, int expectedBins)
+    {
+        Assert.Equal(expectedBins, GetTable(new ConcurrentHashMap<int, string>(capacity)).Length);
+        Assert.Equal(16, GetTable(new ConcurrentHashMap<int, string>()).Length);
+    }
+
     private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
         where TKey : notnull where TValue : class
     {

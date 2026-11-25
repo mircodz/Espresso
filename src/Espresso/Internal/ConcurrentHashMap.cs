@@ -29,6 +29,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private const int DefaultCapacity = 16;
     private const int MaximumCapacity = 1 << 30;
     private const int HashBits = 0x7fffffff;
+    private const float LoadFactor = 0.75f;
 
     // Special bin heads carry negative hashes; Spread keeps user hashes non-negative, so a lookup can
     // tell them apart from entries with a single compare instead of type tests.
@@ -866,14 +867,22 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
     private static int LogicalCell(long[] cells, int probe) => (probe & (cells.Length / CounterCellStride - 1)) * CounterCellStride;
 
+    /// <summary>Creates an empty map with the default table size (16 bins), like the JDK's no-arg constructor.</summary>
+    public ConcurrentHashMap()
+    {
+        _table = new Node?[DefaultCapacity];
+        _sizeCtl = DefaultCapacity - (DefaultCapacity >>> 2); // 0.75 load factor threshold
+    }
+
     /// <summary>
-    /// Creates the map. <paramref name="initialCapacity"/> presizes the bin array (fewer resizes).
-    /// <paramref name="concurrencyLevel"/> is an optional lower bound on the initial bin count;
-    /// since locking is per-bin it only nudges the initial
-    /// size and imposes no fixed cap on concurrent writers.
+    /// Creates the map. <paramref name="initialCapacity"/> is the number of entries the map holds
+    /// before its first resize: like the JDK, the table is sized to <c>1 + initialCapacity / 0.75</c>
+    /// bins, rounded up to a power of two. <paramref name="concurrencyLevel"/> is an optional lower
+    /// bound on that estimate; since locking is per-bin it only nudges the initial size and imposes no
+    /// fixed cap on concurrent writers.
     /// </summary>
     public ConcurrentHashMap(
-        int initialCapacity = DefaultCapacity,
+        int initialCapacity,
         int concurrencyLevel = 1,
         IEqualityComparer<TKey>? comparer = null)
     {
@@ -882,7 +891,8 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         // Storing null for the default comparer lets the JIT devirtualize/inline equality for value
         // types on the hot path (the Dictionary<TKey,TValue> pattern), avoiding interface dispatch.
         _comparer = ReferenceEquals(comparer, EqualityComparer<TKey>.Default) ? null : comparer;
-        int cap = TableSizeFor(Math.Max(initialCapacity, concurrencyLevel));
+        long size = (long)(1.0 + Math.Max(initialCapacity, concurrencyLevel) / LoadFactor);
+        int cap = size >= MaximumCapacity ? MaximumCapacity : TableSizeFor((int)size);
         _table = new Node?[cap];
         _sizeCtl = cap - (cap >>> 2); // 0.75 load factor threshold
     }
