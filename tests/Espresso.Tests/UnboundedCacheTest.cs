@@ -145,6 +145,33 @@ public sealed class UnboundedCacheTest : CacheTestBase
         Assert.Equal("3", present["c"]);
     }
 
+    // Caffeine's getAllPresent counts each distinct key once, however often it is requested.
+    [Fact]
+    public void GetAllPresent_DuplicateKeys_RecordsStatsPerUniqueKey()
+    {
+        var cache = NewCache();
+        cache.Put("a", "1");
+
+        var present = cache.GetAllPresent(new[] { "a", "a", "x", "x", "a" });
+
+        Assert.Single(present);
+        Assert.Equal(1, cache.Stats().HitCount);
+        Assert.Equal(1, cache.Stats().MissCount);
+    }
+
+    // Every key is validated before any lookup, so a null key records no statistics.
+    [Fact]
+    public void GetAllPresent_NullKey_RecordsNoStats()
+    {
+        var cache = NewCache();
+        cache.Put("a", "1");
+
+        Assert.Throws<ArgumentNullException>(() => cache.GetAllPresent(new[] { "a", "x", null! }));
+
+        Assert.Equal(0, cache.Stats().HitCount);
+        Assert.Equal(0, cache.Stats().MissCount);
+    }
+
     [Fact]
     public void InvalidateAll_ClearsEverything()
     {

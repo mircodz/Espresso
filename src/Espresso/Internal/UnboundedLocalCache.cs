@@ -105,25 +105,28 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     public IReadOnlyDictionary<K, V> GetAllPresent(IEnumerable<K> keys)
     {
         ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        int hits = 0;
-        int misses = 0;
+        // Validate and de-duplicate first: the statistics count each distinct key once.
+        var unique = new List<K>();
+        var seen = new HashSet<K>();
         foreach (K key in keys)
         {
             ThrowIfKeyNull(key);
-            V? value = _data.GetOrDefault(key);
-            if (value == null)
+            if (seen.Add(key))
             {
-                misses++;
+                unique.Add(key);
             }
-            else
+        }
+        var result = new Dictionary<K, V>(unique.Count);
+        foreach (K key in unique)
+        {
+            V? value = _data.GetOrDefault(key);
+            if (value != null)
             {
-                hits++;
                 result[key] = value;
             }
         }
-        _statsCounter.RecordHits(hits);
-        _statsCounter.RecordMisses(misses);
+        _statsCounter.RecordHits(result.Count);
+        _statsCounter.RecordMisses(unique.Count - result.Count);
         return result;
     }
 
