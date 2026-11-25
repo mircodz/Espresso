@@ -1714,7 +1714,9 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
             if (delta != 0)
             {
-                AddCount(delta, -1);
+                // Like the JDK, pass the bin length so an insert into a long bin checks the resize
+                // threshold even once counter cells exist (AddCount skips the check for check <= 1).
+                AddCount(delta, binCount);
             }
             return val;
         }

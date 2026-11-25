@@ -490,6 +490,57 @@ public sealed class ConcurrentHashMapTest
         Assert.Equal(16, GetTable(new ConcurrentHashMap<int, string>()).Length);
     }
 
+    // Once counter cells exist, AddCount checks the resize threshold only when the caller reports a bin
+    // longer than one node. Compute and Merge must report their bin length (the JDK passes binCount);
+    // keys k * 64 all share bin 0 until the table reaches 128 bins, so every insert after the second
+    // lands in a non-empty bin.
+    [Theory]
+    [InlineData("Compute")]
+    [InlineData("Merge")]
+    [InlineData("PutIfAbsent")]
+    public void InsertIntoNonEmptyBin_WithCounterCells_GrowsTable(string operation)
+    {
+        var map = new ConcurrentHashMap<int, string>();
+        ForceCounterCells(map);
+        const int n = 1024;
+        for (int k = 0; k < n; k++)
+        {
+            int key = k * 64;
+            switch (operation)
+            {
+                case "Compute": map.Compute(key, (_, _) => "v"); break;
+                case "Merge": map.Merge(key, "v", (a, _) => a); break;
+                default: map.PutIfAbsent(key, "v"); break;
+            }
+        }
+        Assert.Equal(n, map.Count);
+        Assert.True(GetTable(map).Length >= 2048, $"{operation}: table stuck at {GetTable(map).Length} bins");
+    }
+
+    [Fact]
+    public void CacheLoads_IntoNonEmptyBins_WithCounterCells_GrowTable()
+    {
+        using var cache = Cache.NewBuilder<int, string>().MaximumSize(1_000_000).Build();
+        object data = cache.GetType().GetField("_data", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(cache)!;
+        data.GetType().GetMethod("FullAddCount", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(data, [0L]);
+        for (int k = 0; k < 1024; k++)
+        {
+            Assert.Equal("loaded", cache.Get(k * 64, _ => "loaded"));
+        }
+        var table = (Array)data.GetType().GetField("_table", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(data)!;
+        Assert.True(table.Length >= 2048, $"table stuck at {table.Length} bins");
+    }
+
+    // Creates the striped size counter cells, as contention on the base count does in a busy process.
+    private static void ForceCounterCells<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
+        where TKey : notnull where TValue : class
+    {
+        typeof(ConcurrentHashMap<TKey, TValue>).GetMethod("FullAddCount", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(map, [0L]);
+        Assert.NotNull(typeof(ConcurrentHashMap<TKey, TValue>)
+            .GetField("_counterCells", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(map));
+    }
+
     private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
         where TKey : notnull where TValue : class
     {
