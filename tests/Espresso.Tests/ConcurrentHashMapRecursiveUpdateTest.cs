@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -105,6 +106,36 @@ public sealed class ConcurrentHashMapRecursiveUpdateTest
         Assert.Equal("retained", map.GetOrDefault(1));
         Assert.Null(map.GetOrDefault(0));
         Assert.Equal(1, map.Count);
+        Assert.Equal(map.Count, map.AsEnumerable().LongCount());
+    }
+
+    // PR #4 detects a callback that inserts its own key into a list bin; a tree bin must reject it the
+    // same way instead of keeping the inner value, returning the outer one and counting the key twice.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void RecursiveSameKeyInsert_IsRejectedInListAndTreeBins(bool treeBin, bool compute)
+    {
+        var map = new ConcurrentHashMap<int, string>(64, 1, new ZeroHash());
+        int entries = treeBin ? 20 : 3;
+        for (int key = 0; key < entries; key++) map.Put(key, "v" + key);
+        Assert.Equal(treeBin ? "TreeBin" : "Node", HeadTypeName(map, 0));
+        string Mapping(int key)
+        {
+            map.Put(key, "inner");
+            return "outer";
+        }
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (compute) map.Compute(100, (key, _) => Mapping(key));
+            else map.ComputeIfAbsent(100, Mapping);
+        });
+        Assert.Equal("Recursive update", error.Message);
+        Assert.Equal("inner", map.GetOrDefault(100));
+        Assert.Equal(entries + 1, map.Count);
         Assert.Equal(map.Count, map.AsEnumerable().LongCount());
     }
 
@@ -223,6 +254,20 @@ public sealed class ConcurrentHashMapRecursiveUpdateTest
         Assert.Equal("retry", map.ComputeIfAbsent(0, _ => "retry"));
         Assert.Equal(1, map.Count);
     }
+
+    private sealed class ZeroHash : IEqualityComparer<int>
+    {
+        public bool Equals(int a, int b) => a == b;
+        public int GetHashCode(int _) => 0;
+    }
+
+    private static string HeadTypeName<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map, int bin)
+        where TKey : notnull where TValue : class
+        => ((Array)Field(map, "_table")!).GetValue(bin)?.GetType().Name ?? "null";
+
+    private static object? Field<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map, string name)
+        where TKey : notnull where TValue : class
+        => typeof(ConcurrentHashMap<TKey, TValue>).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(map);
 
     private static long EnumeratedCacheSize(object cache)
     {

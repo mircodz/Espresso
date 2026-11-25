@@ -1399,7 +1399,11 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         result = mappingFunction(key);
                         if (result != null)
                         {
-                            tb.PutTreeVal(h, key, result, this);
+                            // A node already present means the callback inserted this key itself.
+                            if (tb.PutTreeVal(h, key, result, this) != null)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             inserted = true;
                         }
                     }
@@ -1657,8 +1661,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                         val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
                         if (val != null)
                         {
+                            // A node already present means the callback inserted this key itself.
+                            if (tb.PutTreeVal(h, key, val, this) != null)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             delta = 1;
-                            tb.PutTreeVal(h, key, val, this);
                         }
                     }
                 }
