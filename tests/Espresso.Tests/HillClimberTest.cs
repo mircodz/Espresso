@@ -505,9 +505,9 @@ public sealed class HillClimberTest : CacheTestBase
         long hits = cache.Climber.sample.hits;
         long misses = cache.Climber.sample.misses;
 
-        // the read is served the current value and reloads it in place on the direct executor
+        // the read reloads the value in place on the direct executor and is served the reloaded value
         ticker.Advance(TimeSpan.FromMinutes(2));
-        AssertThat(cache.Cache.GetIfPresent(0)).IsEqualTo("v0");
+        AssertThat(cache.Cache.GetIfPresent(0)).IsEqualTo("r0");
         cache.Cache.CleanUp();
 
         // only the read is observed, not the committed reload

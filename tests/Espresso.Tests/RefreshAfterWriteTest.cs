@@ -47,7 +47,7 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
         // Past the window: the access triggers a reload; the new value replaces the old.
         version = 2;
         ticker.Advance(TimeSpan.FromSeconds(31)); // 61s since write
-        cache.GetIfPresent(1); // triggers refresh (returns the stale value on this call)
+        cache.GetIfPresent(1); // triggers the refresh, which completes inline
         Assert.Equal(2, loader.Calls);
         Assert.Equal("1-v2", cache.GetIfPresent(1)); // now the refreshed value
     }
@@ -85,17 +85,21 @@ public sealed class RefreshAfterWriteTest : CacheTestBase
     {
         var ticker = new FakeTicker();
         var loader = new CountingLoader(k => "new");
+        var executor = new DeferredExecutor(); // keeps the reload in flight
         var cache = Cache.NewBuilder<int, string>()
             .RefreshAfterWrite(OneMinute)
             .Ticker(ticker.Read)
-            .Executor(DirectExecutor.Instance)
+            .Executor(executor)
             .Build(loader);
 
         cache.Put(1, "old");
         ticker.Advance(TimeSpan.FromSeconds(61));
 
-        // The triggering access still returns the old value.
+        // The triggering access, and those after it, return the old value until the reload completes.
         Assert.Equal("old", cache.GetIfPresent(1));
+        Assert.Equal("old", cache.GetIfPresent(1));
+        executor.Pending!();
+        Assert.Equal("new", cache.GetIfPresent(1));
     }
 
     [Fact]

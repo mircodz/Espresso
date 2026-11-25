@@ -99,6 +99,11 @@ public sealed class EspressoBuilder<K, V>
     }
 
     /// <summary>Sets the duration after a write when an entry becomes eligible for refresh.</summary>
+    /// <remarks>
+    /// The first read of an eligible entry starts an asynchronous reload on the executor. Reads return
+    /// the current value while the reload is in flight; if the reload completes before the triggering
+    /// read returns (e.g. on an inline executor), that read returns the reloaded value.
+    /// </remarks>
     public EspressoBuilder<K, V> RefreshAfterWrite(TimeSpan duration)
     {
         Common.RequireState(_refreshAfterWrite == null);
