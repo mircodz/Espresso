@@ -23,10 +23,10 @@ public class StatsLoadTimeTest
     }
 
     [Fact]
-    public void UnboundedLoading_Refresh_RecordsLoadTime()
+    public async Task UnboundedLoading_Refresh_RecordsLoadTime()
     {
         ILoadingCache<int, string> cache = Cache.NewBuilder<int, string>().RecordStats().Build(SlowLoad);
-        cache.Refresh(1);
+        await cache.Refresh(1);
         Assert.True(cache.Stats().TotalLoadTime > 0);
     }
 
@@ -40,11 +40,11 @@ public class StatsLoadTimeTest
     }
 
     [Fact]
-    public void BoundedLoading_Refresh_RecordsLoadTime()
+    public async Task BoundedLoading_Refresh_RecordsLoadTime()
     {
         ILoadingCache<int, string> cache = Cache.NewBuilder<int, string>()
             .MaximumSize(100).Executor(DirectExecutor.Instance).RecordStats().Build(SlowLoad);
-        cache.Refresh(1);
+        await cache.Refresh(1);
         Assert.True(cache.Stats().TotalLoadTime > 0);
     }
 

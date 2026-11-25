@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 using Espresso.Stats;
 
 namespace Espresso.Internal;
@@ -9,7 +11,7 @@ namespace Espresso.Internal;
 /// A cache with no bounding of the map — a lightweight wrapper over <see cref="ConcurrentHashMap{TKey,TValue}"/>.
 /// It backs both the manual and loading surfaces; <see cref="_loader"/> is null for a manual cache.
 /// </summary>
-internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
+internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>, IRefreshHost<K, V>
     where K : notnull
     where V : class
 {
@@ -20,6 +22,11 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     private readonly Ticker _ticker;
     private readonly ICacheLoader<K, V>? _loader;
     private readonly bool _hasLoadAll;
+
+    // In-flight manual refreshes (RefreshRegistration<V>), keyed by the boxed key; created by the first
+    // refresh. Once it exists, every write discards the key's registration under the key's bin lock, so
+    // a reload never overwrites the write (Caffeine's discardRefresh).
+    private ConcurrentHashMap<object, object>? _refreshes;
 
     internal UnboundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)
     {
@@ -71,15 +78,18 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
             loaded[0] = true;
             _statsCounter.RecordMisses(1);
             startTime = _ticker.Read();
+            V? computed;
             try
             {
-                return mappingFunction(k);
+                computed = mappingFunction(k);
             }
             catch
             {
                 _statsCounter.RecordLoadFailure(_ticker.Read() - startTime);
                 throw;
             }
+            Volatile.Read(ref _refreshes)?.Remove(k);
+            return computed;
         });
 
         if (loaded[0])
@@ -134,7 +144,23 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     {
         ThrowIfKeyNull(key);
         ArgumentNullException.ThrowIfNull(value);
-        V? previous = _data.Put(key, value);
+        V? previous;
+        ConcurrentHashMap<object, object>? refreshes = Volatile.Read(ref _refreshes);
+        if (refreshes == null)
+        {
+            previous = _data.Put(key, value);
+        }
+        else
+        {
+            V? prior = null;
+            _data.Compute(key, (k, current) =>
+            {
+                refreshes.Remove(k);
+                prior = current;
+                return value;
+            });
+            previous = prior;
+        }
         if (previous != null && !ReferenceEquals(previous, value))
         {
             NotifyRemoval(key, previous, RemovalCause.Replaced);
@@ -153,7 +179,23 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     public void Invalidate(K key)
     {
         ThrowIfKeyNull(key);
-        V? removed = _data.Remove(key);
+        V? removed;
+        ConcurrentHashMap<object, object>? refreshes = Volatile.Read(ref _refreshes);
+        if (refreshes == null)
+        {
+            removed = _data.Remove(key);
+        }
+        else
+        {
+            V? prior = null;
+            _data.Compute(key, (k, current) =>
+            {
+                refreshes.Remove(k);
+                prior = current;
+                return null;
+            });
+            removed = prior;
+        }
         if (removed != null)
         {
             NotifyRemoval(key, removed, RemovalCause.Explicit);
@@ -171,6 +213,8 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
 
     public void InvalidateAll()
     {
+        // Discard every in-flight refresh, including those loading an absent key, as Caffeine's clear.
+        Volatile.Read(ref _refreshes)?.Clear();
         if (_removalListener == null)
         {
             _data.Clear();
@@ -212,34 +256,69 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _ticker, keys);
     }
 
-    public void Refresh(K key)
+    public Task<V?> Refresh(K key)
     {
         ThrowIfKeyNull(key);
         RequireLoader();
-        long startTime = _ticker.Read();
-        V? loaded;
-        try
-        {
-            loaded = _loader!.Load(key);
-        }
-        catch
-        {
-            _statsCounter.RecordLoadFailure(_ticker.Read() - startTime);
-            throw;
-        }
+        return LocalLoadingCache.Refresh(this, _loader!, _executor, _statsCounter, _ticker, key);
+    }
 
-        long elapsed = _ticker.Read() - startTime;
-        if (loaded == null)
-        {
-            _statsCounter.RecordLoadFailure(elapsed);
-            return; // leave the existing mapping unchanged
-        }
+    // ----- manual refresh (IRefreshHost) -----
 
-        _statsCounter.RecordLoadSuccess(elapsed);
-        V? previous = _data.Put(key, loaded);
-        if (previous != null && !ReferenceEquals(previous, loaded))
+    ConcurrentHashMap<object, object> IRefreshHost<K, V>.Refreshes()
+    {
+        ConcurrentHashMap<object, object>? refreshes = Volatile.Read(ref _refreshes);
+        if (refreshes == null)
         {
-            NotifyRemoval(key, previous, RemovalCause.Replaced);
+            Interlocked.CompareExchange(ref _refreshes, new ConcurrentHashMap<object, object>(), null);
+            refreshes = Volatile.Read(ref _refreshes)!;
+        }
+        return refreshes;
+    }
+
+    /// <summary>An unbounded cache neither expires nor collects entries.</summary>
+    bool IRefreshHost<K, V>.IsPendingEviction(K key) => false;
+
+    V? IRefreshHost<K, V>.GetIfPresentQuietly(K key) => _data.GetOrDefault(key);
+
+    void IRefreshHost<K, V>.EvictIfPendingEviction(K key)
+    {
+    }
+
+    /// <summary>
+    /// Commits a manual refresh as Caffeine's <c>RefreshOperation.commit</c> does: installs the reload
+    /// (a null reload removes the entry) if the refresh still owns its registration and the key still
+    /// maps to the value the refresh read; otherwise keeps the mapping and reports the discarded reload.
+    /// </summary>
+    void IRefreshHost<K, V>.CommitManualRefresh(
+        K key, object keyReference, RefreshRegistration<V> registration, V? oldValue, V? newValue)
+    {
+        ConcurrentHashMap<object, object> refreshes = Volatile.Read(ref _refreshes)!;
+        V? replaced = null;
+        bool discard = false;
+        V? mapped = _data.Compute(key, (_, current) =>
+        {
+            bool owned = ReferenceEquals(refreshes.GetOrDefault(keyReference), registration);
+            if (owned)
+            {
+                refreshes.Remove(keyReference, registration);
+            }
+            if (owned && ReferenceEquals(current, oldValue))
+            {
+                replaced = current;
+                return newValue;
+            }
+            discard = !ReferenceEquals(current, newValue);
+            return current;
+        });
+
+        if (replaced != null && !ReferenceEquals(replaced, newValue))
+        {
+            NotifyRemoval(key, replaced, (mapped == null) ? RemovalCause.Explicit : RemovalCause.Replaced);
+        }
+        if (discard && (newValue != null))
+        {
+            NotifyRemoval(key, newValue, (mapped == null) ? RemovalCause.Explicit : RemovalCause.Replaced);
         }
     }
 

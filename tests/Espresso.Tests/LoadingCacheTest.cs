@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Espresso.Tests;
@@ -59,29 +60,30 @@ public sealed class LoadingCacheTest : CacheTestBase
     }
 
     [Fact]
-    public void Refresh_LoaderReturnsNewValue_ReplacesExisting()
+    public async Task Refresh_LoaderReturnsNewValue_ReplacesExisting()
     {
         int version = 1;
         var cache = NewLoading(k => $"{k}-v{version}", out _);
         Assert.Equal("a-v1", cache.Get("a"));
 
         version = 2;
-        cache.Refresh("a");
+        Assert.Equal("a-v2", await cache.Refresh("a"));
 
         Assert.Equal("a-v2", cache.GetIfPresent("a"));
     }
 
     [Fact]
-    public void Refresh_LoaderReturnsNull_KeepsPreviousValue()
+    public async Task Refresh_LoaderReturnsNull_RemovesTheEntry()
     {
+        // As in Caffeine, a refresh whose loader returns null removes the mapping.
         bool returnNull = false;
         var cache = NewLoading(k => returnNull ? null : "v-" + k, out _);
         Assert.Equal("v-a", cache.Get("a"));
 
         returnNull = true;
-        cache.Refresh("a");
+        Assert.Null(await cache.Refresh("a"));
 
-        Assert.Equal("v-a", cache.GetIfPresent("a"));
+        Assert.Null(cache.GetIfPresent("a"));
     }
 
     [Fact]

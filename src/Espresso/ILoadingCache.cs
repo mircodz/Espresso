@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace Espresso;
 
@@ -34,8 +35,39 @@ public interface ILoadingCache<K, V> : ICache<K, V>
     IReadOnlyDictionary<K, V> GetAll(IEnumerable<K> keys);
 
     /// <summary>
-    /// Reloads the value for <paramref name="key"/> and, on success, replaces the cached value. If
-    /// the loader returns <c>null</c> the entry is left unchanged.
+    /// Loads a new value for <paramref name="key"/> asynchronously, on the cache's executor, while the
+    /// current value (if any) keeps being served. The value is loaded with
+    /// <see cref="ICacheLoader{K,V}.Load"/> whether or not the key is present; an expired entry is
+    /// treated as absent and removed as <see cref="RemovalCause.Expired"/>.
     /// </summary>
-    void Refresh(K key);
+    /// <remarks>
+    /// <para>
+    /// When the load completes, its value replaces the cached one only if the entry was not modified
+    /// in the meantime: a <see cref="ICache{K,V}.Put"/>, an invalidation or another load of the key
+    /// while the refresh was in flight wins, and the refreshed value is then discarded and reported to
+    /// the removal listener (<see cref="RemovalCause.Replaced"/> if the key is present,
+    /// <see cref="RemovalCause.Explicit"/> if it is not). A load that returns <c>null</c> removes the
+    /// entry (<see cref="RemovalCause.Explicit"/>). A load that throws leaves the entry unchanged.
+    /// </para>
+    /// <para>
+    /// A refresh of a key that is already being refreshed (manually or by refresh-after-write) returns
+    /// the in-flight refresh's task instead of loading again, unless that refresh reloads an entry that
+    /// has since expired.
+    /// </para>
+    /// <para>
+    /// Nothing is thrown for a failed load: the returned task faults instead. With an inline executor
+    /// (such as <see cref="DirectExecutor"/>) the task is already complete when this method returns.
+    /// </para>
+    /// </remarks>
+    /// <param name="key">the key whose value should be loaded</param>
+    /// <returns>
+    /// a task that completes with the loaded value, or <c>null</c> if the loader returned none, once
+    /// the cache has applied or discarded it; it faults with the exception that the loader threw
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> is <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The cache has no loader, or the loader refreshes the key it is loading on the same thread
+    /// (an inline executor).
+    /// </exception>
+    Task<V?> Refresh(K key);
 }

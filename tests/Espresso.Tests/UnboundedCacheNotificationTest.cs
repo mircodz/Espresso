@@ -10,7 +10,7 @@ namespace Espresso.Tests;
 public sealed class UnboundedCacheNotificationTest
 {
     [Fact]
-    public void RemovalNotifications_UseConfiguredExecutor()
+    public async Task RemovalNotifications_UseConfiguredExecutor()
     {
         var executor = new QueuedExecutor();
         var events = new List<(string?, string?, RemovalCause)>();
@@ -21,20 +21,24 @@ public sealed class UnboundedCacheNotificationTest
 
         cache.Put("key", "first");
         cache.Put("key", "second");
-        cache.Refresh("key");
+        Task<string?> refresh = cache.Refresh("key"); // the reload is queued on the executor too
         cache.Invalidate("key");
         cache.Put("another", "last");
         cache.InvalidateAll();
 
         Assert.Empty(events);
+        Assert.False(refresh.IsCompleted);
         Assert.Equal(4, executor.Calls);
         executor.RunAll();
+        Assert.True(refresh.IsCompletedSuccessfully);
+        Assert.Equal("refreshed", await refresh);
+        // The invalidation superseded the reload, which is discarded and notified once it completes.
         Assert.Equal(new (string?, string?, RemovalCause)[]
         {
             ("key", "first", RemovalCause.Replaced),
-            ("key", "second", RemovalCause.Replaced),
-            ("key", "refreshed", RemovalCause.Explicit),
+            ("key", "second", RemovalCause.Explicit),
             ("another", "last", RemovalCause.Explicit),
+            ("key", "refreshed", RemovalCause.Explicit),
         }, events);
         Assert.Equal(0, cache.EstimatedSize());
     }
