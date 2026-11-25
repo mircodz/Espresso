@@ -64,21 +64,35 @@ internal static class LocalLoadingCache
         }
         return bulk
             ? BulkLoad(cache, loader, statsCounter, statsTicker, unique)
-            : LoadSequentially(cache, unique);
+            : LoadSequentially(cache, statsCounter, unique);
     }
 
-    private static Dictionary<K, V> LoadSequentially<K, V>(ILoadingCache<K, V> cache, List<K> keys)
+    /// <summary>
+    /// Loads each key in order. If a load throws, the keys not yet reached are recorded as misses
+    /// before the failure propagates.
+    /// </summary>
+    private static Dictionary<K, V> LoadSequentially<K, V>(ILoadingCache<K, V> cache, StatsCounter statsCounter, List<K> keys)
         where K : notnull
         where V : class
     {
         var result = new Dictionary<K, V>(keys.Count);
-        foreach (K key in keys)
+        int count = 0;
+        try
         {
-            V? value = cache.Get(key);
-            if (value != null)
+            foreach (K key in keys)
             {
-                result[key] = value;
+                count++;
+                V? value = cache.Get(key);
+                if (value != null)
+                {
+                    result[key] = value;
+                }
             }
+        }
+        catch
+        {
+            statsCounter.RecordMisses(keys.Count - count);
+            throw;
         }
         return result;
     }

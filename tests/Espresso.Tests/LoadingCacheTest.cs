@@ -156,6 +156,26 @@ public sealed class LoadingCacheTest : CacheTestBase
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public void GetAll_LoadThrows_RecordsTheRemainingKeysAsMisses(bool bounded)
+    {
+        var loader = new CountingLoader(k => k == "b" ? throw new InvalidOperationException("boom") : "v-" + k);
+        var cache = NewLoading(bounded, loader);
+
+        Assert.Throws<InvalidOperationException>(() => cache.GetAll(new[] { "a", "b", "c", "d", "c" }));
+
+        // a and b were loaded; c and d were never reached but still count as misses
+        var stats = cache.Stats();
+        Assert.Equal(4, stats.MissCount);
+        Assert.Equal(0, stats.HitCount);
+        Assert.Equal(1, stats.LoadSuccessCount);
+        Assert.Equal(1, stats.LoadFailureCount);
+        Assert.Equal(2, loader.Calls);
+        Assert.Equal("v-a", cache.GetIfPresent("a"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public void GetAll_DefaultLoadAll_LoadsEachMissingKeyThroughLoad(bool bounded)
     {
         var loader = new CountingLoader(k => "v-" + k);
