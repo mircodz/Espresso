@@ -798,20 +798,37 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         }
     }
 
+    /// <summary>
+    /// Natural-order comparison of two colliding keys, applied only when <paramref name="a"/> is an
+    /// <see cref="IComparable{TKey}"/>. Like the JDK's <c>compareComparables</c>, keys of different
+    /// runtime types are never ordered against each other (0 = unordered): lookups then search both
+    /// subtrees and inserts fall back to <see cref="TieBreakOrder"/>, which keeps the tree's order
+    /// consistent when comparable and other keys share a bin.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int CompareComparables(TKey a, TKey b)
-        => typeof(TKey) == typeof(string)
-            ? string.CompareOrdinal((string)(object)a, (string)(object)b)
-            : ((IComparable<TKey>)a).CompareTo(b);
+    {
+        if (typeof(TKey) == typeof(string))
+        {
+            return string.CompareOrdinal((string)(object)a, (string)(object)b);
+        }
+        if (!typeof(TKey).IsValueType && a.GetType() != b.GetType())
+        {
+            return 0;
+        }
+        return ((IComparable<TKey>)a).CompareTo(b);
+    }
 
     /// <summary>
     /// Deterministic total-order tiebreak used when two keys collide on hash and are not comparable
-    /// (so the tree can still be built). Orders by type name, then by a stable identity hash. Never
-    /// reached on the value-type fast path where <c>TKey</c> is <see cref="IComparable{TKey}"/>.
+    /// (so the tree can still be built). Orders by full type name (the JDK's class name), then by a
+    /// stable identity hash. Never reached on the value-type fast path where <c>TKey</c> is
+    /// <see cref="IComparable{TKey}"/>.
     /// </summary>
     private static int TieBreakOrder(TKey a, TKey b)
     {
-        int d = string.CompareOrdinal(a.GetType().Name, b.GetType().Name);
+        Type ta = a.GetType(), tb = b.GetType();
+        int d = ta == tb ? 0 : string.CompareOrdinal(ta.FullName, tb.FullName);
         if (d == 0)
         {
             d = RuntimeHelpers.GetHashCode(a) <= RuntimeHelpers.GetHashCode(b) ? -1 : 1;

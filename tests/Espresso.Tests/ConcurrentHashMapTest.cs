@@ -541,6 +541,106 @@ public sealed class ConcurrentHashMapTest
             .GetField("_counterCells", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(map));
     }
 
+    // The JDK orders colliding keys by compareTo only when both have the same runtime class; other
+    // pairs fall back to the class-name / identity tie break, and lookups search both subtrees. Ordering
+    // a comparable key against keys of other runtime types mixes the two orders, so the tree is no
+    // longer consistent: present keys become unreachable and a re-put inserts a duplicate.
+    [Fact]
+    public void TreeBin_MixedRuntimeKeyTypes_AllKeysRemainReachable()
+    {
+        for (int seed = 0; seed < 2000; seed++)
+        {
+            var random = new Random(seed);
+            var map = new ConcurrentHashMap<MixedKey, string>(64);
+            var keys = Enumerable.Range(0, 1000).OrderBy(_ => random.Next()).Take(30)
+                .Select(id => random.Next(2) == 0 ? (MixedKey)new ComparableKey(id) : new PlainKey(id))
+                .ToList();
+            foreach (var key in keys)
+            {
+                map.Put(key, key.ToString());
+            }
+
+            Assert.Equal("TreeBin", HeadTypeName(map, MixedKey.Hash & 63));
+            foreach (var key in keys)
+            {
+                Assert.True(map.GetOrDefault(key) == key.ToString(), $"seed {seed}: {key} unreachable");
+            }
+            foreach (var key in keys)
+            {
+                map.Put(key, "updated");
+            }
+            Assert.Equal(keys.Count, map.Count);
+        }
+    }
+
+    // Same as above, but the comparable and the plain key types share a simple name, so a tie break
+    // on Type.Name (instead of the JDK's fully qualified class name) cannot separate them.
+    [Fact]
+    public void TreeBin_MixedKeyTypesWithTheSameName_AllKeysRemainReachable()
+    {
+        for (int seed = 0; seed < 2000; seed++)
+        {
+            var random = new Random(seed);
+            var map = new ConcurrentHashMap<MixedKey, string>(64);
+            var keys = Enumerable.Range(0, 1000).OrderBy(_ => random.Next()).Take(30)
+                .Select(id => random.Next(2) == 0 ? (MixedKey)new ComparableKeys.Key(id) : new PlainKeys.Key(id))
+                .ToList();
+            foreach (var key in keys)
+            {
+                map.Put(key, key.ToString());
+            }
+
+            foreach (var key in keys)
+            {
+                Assert.True(map.GetOrDefault(key) == key.ToString(), $"seed {seed}: {key} unreachable");
+            }
+            foreach (var key in keys)
+            {
+                map.Put(key, "updated");
+            }
+            Assert.Equal(keys.Count, map.Count);
+        }
+    }
+
+    private abstract class MixedKey
+    {
+        public const int Hash = 42; // every key collides into one tree bin
+        public readonly int Id;
+        protected MixedKey(int id) => Id = id;
+        public override int GetHashCode() => Hash;
+        public override bool Equals(object? obj) => obj is MixedKey other && other.GetType() == GetType() && other.Id == Id;
+        public override string ToString() => GetType().FullName + Id;
+    }
+
+    // Orders all MixedKey instances by id: a valid total order, but only over its own type for the JDK.
+    private sealed class ComparableKey : MixedKey, IComparable<MixedKey>
+    {
+        public ComparableKey(int id) : base(id) { }
+        public int CompareTo(MixedKey? other) => Id.CompareTo(other!.Id);
+    }
+
+    private sealed class PlainKey : MixedKey
+    {
+        public PlainKey(int id) : base(id) { }
+    }
+
+    private static class ComparableKeys
+    {
+        public sealed class Key : MixedKey, IComparable<MixedKey>
+        {
+            public Key(int id) : base(id) { }
+            public int CompareTo(MixedKey? other) => Id.CompareTo(other!.Id);
+        }
+    }
+
+    private static class PlainKeys
+    {
+        public sealed class Key : MixedKey
+        {
+            public Key(int id) : base(id) { }
+        }
+    }
+
     private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
         where TKey : notnull where TValue : class
     {
