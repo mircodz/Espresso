@@ -2921,6 +2921,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     void ILoadingCache<K, V>.Refresh(K key)
     {
+        ThrowIfKeyNull(key);
         RequireLoader();
         long start = _statsTicker.Read();
         V? loaded;
