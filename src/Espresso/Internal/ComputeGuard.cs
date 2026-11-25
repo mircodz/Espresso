@@ -10,7 +10,8 @@ namespace Espresso.Internal;
 /// monitors are reentrant, so a write from inside the function must not start or help a resize of
 /// that map: the transfer would reach the bin the outer operation holds and either meet its
 /// reservation or migrate the list the outer operation is about to append to. The map instead leaves
-/// the resize to the outer operation, whose own size update runs after the function returns.
+/// the resize to the outer operation, whose own size update runs after the function returns. For the
+/// same reason such a write does not treeify a bin; a later write to the bin does.
 /// <para>
 /// Scopes nest (a function of map A may call map B, whose function writes to A), so the thread keeps
 /// a small stack rather than a single slot. It holds integer map ids rather than references, so

@@ -2083,6 +2083,13 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     /// </summary>
     private void TreeifyBin(Node?[] tab, int index)
     {
+        if (ComputeGuard.IsActive(_guardId))
+        {
+            // A write from inside one of this map's mapping functions: converting (or resizing) could
+            // replace the bin the outer operation holds and is about to update. A later write to the
+            // bin treeifies it.
+            return;
+        }
         int n = tab.Length;
         if (n < MinTreeifyCapacity)
         {
@@ -2146,9 +2153,9 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     /// </summary>
     private void TryPresizeForTreeify(int n)
     {
-        if (n >= MaximumCapacity || ComputeGuard.IsActive(_guardId))
+        if (n >= MaximumCapacity)
         {
-            return; // see AddCount
+            return;
         }
         int sc = Volatile.Read(ref _sizeCtl);
         if (sc < 0)

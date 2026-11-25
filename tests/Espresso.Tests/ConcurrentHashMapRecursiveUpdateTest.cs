@@ -65,6 +65,42 @@ public sealed class ConcurrentHashMapRecursiveUpdateTest
         Assert.Equal(map.Count, map.AsEnumerable().LongCount());
     }
 
+    // A write from a mapping function that lengthens the bin the function's own operation holds must not
+    // treeify that bin: the conversion replaces the list the outer operation is updating, so its write
+    // went to a node that is no longer in the table. Treeification waits for a later write instead.
+    [Theory]
+    [InlineData("Compute")]
+    [InlineData("ComputeIfPresent")]
+    [InlineData("StatefulComputeIfPresent")]
+    public void CallbackGrowingTheHeldBin_DoesNotTreeifyIt(string operation)
+    {
+        var map = new ConcurrentHashMap<int, string>(32, 1, new ZeroHash()); // 64 bins: treeify, not resize
+        for (int key = 0; key < 8; key++) map.Put(key, "v" + key);
+        Assert.Equal("Node", HeadTypeName(map, 0));
+        string Remap()
+        {
+            map.Put(100, "inner"); // the ninth node reaches the treeify threshold
+            return "outer";
+        }
+
+        int state = 0;
+        string? result = operation switch
+        {
+            "Compute" => map.Compute(0, (_, _) => Remap()),
+            "ComputeIfPresent" => map.ComputeIfPresent(0, (_, _) => Remap()),
+            _ => map.ComputeIfPresent(0, (string _, ref int _) => Remap(), ref state),
+        };
+
+        Assert.Equal("outer", result);
+        Assert.Equal("outer", map.GetOrDefault(0));
+        Assert.Equal("inner", map.GetOrDefault(100));
+        Assert.Equal(9, map.Count);
+        Assert.Equal(map.Count, map.AsEnumerable().LongCount());
+        map.Put(101, "later");
+        Assert.Equal("TreeBin", HeadTypeName(map, 0));
+        Assert.Equal("outer", map.GetOrDefault(0));
+    }
+
     [Theory]
     [InlineData("Put")]
     [InlineData("PutIfAbsent")]
