@@ -19,7 +19,8 @@ namespace Espresso.Internal;
 /// the features it uses.
 /// </para>
 /// </summary>
-internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache<K, V>, ITimerWheelCache<K, V>
+internal sealed class BoundedLocalCache<K, V>
+    : ILocalCache<K, V>, ILoadingCache<K, V>, ITimerWheelCache<K, V>, IRefreshHost<K, V>
     where K : notnull
     where V : class
 {
@@ -129,8 +130,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly long _refreshAfterWriteNanos;
     private readonly NodeFeature _nodeFeatures;
 
-    // In-flight refresh registrations, keyed by the node's key reference (debounces concurrent reloads).
-    private readonly ConcurrentHashMap<object, object> _refreshes = new();
+    // In-flight refresh registrations (RefreshRegistration<V>), keyed by the node's key reference, so
+    // concurrent reloads coalesce and a write can discard a reload that it supersedes. Created by the
+    // constructor for refresh-after-write, otherwise by the first manual refresh (see Refreshes).
+    private ConcurrentHashMap<object, object>? _refreshes;
 
     // Eviction policy state (guarded by _evictionLock).
     private readonly object _evictionLock = new();
@@ -195,6 +198,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _expiresAfterAccessNanos = config.ExpiresAfterAccessNanos;
         _expiresAfterWriteNanos = config.ExpiresAfterWriteNanos;
         _refreshAfterWriteNanos = config.RefreshAfterWriteNanos;
+        if (_refreshAfterWrite)
+        {
+            _refreshes = new ConcurrentHashMap<object, object>();
+        }
 
         // Select the smallest node variant that carries the fields this configuration needs.
         NodeFeature features = _weighsEntries ? NodeFeature.MaximumWeight
@@ -348,7 +355,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return null;
         }
         object keyRef = node.KeyReference;
-        if (_refreshes.ContainsKey(keyRef))
+        ConcurrentHashMap<object, object> refreshes = _refreshes!;
+        if (refreshes.ContainsKey(keyRef))
         {
             return null;
         }
@@ -357,11 +365,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             return null;
         }
 
-        // Register a placeholder token so concurrent readers debounce, then reload in the background.
-        var token = new object();
+        // Register before reloading so concurrent readers debounce, a manual refresh of the key joins
+        // this one, and a write while the reload is in flight discards it.
+        var token = new RefreshRegistration<V>();
         try
         {
-            object? registered = _refreshes.ComputeIfAbsent(keyRef, _ =>
+            object? registered = refreshes.ComputeIfAbsent(keyRef, _ =>
                 (node.IsAlive && node.WriteTime == refreshWriteTime) ? token : null);
             if (!ReferenceEquals(registered, token))
             {
@@ -386,7 +395,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// The registration stays in place until the reload settles, so later reads do not start another.
     /// A reload that is already complete is committed inline and the value now mapped is returned.
     /// </summary>
-    private V? RefreshAsync(K key, V oldValue, object keyRef, object token, long writeTime)
+    private V? RefreshAsync(K key, V oldValue, object keyRef, RefreshRegistration<V> token, long writeTime)
     {
         long start = _statsTicker.Read();
         Task<V?>? reload;
@@ -394,16 +403,19 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             reload = _asyncReload!(key, oldValue);
         }
-        catch
+        catch (Exception e)
         {
             ReleaseRefresh(keyRef, token); // the reload failed to start
+            FailRefresh(token, e);
             return null;
         }
         if (reload == null)
         {
             ReleaseRefresh(keyRef, token); // not eligible (e.g. current future not ready)
+            token.TrySetResult(null);
             return null;
         }
+        token.Publish();
 
         if (reload.IsCompleted)
         {
@@ -418,7 +430,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// Commits a settled async reload and releases its registration. Returns the value now mapped, or
     /// null if the reload failed or the entry is gone.
     /// </summary>
-    private V? CompleteAsyncRefresh(Task<V?> reload, K key, V oldValue, object keyRef, object token, long writeTime, long start)
+    private V? CompleteAsyncRefresh(
+        Task<V?> reload, K key, V oldValue, object keyRef, RefreshRegistration<V> token, long writeTime, long start)
     {
         try
         {
@@ -439,6 +452,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         finally
         {
             ReleaseRefresh(keyRef, token);
+            if (reload.IsCompletedSuccessfully)
+            {
+                token.TrySetResult(reload.Result);
+            }
+            else
+            {
+                FailRefresh(token, reload.Exception?.InnerException ?? new TaskCanceledException(reload));
+            }
         }
     }
 
@@ -448,47 +469,64 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// value now mapped if the reload completed before the submission returned (e.g. an inline
     /// executor), else null.
     /// </summary>
-    private V? RefreshSync(K key, V oldValue, object keyRef, object token, long writeTime)
+    private V? RefreshSync(K key, V oldValue, object keyRef, RefreshRegistration<V> token, long writeTime)
     {
         var task = new RefreshSyncTask(this, key, oldValue, keyRef, token, writeTime);
         try
         {
             _executor.Execute(task.Run);
         }
-        catch
+        catch (Exception e)
         {
-            ReleaseRefresh(keyRef, token);
+            if (task.TryReject())
+            {
+                ReleaseRefresh(keyRef, token);
+                FailRefresh(token, e);
+            }
             return null;
         }
+        token.Publish();
         return task.ResultIfCompleted();
     }
 
     /// <summary>
     /// Loads a resolved value and commits it (see <see cref="CommitRefresh"/>). Nothing escapes the
     /// work item, and the registration is always released (by identity, so a successor's registration
-    /// is never taken). The value the commit left mapped is published for the submitting reader.
+    /// is never taken) and then settled with the loaded value or the load's failure, which is what a
+    /// manual refresh that joined this one observes. The value the commit left mapped is published for
+    /// the submitting reader.
     /// </summary>
     private sealed class RefreshSyncTask(
-        BoundedLocalCache<K, V> cache, K key, V oldValue, object keyRef, object token, long writeTime)
+        BoundedLocalCache<K, V> cache, K key, V oldValue, object keyRef, RefreshRegistration<V> token, long writeTime)
     {
         private V? _result;
         private volatile bool _completed;
+        private int _state; // 0 = idle, 1 = started, 2 = rejected by the executor
 
         /// <summary>The value the refresh left mapped, or null if it has not completed or installed nothing.</summary>
         public V? ResultIfCompleted() => _completed ? _result : null;
 
+        /// <summary>Returns whether the executor refused this work before running it.</summary>
+        public bool TryReject() => Interlocked.CompareExchange(ref _state, 2, 0) == 0;
+
         public void Run()
         {
+            if (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+            {
+                return;
+            }
+            Exception? failure = null;
+            V? newValue = null;
             try
             {
                 long start = cache._statsTicker.Read();
-                V? newValue;
                 try
                 {
                     newValue = cache._loader!.Load(key);
                 }
-                catch
+                catch (Exception e)
                 {
+                    failure = e;
                     cache._statsCounter.RecordLoadFailure(cache._statsTicker.Read() - start);
                     return;
                 }
@@ -496,14 +534,35 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     cache._statsTicker.Read() - start);
                 _completed = true;
             }
-            catch
+            catch (Exception e)
             {
                 // A best-effort refresh must not fail the executor's thread (no logger is available).
+                failure ??= e;
             }
             finally
             {
                 cache.ReleaseRefresh(keyRef, token);
+                if (failure == null)
+                {
+                    token.TrySetResult(newValue);
+                }
+                else
+                {
+                    FailRefresh(token, failure);
+                }
             }
+        }
+    }
+
+    /// <summary>
+    /// Faults an automatic refresh's registration. Its failure is marked observed: unless a manual
+    /// refresh joined it, nothing awaits the task, and the reload's failure is already recorded.
+    /// </summary>
+    private static void FailRefresh(RefreshRegistration<V> token, Exception error)
+    {
+        if (token.TrySetException(error))
+        {
+            _ = token.Task.Exception;
         }
     }
 
@@ -516,7 +575,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// registration. Returns the value left mapped: the reloaded value, the value of a concurrent write
     /// that superseded the reload, or null if the entry is gone or a callback threw.
     /// </summary>
-    private V? CommitRefresh(K key, V oldValue, object keyRef, object token, long writeTime, V? newValue, long loadTime)
+    private V? CommitRefresh(
+        K key, V oldValue, object keyRef, RefreshRegistration<V> token, long writeTime, V? newValue, long loadTime)
     {
         Node<K, V>? updated = null;
         Node<K, V>? removed = null;
@@ -641,7 +701,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     {
         try
         {
-            _refreshes.Remove(keyRef, token);
+            Volatile.Read(ref _refreshes)?.Remove(keyRef, token);
         }
         catch
         {
@@ -656,7 +716,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// </summary>
     private bool IsUnmodifiedSinceRefresh(Node<K, V> current, V oldValue, object keyRef, object token, long writeTime)
         => current.IsAlive
-            && ReferenceEquals(_refreshes.GetOrDefault(keyRef), token)
+            && ReferenceEquals(Volatile.Read(ref _refreshes)?.GetOrDefault(keyRef), token)
             && ReferenceEquals(current.Value, oldValue)
             && (current.WriteTime & ~1L) == writeTime;
 
@@ -2743,6 +2803,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     public void Clear()
     {
+        // Discard every in-flight refresh, including those loading an absent key, as Caffeine's clear.
+        Volatile.Read(ref _refreshes)?.Clear();
         foreach (KeyValuePair<K, V> entry in SnapshotEntries())
         {
             Remove(entry.Key);
@@ -2845,26 +2907,21 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// <summary>
     /// Clears any in-flight refresh registration for the key. Called on every mutation so a
     /// concurrent write is not shadowed by a stale reload, and so a dropped executor task cannot
-    /// leak a token that permanently suppresses future refreshes.
+    /// leak a token that permanently suppresses future refreshes. A no-op until a refresh has
+    /// created the registry.
     /// </summary>
     private void DiscardRefresh(object keyReference)
     {
-        if (_refreshAfterWrite)
-        {
-            _refreshes.Remove(keyReference);
-        }
+        Volatile.Read(ref _refreshes)?.Remove(keyReference);
     }
 
     /// <summary>
     /// <see cref="DiscardRefresh(object)"/> for a key that has no node to supply its key reference;
-    /// checks the feature before boxing a value-type key.
+    /// checks for the registry before boxing a value-type key.
     /// </summary>
     private void DiscardRefreshForKey(K key)
     {
-        if (_refreshAfterWrite)
-        {
-            _refreshes.Remove(key);
-        }
+        Volatile.Read(ref _refreshes)?.Remove(key);
     }
 
     // ===== public ICache<K,V> surface =====
@@ -2919,28 +2976,245 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _statsTicker, keys);
     }
 
-    void ILoadingCache<K, V>.Refresh(K key)
+    Task<V?> ILoadingCache<K, V>.Refresh(K key)
     {
+        ThrowIfKeyNull(key);
         RequireLoader();
-        long start = _statsTicker.Read();
-        V? loaded;
-        try
+        return LocalLoadingCache.Refresh(this, _loader!, _executor, _statsCounter, _statsTicker, key);
+    }
+
+    // ===== manual refresh (IRefreshHost) =====
+
+    ConcurrentHashMap<object, object> IRefreshHost<K, V>.Refreshes()
+    {
+        ConcurrentHashMap<object, object>? refreshes = Volatile.Read(ref _refreshes);
+        if (refreshes == null)
         {
-            loaded = _loader!.Load(key);
+            Interlocked.CompareExchange(ref _refreshes, new ConcurrentHashMap<object, object>(), null);
+            refreshes = Volatile.Read(ref _refreshes)!;
         }
-        catch
+        return refreshes;
+    }
+
+    bool IRefreshHost<K, V>.IsPendingEviction(K key)
+    {
+        Node<K, V>? node = _data.GetOrDefault(key);
+        if (node == null)
         {
-            _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
-            throw;
+            return false;
         }
-        long elapsed = _statsTicker.Read() - start;
-        if (loaded == null)
+        bool expired = HasExpired(node, _ticker.Read());
+        V? value = node.Value;
+        return (value == null) || (expired && !IsComputingAsync(value));
+    }
+
+    void IRefreshHost<K, V>.EvictIfPendingEviction(K key)
+    {
+        Node<K, V>? removed = null;
+        V? oldValue = null;
+        int oldWeight = 0;
+        RemovalCause cause = RemovalCause.Expired;
+        _data.ComputeIfPresent(key, (_, n) =>
         {
-            _statsCounter.RecordLoadFailure(elapsed);
-            return;
+            lock (n)
+            {
+                V? value = n.Value;
+                if (value == null)
+                {
+                    cause = RemovalCause.Collected;
+                }
+                else if (!HasExpired(n, _ticker.Read()) || IsComputingAsync(value))
+                {
+                    return n; // live: nothing to reap
+                }
+                // The key's refresh registration is kept: it belongs to the refresh loading the key anew.
+                oldValue = value;
+                oldWeight = n.Weight;
+                removed = n;
+                n.Retire();
+                return null;
+            }
+        });
+        if (removed != null)
+        {
+            AfterWrite(new RemovalTask(this, removed));
+            _statsCounter.RecordEviction(oldWeight, cause);
+            NotifyRemoval(key, oldValue, cause);
         }
-        _statsCounter.RecordLoadSuccess(elapsed);
-        Put(key, loaded);
+    }
+
+    /// <summary>
+    /// Commits a manual refresh as Caffeine's <c>RefreshOperation.commit</c> does, through a compute on
+    /// the key: an expired entry is first evicted (reported as <see cref="RemovalCause.Expired"/>) and
+    /// read as absent; then the reload is installed (a null reload removes the entry) if the refresh
+    /// still owns its registration and the entry still holds the value the refresh read. Otherwise the
+    /// entry is left as it is, without touching its timestamps, and the reload is reported as
+    /// discarded. User callbacks run before the entry is mutated; if one throws for a live entry it is
+    /// left unchanged, while an evicted entry is still removed, and the failure is rethrown.
+    /// </summary>
+    void IRefreshHost<K, V>.CommitManualRefresh(
+        K key, object keyReference, RefreshRegistration<V> registration, V? oldValue, V? newValue)
+    {
+        ConcurrentHashMap<object, object> refreshes = Volatile.Read(ref _refreshes)!;
+        Node<K, V>? added = null;
+        Node<K, V>? updated = null;
+        Node<K, V>? removed = null;
+        V? previous = null;
+        int oldWeight = 0;
+        int newWeight = 0;
+        long now = 0L;
+        RemovalCause? cause = null;
+        bool discard = false;
+        bool exceedsTolerance = false;
+        ExceptionDispatchInfo? failure = null;
+
+        Node<K, V>? node = _data.Compute(key, (k, n) =>
+        {
+            // Read under the bin lock, which every write to the key holds when it discards the refresh.
+            bool owned = ReferenceEquals(refreshes.GetOrDefault(keyReference), registration);
+            if (n == null)
+            {
+                if (owned && (oldValue == null) && (newValue != null))
+                {
+                    now = _ticker.Read();
+                    newWeight = WeighEntry(key, newValue);
+                    Node<K, V> created = NodeFactory.Create(_nodeFeatures, k, newValue, newWeight, now);
+                    SetVariableTime(created, ExpireAfterCreate(key, newValue, now));
+                    refreshes.Remove(keyReference, registration);
+                    added = created;
+                    return created;
+                }
+                discard = !owned || (oldValue != null);
+                if (owned)
+                {
+                    refreshes.Remove(keyReference, registration);
+                }
+                return null;
+            }
+
+            lock (n)
+            {
+                previous = n.Value;
+                oldWeight = n.Weight;
+                now = _ticker.Read();
+                if (previous == null)
+                {
+                    cause = RemovalCause.Collected;
+                }
+                else if (HasExpired(n, now) && !IsComputingAsync(previous))
+                {
+                    cause = RemovalCause.Expired;
+                }
+                V? currentValue = (cause == null) ? previous : null;
+
+                if (!owned || !ReferenceEquals(currentValue, oldValue))
+                {
+                    // Superseded: keep the entry (an evicted one is removed) and drop the reload.
+                    discard = !ReferenceEquals(currentValue, newValue);
+                    if (owned)
+                    {
+                        refreshes.Remove(keyReference, registration);
+                    }
+                    if (cause == null)
+                    {
+                        return n;
+                    }
+                    removed = n;
+                    n.Retire();
+                    return null;
+                }
+
+                if (newValue == null)
+                {
+                    cause ??= RemovalCause.Explicit;
+                    refreshes.Remove(keyReference, registration);
+                    removed = n;
+                    n.Retire();
+                    return null;
+                }
+
+                try
+                {
+                    // Evaluate the user callbacks before mutating, so a throw leaves the node untouched.
+                    newWeight = WeighEntry(key, newValue);
+                    long varTime = (cause == null)
+                        ? ExpireAfterUpdate(n, key, newValue, now)
+                        : ExpireAfterCreate(key, newValue, now);
+                    refreshes.Remove(keyReference, registration);
+
+                    exceedsTolerance = ExceedsWriteTimeTolerance(n, now)
+                        || (_expiresVariable && Math.Abs(varTime - n.VariableTime) > ExpireTolerance);
+                    n.Value = newValue;
+                    n.Weight = newWeight;
+                    if ((cause != null) || exceedsTolerance)
+                    {
+                        if (_expiresAfterWrite || _refreshAfterWrite) n.WriteTime = now;
+                    }
+                    if (_expiresAfterAccess) n.AccessTime = now;
+                    SetVariableTime(n, varTime);
+                    if ((cause == null) && !ReferenceEquals(previous, newValue))
+                    {
+                        cause = RemovalCause.Replaced;
+                    }
+                    updated = n;
+                    return n;
+                }
+                catch (Exception e)
+                {
+                    if (cause == null)
+                    {
+                        throw;
+                    }
+                    // The evicted entry is removed even though its replacement could not be installed.
+                    failure = ExceptionDispatchInfo.Capture(e);
+                    refreshes.Remove(keyReference, registration);
+                    removed = n;
+                    n.Retire();
+                    return null;
+                }
+            }
+        });
+
+        if (cause == RemovalCause.Replaced)
+        {
+            NotifyRemoval(key, previous, RemovalCause.Replaced);
+        }
+        else if (cause != null)
+        {
+            if (cause != RemovalCause.Explicit)
+            {
+                _statsCounter.RecordEviction(oldWeight, cause.Value);
+            }
+            NotifyRemoval(key, previous, cause.Value);
+        }
+
+        if (removed != null)
+        {
+            AfterWrite(new RemovalTask(this, removed));
+        }
+        else if (added != null)
+        {
+            AfterWrite(new AddTask(this, added, newWeight));
+        }
+        else if (updated != null)
+        {
+            int weightDifference = newWeight - oldWeight;
+            bool reload = (cause == RemovalCause.Expired) || (cause == RemovalCause.Collected);
+            if (exceedsTolerance || (weightDifference != 0) || (_evicts && reload))
+            {
+                AfterWrite(new UpdateTask(this, updated, weightDifference, reload ? Access.Reload : Access.Hit));
+            }
+            else
+            {
+                AfterRead(updated, now);
+            }
+        }
+
+        if (discard && (newValue != null))
+        {
+            NotifyRemoval(key, newValue, (node == null) ? RemovalCause.Explicit : RemovalCause.Replaced);
+        }
+        failure?.Throw();
     }
 
     private void RequireLoader()

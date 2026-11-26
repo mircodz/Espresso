@@ -349,24 +349,27 @@ public class WriteOperationTest
     }
 
     [Fact]
-    public void BoundedRefresh_ThrowingLoader_RecordsLoadFailure()
+    public async Task BoundedRefresh_ThrowingLoader_RecordsLoadFailure()
     {
         var cache = Cache.NewBuilder<int, string>()
             .MaximumSize(10).Executor(DirectExecutor.Instance).RecordStats()
             .Build(k => throw new InvalidOperationException());
 
-        Assert.Throws<InvalidOperationException>(() => cache.Refresh(1));
+        // The failure faults the refresh's task rather than being thrown to the caller.
+        Task<string?> refresh = cache.Refresh(1);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => refresh);
 
         Assert.Equal(1, cache.Stats().LoadFailureCount);
     }
 
     [Fact]
-    public void UnboundedRefresh_ThrowingLoader_RecordsLoadFailure()
+    public async Task UnboundedRefresh_ThrowingLoader_RecordsLoadFailure()
     {
         var cache = Cache.NewBuilder<int, string>().RecordStats()
             .Build(k => throw new InvalidOperationException());
 
-        Assert.Throws<InvalidOperationException>(() => cache.Refresh(1));
+        Task<string?> refresh = cache.Refresh(1);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => refresh);
 
         Assert.Equal(1, cache.Stats().LoadFailureCount);
     }
