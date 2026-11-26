@@ -167,7 +167,8 @@ public sealed class AsyncRefreshTest
         Assert.Equal(1, cache.Stats().LoadFailureCount);
 
         loader.Reload = (_, _) => Task.FromResult<string?>("v2");
-        Assert.Equal("v1", await cache.GetIfPresent(1)!); // still overdue, and no reload is registered
+        // Still overdue, and no reload is registered: this read reloads, inline, and is served the result.
+        Assert.Equal("v2", await cache.GetIfPresent(1)!);
         Assert.Equal(2, loader.Reloads);
         Assert.Equal("v2", await cache.GetIfPresent(1)!);
     }

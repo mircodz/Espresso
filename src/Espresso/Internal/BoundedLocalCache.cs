@@ -60,6 +60,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     private readonly Ticker _statsTicker;
     private readonly IWeigher<K, V> _weigher;
     private readonly ICacheLoader<K, V>? _loader;
+    private readonly bool _hasLoadAll;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ThrowIfKeyNull(K key, [CallerArgumentExpression(nameof(key))] string? param = null)
@@ -176,6 +177,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         _statsTicker = config.StatsTicker;
         _weigher = config.Weigher;
         _loader = loader;
+        _hasLoadAll = loader != null && LocalLoadingCache.HasLoadAll(loader);
 
         _evicts = config.Evicts;
         _isWeighted = config.IsWeighted;
@@ -296,35 +298,40 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             SetAccessTime(node, now);
             TryExpireAfterRead(node, key, value, now);
         }
-        AfterRead(node, now);
-        return value;
+        V? refreshed = AfterRead(node, now);
+        return refreshed ?? value;
     }
 
     /// <summary>
     /// Asynchronously reloads the entry if it is past its refresh-after-write threshold and no
     /// refresh is already in flight. The stale value keeps being served until the reload completes.
-    /// The write-time low bit is used as an in-progress flag.
+    /// The write-time low bit is used as an in-progress flag. Returns the value the refresh installed
+    /// if it completed before this call returned (as Caffeine's <c>refreshIfNeeded</c> returns
+    /// <c>Async.getIfReady</c> of the refresh), else null.
     /// </summary>
-    private void RefreshIfNeeded(Node<K, V> node, long now)
+    private V? RefreshIfNeeded(Node<K, V> node, long now)
     {
         // The eligibility check is split into a separate, non-inlined method so its closure is only
         // allocated when a refresh is actually configured, keeping the read-hit path allocation-free.
         if (!_refreshAfterWrite)
         {
-            return;
+            return null;
         }
         // Async caches need the async-reload delegate installed; without it (e.g. a manual async
         // cache with no loader) there is nothing to refresh with.
         if (_isAsync && _asyncReload == null)
         {
-            return;
+            return null;
         }
-        RefreshTryStart(node, now);
+        return RefreshTryStart(node, now);
     }
 
-    /// <summary>Attempts to start a background refresh for an overdue entry.</summary>
+    /// <summary>
+    /// Attempts to start a background refresh for an overdue entry. Returns the value now mapped if the
+    /// refresh completed inline (null if it is still in flight, failed, or was not started).
+    /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private void RefreshTryStart(Node<K, V> node, long now)
+    private V? RefreshTryStart(Node<K, V> node, long now)
     {
         long writeTime = node.WriteTime;
         long refreshWriteTime = writeTime | 1L;
@@ -338,16 +345,16 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             || (writeTime & 1L) != 0L
             || !node.IsAlive)
         {
-            return;
+            return null;
         }
         object keyRef = node.KeyReference;
         if (_refreshes.ContainsKey(keyRef))
         {
-            return;
+            return null;
         }
         if (!node.CasWriteTime(writeTime, refreshWriteTime))
         {
-            return;
+            return null;
         }
 
         // Register a placeholder token so concurrent readers debounce, then reload in the background.
@@ -358,7 +365,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 (node.IsAlive && node.WriteTime == refreshWriteTime) ? token : null);
             if (!ReferenceEquals(registered, token))
             {
-                return; // another refresh owns the registration
+                return null; // another refresh owns the registration
             }
         }
         finally
@@ -366,14 +373,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             node.CasWriteTime(refreshWriteTime, writeTime); // clear the in-progress flag
         }
 
-        if (_isAsync)
-        {
-            RefreshAsync(key, oldValue, keyRef, token, writeTime);
-        }
-        else
-        {
-            RefreshSync(key, oldValue, keyRef, token, writeTime);
-        }
+        return _isAsync
+            ? RefreshAsync(key, oldValue, keyRef, token, writeTime)
+            : RefreshSync(key, oldValue, keyRef, token, writeTime);
     }
 
     /// <summary>
@@ -382,8 +384,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// completes it is committed like a synchronous reload (see <see cref="CommitRefresh"/>). A reload
     /// that fails to start, faults or is canceled leaves the entry untouched, including its write time.
     /// The registration stays in place until the reload settles, so later reads do not start another.
+    /// A reload that is already complete is committed inline and the value now mapped is returned.
     /// </summary>
-    private void RefreshAsync(K key, V oldValue, object keyRef, object token, long writeTime)
+    private V? RefreshAsync(K key, V oldValue, object keyRef, object token, long writeTime)
     {
         long start = _statsTicker.Read();
         Task<V?>? reload;
@@ -394,85 +397,113 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         catch
         {
             ReleaseRefresh(keyRef, token); // the reload failed to start
-            return;
+            return null;
         }
         if (reload == null)
         {
             ReleaseRefresh(keyRef, token); // not eligible (e.g. current future not ready)
-            return;
+            return null;
         }
 
-        reload.ContinueWith(t =>
+        if (reload.IsCompleted)
         {
-            try
+            return CompleteAsyncRefresh(reload, key, oldValue, keyRef, token, writeTime, start);
+        }
+        reload.ContinueWith(t => CompleteAsyncRefresh(t, key, oldValue, keyRef, token, writeTime, start),
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return null;
+    }
+
+    /// <summary>
+    /// Commits a settled async reload and releases its registration. Returns the value now mapped, or
+    /// null if the reload failed or the entry is gone.
+    /// </summary>
+    private V? CompleteAsyncRefresh(Task<V?> reload, K key, V oldValue, object keyRef, object token, long writeTime, long start)
+    {
+        try
+        {
+            long loadTime = _statsTicker.Read() - start;
+            if (reload.IsCompletedSuccessfully)
             {
-                long loadTime = _statsTicker.Read() - start;
-                if (t.IsCompletedSuccessfully)
-                {
-                    CommitRefresh(key, oldValue, keyRef, token, writeTime, t.Result, loadTime);
-                }
-                else
-                {
-                    _ = t.Exception; // observe the failure; a canceled reload has none
-                    _statsCounter.RecordLoadFailure(loadTime);
-                }
+                return CommitRefresh(key, oldValue, keyRef, token, writeTime, reload.Result, loadTime);
             }
-            catch
-            {
-                // A best-effort refresh must not fault its continuation (no logger is available).
-            }
-            finally
-            {
-                ReleaseRefresh(keyRef, token);
-            }
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            _ = reload.Exception; // observe the failure; a canceled reload has none
+            _statsCounter.RecordLoadFailure(loadTime);
+            return null;
+        }
+        catch
+        {
+            // A best-effort refresh must not fault its continuation (no logger is available).
+            return null;
+        }
+        finally
+        {
+            ReleaseRefresh(keyRef, token);
+        }
     }
 
     /// <summary>
     /// Synchronous refresh: submits the reload to the executor. A rejected submission leaves nothing
-    /// in flight, so it releases this refresh's registration and lets the reader proceed.
+    /// in flight, so it releases this refresh's registration and lets the reader proceed. Returns the
+    /// value now mapped if the reload completed before the submission returned (e.g. an inline
+    /// executor), else null.
     /// </summary>
-    private void RefreshSync(K key, V oldValue, object keyRef, object token, long writeTime)
+    private V? RefreshSync(K key, V oldValue, object keyRef, object token, long writeTime)
     {
+        var task = new RefreshSyncTask(this, key, oldValue, keyRef, token, writeTime);
         try
         {
-            _executor.Execute(() => RefreshSyncTask(key, oldValue, keyRef, token, writeTime));
+            _executor.Execute(task.Run);
         }
         catch
         {
             ReleaseRefresh(keyRef, token);
+            return null;
         }
+        return task.ResultIfCompleted();
     }
 
     /// <summary>
     /// Loads a resolved value and commits it (see <see cref="CommitRefresh"/>). Nothing escapes the
     /// work item, and the registration is always released (by identity, so a successor's registration
-    /// is never taken).
+    /// is never taken). The value the commit left mapped is published for the submitting reader.
     /// </summary>
-    private void RefreshSyncTask(K key, V oldValue, object keyRef, object token, long writeTime)
+    private sealed class RefreshSyncTask(
+        BoundedLocalCache<K, V> cache, K key, V oldValue, object keyRef, object token, long writeTime)
     {
-        try
+        private V? _result;
+        private volatile bool _completed;
+
+        /// <summary>The value the refresh left mapped, or null if it has not completed or installed nothing.</summary>
+        public V? ResultIfCompleted() => _completed ? _result : null;
+
+        public void Run()
         {
-            long start = _statsTicker.Read();
-            V? newValue;
             try
             {
-                newValue = _loader!.Load(key);
+                long start = cache._statsTicker.Read();
+                V? newValue;
+                try
+                {
+                    newValue = cache._loader!.Load(key);
+                }
+                catch
+                {
+                    cache._statsCounter.RecordLoadFailure(cache._statsTicker.Read() - start);
+                    return;
+                }
+                _result = cache.CommitRefresh(key, oldValue, keyRef, token, writeTime, newValue,
+                    cache._statsTicker.Read() - start);
+                _completed = true;
             }
             catch
             {
-                _statsCounter.RecordLoadFailure(_statsTicker.Read() - start);
-                return;
+                // A best-effort refresh must not fail the executor's thread (no logger is available).
             }
-            CommitRefresh(key, oldValue, keyRef, token, writeTime, newValue, _statsTicker.Read() - start);
-        }
-        catch
-        {
-            // A best-effort refresh must not fail the executor's thread (no logger is available).
-        }
-        finally
-        {
-            ReleaseRefresh(keyRef, token);
+            finally
+            {
+                cache.ReleaseRefresh(keyRef, token);
+            }
         }
     }
 
@@ -482,9 +513,10 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// and the expiry and weight are computed before the entry is mutated. A committed value restarts
     /// the entry's timers and reports the old value as replaced (unless it is the same instance); a
     /// null reload removes the entry; a discarded reload is reported. The caller releases the
-    /// registration.
+    /// registration. Returns the value left mapped: the reloaded value, the value of a concurrent write
+    /// that superseded the reload, or null if the entry is gone or a callback threw.
     /// </summary>
-    private void CommitRefresh(K key, V oldValue, object keyRef, object token, long writeTime, V? newValue, long loadTime)
+    private V? CommitRefresh(K key, V oldValue, object keyRef, object token, long writeTime, V? newValue, long loadTime)
     {
         Node<K, V>? updated = null;
         Node<K, V>? removed = null;
@@ -493,6 +525,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         int expiredWeight = 0;
         int weightDifference = 0;
         RemovalCause? discardCause = null;
+        V? mapped = null;
         try
         {
             _data.Compute(key, (_, current) =>
@@ -531,6 +564,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                         {
                             discardCause = RemovalCause.Replaced;
                         }
+                        mapped = currentValue;
                         return current;
                     }
                     if (newValue == null)
@@ -557,11 +591,12 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             // A user callback (expiry, weigher, key equality) threw before the entry was mutated.
             _statsCounter.RecordLoadFailure(loadTime);
-            return;
+            return null;
         }
 
         if (updated != null)
         {
+            mapped = newValue;
             // Propagate the weight change and wheel reschedule through the policy. A reload is not a
             // use of the entry, so neither the admission sketch nor the climber observes it.
             AfterWrite(new UpdateTask(this, updated, weightDifference, Access.Quiet));
@@ -594,6 +629,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         {
             _statsCounter.RecordLoadSuccess(loadTime);
         }
+        return mapped;
     }
 
     /// <summary>
@@ -683,8 +719,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 SetAccessTime(node, now);
                 TryExpireAfterRead(node, key, value, now);
             }
-            AfterRead(node, now);
-            result[key] = value;
+            result[key] = AfterRead(node, now) ?? value;
         }
         foreach (K key in toRemove)
         {
@@ -709,16 +744,18 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     /// Records a read into the (lossy) read buffer, schedules a maintenance drain per the drain-status
     /// state machine, and triggers an async refresh if the entry is overdue. A dropped read (buffer
     /// FULL) makes the drain non-delayable. Performs the
-    /// refresh check on every read path (not just <see cref="GetIfPresent"/>).
+    /// refresh check on every read path (not just <see cref="GetIfPresent"/>), and returns the
+    /// refreshed value if that refresh completed inline (see <see cref="RefreshIfNeeded"/>); a read
+    /// returns it in place of the value it read, as in Caffeine's <c>afterRead</c>.
     /// </summary>
-    private void AfterRead(Node<K, V> node, long now)
+    private V? AfterRead(Node<K, V> node, long now)
     {
         bool delayable = !_tracksAccess || _readBuffer.Offer(node) != BufferResult.Full;
         if (ShouldDrainBuffers(delayable))
         {
             ScheduleDrainBuffers();
         }
-        RefreshIfNeeded(node, now);
+        return RefreshIfNeeded(node, now);
     }
 
     /// <summary>
@@ -879,8 +916,9 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 task?.Run();
             }
 
-            ExpireEntries();        // access / write / variable expiration
-            EvictEntries();         // size / weight eviction
+            long now = _ticker.Read();
+            ExpireEntries(now);     // access / write / variable expiration
+            EvictEntries(now);      // size / weight eviction
             Climb();                // adaptive window climbing
         }
         finally
@@ -915,9 +953,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         Volatile.Write(ref _drainStatus, ProcessingToRequired);
     }
 
-    private void ExpireEntries()
+    private void ExpireEntries(long now)
     {
-        long now = _ticker.Read();
         ExpireAfterAccessEntries(now);
         ExpireAfterWriteEntries(now);
         ExpireVariableEntries(now);
@@ -1533,14 +1570,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
 
     // ----- eviction -----
 
-    private void EvictEntries()
+    private void EvictEntries(long now)
     {
         if (!Evicts)
         {
             return;
         }
         Node<K, V>? candidate = EvictFromWindow();
-        EvictFromMain(candidate);
+        EvictFromMain(candidate, now);
     }
 
     private Node<K, V>? EvictFromWindow()
@@ -1567,7 +1604,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
         return first;
     }
 
-    private void EvictFromMain(Node<K, V>? candidate)
+    private void EvictFromMain(Node<K, V>? candidate, long now)
     {
         int victimQueue = Node<K, V>.Probation;
         int candidateQueue = Node<K, V>.Probation;
@@ -1614,14 +1651,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = candidate!;
                 candidate = candidate!.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
             if (candidate == null)
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1629,7 +1666,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             if (ReferenceEquals(candidate, victim))
             {
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(candidate, RemovalCause.Size);
+                EvictEntry(candidate, RemovalCause.Size, now);
                 candidate = null;
                 continue;
             }
@@ -1639,14 +1676,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
             if (!candidate.IsAlive)
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1655,7 +1692,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 continue;
             }
 
@@ -1664,14 +1701,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             {
                 Node<K, V> evict = victim;
                 victim = victim.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
                 candidate = candidate.GetNextInAccessOrder();
             }
             else
             {
                 Node<K, V> evict = candidate;
                 candidate = candidate.GetNextInAccessOrder();
-                EvictEntry(evict, RemovalCause.Size);
+                EvictEntry(evict, RemovalCause.Size, now);
             }
         }
     }
@@ -1694,7 +1731,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     }
 
     /// <summary>Removes a victim from the map and policy. Caller holds the eviction lock.</summary>
-    public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now = 0L)
+    public bool EvictEntry(Node<K, V> node, RemovalCause cause, long now)
     {
         // Capture the key reference before the remap can retire the node (retiring swaps it for a
         // sentinel). A node already retired by a concurrent removal is no longer in the map under its
@@ -1771,17 +1808,33 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
             lock (n)
             {
                 st.Value = n.Value;
-                st.ActualCause = (n.Key == null || st.Value == null) ? RemovalCause.Collected : st.Cause;
+                // Each predicate is evaluated once: a lock-free writer or a completing future could
+                // otherwise make two evaluations disagree. An expired victim is reported as EXPIRED
+                // whatever the reason it was chosen; an in-flight entry keeps the requested cause.
+                bool expired = st.Cache.HasExpired(n, st.Now);
+                bool computing = st.Cache.IsComputingAsync(st.Value);
+                if (n.Key == null || st.Value == null)
+                {
+                    st.ActualCause = RemovalCause.Collected;
+                }
+                else if (expired && !computing)
+                {
+                    st.ActualCause = RemovalCause.Expired;
+                }
+                else
+                {
+                    st.ActualCause = st.Cause;
+                }
 
                 if (st.ActualCause == RemovalCause.Expired)
                 {
                     // Re-verify: the entry may have been touched since it was queued for expiration.
-                    if (!st.Cache.HasExpired(n, st.Now))
+                    if (!expired)
                     {
                         st.Resurrect = true;
                         return n;
                     }
-                    if (st.Cache.IsComputingAsync(st.Value))
+                    if (computing)
                     {
                         // An in-flight async load never expires. Push its timestamps out to the async
                         // sentinel (restored when the load completes) so the expiration scans and the
@@ -1880,7 +1933,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 {
                     if (c._weightedSize > MaximumCapacity)
                     {
-                        c.EvictEntries();
+                        c.EvictEntries(c._ticker.Read());
                     }
                     else
                     {
@@ -1924,7 +1977,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 if (_weight > c._maximum)
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
             else if (c.ExpiresAfterAccess)
@@ -2025,7 +2078,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 c._windowWeightedSize += _weightDifference;
                 if (_node.PolicyWeight > c._maximum)
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
                 else if (_node.PolicyWeight <= c._windowMaximum)
                 {
@@ -2044,7 +2097,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 else
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
             else
@@ -2056,14 +2109,14 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 else
                 {
-                    c.EvictEntry(_node, RemovalCause.Size);
+                    c.EvictEntry(_node, RemovalCause.Size, c._ticker.Read());
                 }
             }
 
             c._weightedSize += _weightDifference;
             if (c._weightedSize > MaximumCapacity)
             {
-                c.EvictEntries();
+                c.EvictEntries(c._ticker.Read());
             }
         }
     }
@@ -2110,7 +2163,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 }
                 if (onlyIfAbsent)
                 {
-                    // A live existing value short-circuits without locking.
+                    // A live existing value short-circuits without locking. As in Caffeine, the value
+                    // found is returned even if the read's refresh completed inline.
                     long readNow = _ticker.Read();
                     bool priorExpired = HasExpired(prior, readNow);
                     V? currentValue = prior.Value;
@@ -2279,8 +2333,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                     SetAccessTime(existing, readNow);
                     TryExpireAfterRead(existing, key, hitValue, readNow);
                 }
-                AfterRead(existing, readNow);
-                return hitValue;
+                V? refreshed = AfterRead(existing, readNow);
+                return refreshed ?? hitValue;
             }
         }
 
@@ -2416,8 +2470,8 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
                 SetAccessTime(node, now);
             }
             if (recordStats) _statsCounter.RecordHits(1);
-            AfterRead(node, now);
-            return oldValue;
+            V? refreshed = AfterRead(node, now);
+            return refreshed ?? oldValue;
         }
         if (oldValue == null && cause == null)
         {
@@ -2862,18 +2916,7 @@ internal sealed class BoundedLocalCache<K, V> : ILocalCache<K, V>, ILoadingCache
     IReadOnlyDictionary<K, V> ILoadingCache<K, V>.GetAll(IEnumerable<K> keys)
     {
         RequireLoader();
-        ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        foreach (K key in keys)
-        {
-            if (result.ContainsKey(key)) continue;
-            V? value = ComputeIfAbsent(key, k => _loader!.Load(k), recordStats: true);
-            if (value != null)
-            {
-                result[key] = value;
-            }
-        }
-        return result;
+        return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _statsTicker, keys);
     }
 
     void ILoadingCache<K, V>.Refresh(K key)

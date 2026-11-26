@@ -19,6 +19,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     private readonly IExecutor _executor;
     private readonly Ticker _ticker;
     private readonly ICacheLoader<K, V>? _loader;
+    private readonly bool _hasLoadAll;
 
     internal UnboundedLocalCache(in CacheConfiguration<K, V> config, ICacheLoader<K, V>? loader)
     {
@@ -28,6 +29,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
         _executor = config.Executor;
         _ticker = config.StatsTicker; // used only to time loads
         _loader = loader;
+        _hasLoadAll = loader != null && LocalLoadingCache.HasLoadAll(loader);
     }
 
     // ----- Cache -----
@@ -103,25 +105,28 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     public IReadOnlyDictionary<K, V> GetAllPresent(IEnumerable<K> keys)
     {
         ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        int hits = 0;
-        int misses = 0;
+        // Validate and de-duplicate first: the statistics count each distinct key once.
+        var unique = new List<K>();
+        var seen = new HashSet<K>();
         foreach (K key in keys)
         {
             ThrowIfKeyNull(key);
-            V? value = _data.GetOrDefault(key);
-            if (value == null)
+            if (seen.Add(key))
             {
-                misses++;
+                unique.Add(key);
             }
-            else
+        }
+        var result = new Dictionary<K, V>(unique.Count);
+        foreach (K key in unique)
+        {
+            V? value = _data.GetOrDefault(key);
+            if (value != null)
             {
-                hits++;
                 result[key] = value;
             }
         }
-        _statsCounter.RecordHits(hits);
-        _statsCounter.RecordMisses(misses);
+        _statsCounter.RecordHits(result.Count);
+        _statsCounter.RecordMisses(unique.Count - result.Count);
         return result;
     }
 
@@ -204,22 +209,7 @@ internal sealed class UnboundedLocalCache<K, V> : ILoadingCache<K, V>
     public IReadOnlyDictionary<K, V> GetAll(IEnumerable<K> keys)
     {
         RequireLoader();
-        ArgumentNullException.ThrowIfNull(keys);
-        var result = new Dictionary<K, V>();
-        foreach (K key in keys)
-        {
-            ThrowIfKeyNull(key);
-            if (result.ContainsKey(key))
-            {
-                continue;
-            }
-            V? value = Get(key);
-            if (value != null)
-            {
-                result[key] = value;
-            }
-        }
-        return result;
+        return LocalLoadingCache.GetAll(this, _loader!, _hasLoadAll, _statsCounter, _ticker, keys);
     }
 
     public void Refresh(K key)

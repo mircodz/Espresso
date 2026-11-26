@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using Espresso.Internal;
@@ -56,6 +57,60 @@ public class EvictEntryTest
 
         Assert.Null(api.GetIfPresent(1));
         Assert.Equal(0, refreshes.Count);
+    }
+
+    [Fact]
+    public void SizeEviction_OfAnExpiredEntry_IsReportedAsExpired()
+    {
+        // Caffeine's evictEntry derives the cause under the node's lock: a victim chosen for size
+        // that has already expired is evicted (and counted) as EXPIRED.
+        var removals = new List<(int Key, string? Value, RemovalCause Cause)>();
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumWeight(3)
+            .Weigher((_, v) => v.Length)
+            .ExpireAfter(new LifetimeByValue())
+            .Ticker(() => 0L)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener((k, v, c) => removals.Add((k, v, c)))
+            .RecordStats()
+            .Build();
+
+        cache.Put(3, "aa");    // lives six minutes
+        cache.Put(2, "bbb");   // expires at once, and overflows the maximum
+
+        Assert.Equal([(2, (string?)"bbb", RemovalCause.Expired)], removals);
+        Assert.Equal(1, cache.Stats().EvictionCount);
+        Assert.Equal(3, cache.Stats().EvictionWeight);
+        Assert.Equal("aa", cache.GetIfPresent(3));
+    }
+
+    [Fact]
+    public void SizeEviction_OfALiveEntry_IsReportedAsSize()
+    {
+        var removals = new List<(int Key, string? Value, RemovalCause Cause)>();
+        var cache = Cache.NewBuilder<int, string>()
+            .MaximumWeight(3)
+            .Weigher((_, v) => v.Length)
+            .ExpireAfter(new LifetimeByValue())
+            .Ticker(() => 0L)
+            .Executor(DirectExecutor.Instance)
+            .RemovalListener((k, v, c) => removals.Add((k, v, c)))
+            .Build();
+
+        cache.Put(3, "aa");
+        cache.Put(2, "cc");    // lives six minutes, and overflows the maximum
+
+        Assert.Single(removals);
+        Assert.Equal(RemovalCause.Size, removals[0].Cause);
+    }
+
+    /// <summary>"bbb" expires immediately; every other value lives six minutes.</summary>
+    private sealed class LifetimeByValue : IExpiry<int, string>
+    {
+        private static long Lifetime(string value) => value == "bbb" ? 0L : TimeSpan.FromMinutes(6).Ticks * 100;
+        public long ExpireAfterCreate(int key, string value, long currentTime) => Lifetime(value);
+        public long ExpireAfterUpdate(int key, string value, long currentTime, long currentDuration) => Lifetime(value);
+        public long ExpireAfterRead(int key, string value, long currentTime, long currentDuration) => currentDuration;
     }
 
     private sealed class QueuedExecutor : IExecutor
