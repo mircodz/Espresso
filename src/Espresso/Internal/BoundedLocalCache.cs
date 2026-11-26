@@ -115,6 +115,7 @@ internal sealed class BoundedLocalCache<K, V>
     // weigher gives an in-flight load zero weight so it is not evicted while loading.
     private readonly bool _weighsEntries;
     private readonly bool _isAsync;
+    private readonly Func<V, bool>? _isAsyncValueReady;
     private readonly bool _expiresAfterAccess;
     private readonly bool _expiresAfterWrite;
     private readonly bool _refreshAfterWrite;
@@ -185,6 +186,9 @@ internal sealed class BoundedLocalCache<K, V>
         _evicts = config.Evicts;
         _isWeighted = config.IsWeighted;
         _isAsync = config.IsAsync;
+        _isAsyncValueReady = _isAsync
+            ? config.IsAsyncValueReady ?? throw new ArgumentException("An async cache requires a readiness test")
+            : null;
         _weighsEntries = config.Evicts && (config.IsWeighted || config.IsAsync);
         _expiresAfterAccess = config.ExpiresAfterAccess;
         _expiresAfterWrite = config.ExpiresAfterWrite;
@@ -1421,13 +1425,17 @@ internal sealed class BoundedLocalCache<K, V>
             || (_expiresVariable && (now - node.VariableTime >= 0));
     }
 
-    /// <summary>Returns whether the node holds an async future that has not yet completed successfully.</summary>
+    /// <summary>Returns whether the node holds an async future that does not hold a value yet.</summary>
     private bool IsComputingAsync(Node<K, V> node)
         => IsComputingAsync(node.Value);
 
-    /// <summary>Returns whether the value is an async future that has not yet completed successfully.</summary>
+    /// <summary>
+    /// Returns whether the value is an async future that does not hold a value: one still in flight, or
+    /// one that failed or completed with null and is about to be removed (Caffeine's
+    /// <c>!Async.isReady</c>).
+    /// </summary>
     private bool IsComputingAsync(V? value)
-        => _isAsync && value is Task task && !AsyncValue.IsReady(task);
+        => _isAsync && (value != null) && !_isAsyncValueReady!(value);
 
     /// <summary>
     /// For an async cache, pushes a freshly-inserted in-flight future's expiry timestamps ~220 years

@@ -120,7 +120,7 @@ public sealed class AsyncLoadingCacheTest
             .BuildAsync(loader);
 
         Task<IReadOnlyDictionary<int, string>> all = cache.GetAll(new[] { 1, 2 });
-        Task<string> single = cache.Get(2); // coalesces onto the in-flight proxy for key 2
+        Task<string?> single = cache.Get(2); // coalesces onto the in-flight proxy for key 2
 
         // The bulk load returns only key 1; key 2 is omitted.
         gate.SetResult(new Dictionary<int, string> { [1] = "v1" });
@@ -309,7 +309,7 @@ public sealed class AsyncLoadingCacheTest
             .RecordStats()
             .BuildAsync(loader);
 
-        Task<string> pending = cache.Get(1);
+        Task<string?> pending = cache.Get(1);
 
         // While in-flight, even a very long advance must not expire the pinned entry.
         ticker.Advance(TimeSpan.FromDays(365));
@@ -379,7 +379,7 @@ public sealed class AsyncLoadingCacheTest
         _ = cache.GetIfPresent(1); // triggers a reload that faults / resolves to null
         await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
 
-        Task<string>? present = cache.GetIfPresent(1);
+        Task<string?>? present = cache.GetIfPresent(1);
         if (nullReload)
         {
             Assert.Null(present);
@@ -416,7 +416,7 @@ public sealed class AsyncLoadingCacheTest
         gate.SetException(new InvalidOperationException("late boom"));
         await WaitUntil(() => cache.Stats().LoadFailureCount >= 1);
 
-        Task<string>? present = cache.GetIfPresent(1);
+        Task<string?>? present = cache.GetIfPresent(1);
         Assert.NotNull(present);
         Assert.Equal("v1", await present!);
     }

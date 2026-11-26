@@ -51,7 +51,7 @@ internal sealed class LocalAsyncLoadingCache<K, V> : LocalAsyncCache<K, V>, IAsy
         });
     }
 
-    public Task<V> Get(K key)
+    public Task<V?> Get(K key)
         => GetInternal(key, (k, ct) => _loader.AsyncLoad(k, ct), recordStats: true);
 
     public Task<IReadOnlyDictionary<K, V>> GetAll(IEnumerable<K> keys)

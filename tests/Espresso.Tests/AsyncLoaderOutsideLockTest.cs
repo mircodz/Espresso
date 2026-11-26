@@ -57,7 +57,7 @@ public sealed class AsyncLoaderOutsideLockTest
             .Executor(new RecordingExecutor(events))
             .BuildAsync();
 
-        Task<string> loaded = cache.Get(1, (_, _) =>
+        Task<string?> loaded = cache.Get(1, (_, _) =>
         {
             lock (events)
             {
@@ -79,9 +79,9 @@ public sealed class AsyncLoaderOutsideLockTest
         var cache = NewCache<Colliding>();
         cache.Put(new Colliding(0), Task.FromResult("zero")); // a non-empty bin
 
-        Task<string> child = cache.Get(new Colliding(1), async (_, _) =>
+        Task<string?> child = cache.Get(new Colliding(1), async (_, _) =>
         {
-            string parent = await cache.Get(new Colliding(2), (_, _) => Task.FromResult<string?>("parent"));
+            string? parent = await cache.Get(new Colliding(2), (_, _) => Task.FromResult<string?>("parent"));
             return "child-of-" + parent;
         });
 
@@ -96,9 +96,9 @@ public sealed class AsyncLoaderOutsideLockTest
     {
         var cache = NewCache<Colliding>();
 
-        Task<string> child = cache.Get(new Colliding(1), async (_, _) =>
+        Task<string?> child = cache.Get(new Colliding(1), async (_, _) =>
         {
-            string parent = await cache.Get(new Colliding(2), (_, _) => Task.FromResult<string?>("parent"));
+            string? parent = await cache.Get(new Colliding(2), (_, _) => Task.FromResult<string?>("parent"));
             return "child-of-" + parent;
         });
 
@@ -112,9 +112,9 @@ public sealed class AsyncLoaderOutsideLockTest
     {
         var cache = NewCache<int>();
         int innerLoads = 0;
-        Task<string>? inner = null;
+        Task<string?>? inner = null;
 
-        Task<string> outer = cache.Get(1, (k, _) =>
+        Task<string?> outer = cache.Get(1, (k, _) =>
         {
             inner = cache.Get(k, (_, _) =>
             {
@@ -137,7 +137,7 @@ public sealed class AsyncLoaderOutsideLockTest
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
 
-        Task<Task<string>> loading = Task.Factory.StartNew(() => cache.Get(new Colliding(1), (_, _) =>
+        Task<Task<string?>> loading = Task.Factory.StartNew(() => cache.Get(new Colliding(1), (_, _) =>
         {
             entered.SetResult();
             release.Wait(Timeout); // a blocking synchronous prefix
@@ -161,7 +161,7 @@ public sealed class AsyncLoaderOutsideLockTest
         var cache = NewCache<int>();
         int loads = 0;
         var gate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var futures = new Task<string>[16];
+        var futures = new Task<string?>[16];
         using var start = new Barrier(futures.Length);
 
         var threads = new Task[futures.Length];
@@ -182,7 +182,7 @@ public sealed class AsyncLoaderOutsideLockTest
         gate.SetResult("v");
 
         Assert.Equal(1, loads);
-        foreach (Task<string> future in futures)
+        foreach (Task<string?> future in futures)
         {
             Assert.Same(futures[0], future);
             Assert.Equal("v", await future.WaitAsync(Timeout));
@@ -224,7 +224,7 @@ public sealed class AsyncLoaderOutsideLockTest
         var cache = NewCache<int>();
         var load = new TaskCompletionSource<string?>();
 
-        Task<string> future = cache.Get(1, (_, _) => load.Task);
+        Task<string?> future = cache.Get(1, (_, _) => load.Task);
         switch (outcome)
         {
             case "fault": load.SetException(new InvalidOperationException("boom")); break;
@@ -232,7 +232,14 @@ public sealed class AsyncLoaderOutsideLockTest
             default: load.SetResult(null); break;
         }
 
-        await Assert.ThrowsAnyAsync<Exception>(() => future.WaitAsync(Timeout));
+        if (outcome == "null")
+        {
+            Assert.Null(await future.WaitAsync(Timeout)); // a null load completes with null
+        }
+        else
+        {
+            await Assert.ThrowsAnyAsync<Exception>(() => future.WaitAsync(Timeout));
+        }
         // The completion records the failure, then removes the entry, so the removal implies both.
         for (int i = 0; i < 400 && cache.GetIfPresent(1) != null; i++)
         {
