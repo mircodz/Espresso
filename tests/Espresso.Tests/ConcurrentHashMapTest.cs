@@ -459,6 +459,188 @@ public sealed class ConcurrentHashMapTest
         }
     }
 
+    // The JDK sizes the table to 1 + initialCapacity / 0.75 bins, so the map holds initialCapacity
+    // entries before its first resize (the builder documents InitialCapacity as the minimum total size).
+    [Theory]
+    [InlineData(12)]
+    [InlineData(100)]
+    [InlineData(1000)]
+    [InlineData(1_000_000)]
+    public void InitialCapacity_HoldsThatManyEntriesWithoutResizing(int capacity)
+    {
+        var map = new ConcurrentHashMap<int, string>(capacity);
+        int before = GetTable(map).Length;
+        for (int k = 0; k < capacity; k++)
+        {
+            map.Put(k, "v");
+        }
+        Assert.Equal(before, GetTable(map).Length);
+        Assert.Equal(capacity, map.Count);
+    }
+
+    [Theory]
+    [InlineData(0, 16)]
+    [InlineData(11, 16)]
+    [InlineData(12, 32)]
+    [InlineData(16, 32)]
+    [InlineData(1000, 2048)]
+    public void InitialCapacity_SizesTableLikeTheJdk(int capacity, int expectedBins)
+    {
+        Assert.Equal(expectedBins, GetTable(new ConcurrentHashMap<int, string>(capacity)).Length);
+        Assert.Equal(16, GetTable(new ConcurrentHashMap<int, string>()).Length);
+    }
+
+    // Once counter cells exist, AddCount checks the resize threshold only when the caller reports a bin
+    // longer than one node. Compute and Merge must report their bin length (the JDK passes binCount);
+    // keys k * 64 all share bin 0 until the table reaches 128 bins, so every insert after the second
+    // lands in a non-empty bin.
+    [Theory]
+    [InlineData("Compute")]
+    [InlineData("Merge")]
+    [InlineData("PutIfAbsent")]
+    public void InsertIntoNonEmptyBin_WithCounterCells_GrowsTable(string operation)
+    {
+        var map = new ConcurrentHashMap<int, string>();
+        ForceCounterCells(map);
+        const int n = 1024;
+        for (int k = 0; k < n; k++)
+        {
+            int key = k * 64;
+            switch (operation)
+            {
+                case "Compute": map.Compute(key, (_, _) => "v"); break;
+                case "Merge": map.Merge(key, "v", (a, _) => a); break;
+                default: map.PutIfAbsent(key, "v"); break;
+            }
+        }
+        Assert.Equal(n, map.Count);
+        Assert.True(GetTable(map).Length >= 2048, $"{operation}: table stuck at {GetTable(map).Length} bins");
+    }
+
+    [Fact]
+    public void CacheLoads_IntoNonEmptyBins_WithCounterCells_GrowTable()
+    {
+        using var cache = Cache.NewBuilder<int, string>().MaximumSize(1_000_000).Build();
+        object data = cache.GetType().GetField("_data", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(cache)!;
+        data.GetType().GetMethod("FullAddCount", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(data, [0L]);
+        for (int k = 0; k < 1024; k++)
+        {
+            Assert.Equal("loaded", cache.Get(k * 64, _ => "loaded"));
+        }
+        var table = (Array)data.GetType().GetField("_table", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(data)!;
+        Assert.True(table.Length >= 2048, $"table stuck at {table.Length} bins");
+    }
+
+    // Creates the striped size counter cells, as contention on the base count does in a busy process.
+    private static void ForceCounterCells<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
+        where TKey : notnull where TValue : class
+    {
+        typeof(ConcurrentHashMap<TKey, TValue>).GetMethod("FullAddCount", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(map, [0L]);
+        Assert.NotNull(typeof(ConcurrentHashMap<TKey, TValue>)
+            .GetField("_counterCells", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(map));
+    }
+
+    // The JDK orders colliding keys by compareTo only when both have the same runtime class; other
+    // pairs fall back to the class-name / identity tie break, and lookups search both subtrees. Ordering
+    // a comparable key against keys of other runtime types mixes the two orders, so the tree is no
+    // longer consistent: present keys become unreachable and a re-put inserts a duplicate.
+    [Fact]
+    public void TreeBin_MixedRuntimeKeyTypes_AllKeysRemainReachable()
+    {
+        for (int seed = 0; seed < 2000; seed++)
+        {
+            var random = new Random(seed);
+            var map = new ConcurrentHashMap<MixedKey, string>(64);
+            var keys = Enumerable.Range(0, 1000).OrderBy(_ => random.Next()).Take(30)
+                .Select(id => random.Next(2) == 0 ? (MixedKey)new ComparableKey(id) : new PlainKey(id))
+                .ToList();
+            foreach (var key in keys)
+            {
+                map.Put(key, key.ToString());
+            }
+
+            Assert.Equal("TreeBin", HeadTypeName(map, MixedKey.Hash & 63));
+            foreach (var key in keys)
+            {
+                Assert.True(map.GetOrDefault(key) == key.ToString(), $"seed {seed}: {key} unreachable");
+            }
+            foreach (var key in keys)
+            {
+                map.Put(key, "updated");
+            }
+            Assert.Equal(keys.Count, map.Count);
+        }
+    }
+
+    // Same as above, but the comparable and the plain key types share a simple name, so a tie break
+    // on Type.Name (instead of the JDK's fully qualified class name) cannot separate them.
+    [Fact]
+    public void TreeBin_MixedKeyTypesWithTheSameName_AllKeysRemainReachable()
+    {
+        for (int seed = 0; seed < 2000; seed++)
+        {
+            var random = new Random(seed);
+            var map = new ConcurrentHashMap<MixedKey, string>(64);
+            var keys = Enumerable.Range(0, 1000).OrderBy(_ => random.Next()).Take(30)
+                .Select(id => random.Next(2) == 0 ? (MixedKey)new ComparableKeys.Key(id) : new PlainKeys.Key(id))
+                .ToList();
+            foreach (var key in keys)
+            {
+                map.Put(key, key.ToString());
+            }
+
+            foreach (var key in keys)
+            {
+                Assert.True(map.GetOrDefault(key) == key.ToString(), $"seed {seed}: {key} unreachable");
+            }
+            foreach (var key in keys)
+            {
+                map.Put(key, "updated");
+            }
+            Assert.Equal(keys.Count, map.Count);
+        }
+    }
+
+    private abstract class MixedKey
+    {
+        public const int Hash = 42; // every key collides into one tree bin
+        public readonly int Id;
+        protected MixedKey(int id) => Id = id;
+        public override int GetHashCode() => Hash;
+        public override bool Equals(object? obj) => obj is MixedKey other && other.GetType() == GetType() && other.Id == Id;
+        public override string ToString() => GetType().FullName + Id;
+    }
+
+    // Orders all MixedKey instances by id: a valid total order, but only over its own type for the JDK.
+    private sealed class ComparableKey : MixedKey, IComparable<MixedKey>
+    {
+        public ComparableKey(int id) : base(id) { }
+        public int CompareTo(MixedKey? other) => Id.CompareTo(other!.Id);
+    }
+
+    private sealed class PlainKey : MixedKey
+    {
+        public PlainKey(int id) : base(id) { }
+    }
+
+    private static class ComparableKeys
+    {
+        public sealed class Key : MixedKey, IComparable<MixedKey>
+        {
+            public Key(int id) : base(id) { }
+            public int CompareTo(MixedKey? other) => Id.CompareTo(other!.Id);
+        }
+    }
+
+    private static class PlainKeys
+    {
+        public sealed class Key : MixedKey
+        {
+            public Key(int id) : base(id) { }
+        }
+    }
+
     private static Array GetTable<TKey, TValue>(ConcurrentHashMap<TKey, TValue> map)
         where TKey : notnull where TValue : class
     {

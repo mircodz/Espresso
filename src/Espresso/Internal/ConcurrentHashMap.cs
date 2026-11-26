@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -29,6 +30,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private const int DefaultCapacity = 16;
     private const int MaximumCapacity = 1 << 30;
     private const int HashBits = 0x7fffffff;
+    private const float LoadFactor = 0.75f;
 
     // Special bin heads carry negative hashes; Spread keeps user hashes non-negative, so a lookup can
     // tell them apart from entries with a single compare instead of type tests.
@@ -797,20 +799,37 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         }
     }
 
+    /// <summary>
+    /// Natural-order comparison of two colliding keys, applied only when <paramref name="a"/> is an
+    /// <see cref="IComparable{TKey}"/>. Like the JDK's <c>compareComparables</c>, keys of different
+    /// runtime types are never ordered against each other (0 = unordered): lookups then search both
+    /// subtrees and inserts fall back to <see cref="TieBreakOrder"/>, which keeps the tree's order
+    /// consistent when comparable and other keys share a bin.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int CompareComparables(TKey a, TKey b)
-        => typeof(TKey) == typeof(string)
-            ? string.CompareOrdinal((string)(object)a, (string)(object)b)
-            : ((IComparable<TKey>)a).CompareTo(b);
+    {
+        if (typeof(TKey) == typeof(string))
+        {
+            return string.CompareOrdinal((string)(object)a, (string)(object)b);
+        }
+        if (!typeof(TKey).IsValueType && a.GetType() != b.GetType())
+        {
+            return 0;
+        }
+        return ((IComparable<TKey>)a).CompareTo(b);
+    }
 
     /// <summary>
     /// Deterministic total-order tiebreak used when two keys collide on hash and are not comparable
-    /// (so the tree can still be built). Orders by type name, then by a stable identity hash. Never
-    /// reached on the value-type fast path where <c>TKey</c> is <see cref="IComparable{TKey}"/>.
+    /// (so the tree can still be built). Orders by full type name (the JDK's class name), then by a
+    /// stable identity hash. Never reached on the value-type fast path where <c>TKey</c> is
+    /// <see cref="IComparable{TKey}"/>.
     /// </summary>
     private static int TieBreakOrder(TKey a, TKey b)
     {
-        int d = string.CompareOrdinal(a.GetType().Name, b.GetType().Name);
+        Type ta = a.GetType(), tb = b.GetType();
+        int d = ta == tb ? 0 : string.CompareOrdinal(ta.FullName, tb.FullName);
         if (d == 0)
         {
             d = RuntimeHelpers.GetHashCode(a) <= RuntimeHelpers.GetHashCode(b) ? -1 : 1;
@@ -819,6 +838,9 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     }
 
     private readonly IEqualityComparer<TKey>? _comparer; // null => use the devirtualizable default
+
+    // Identifies this map to ComputeGuard while one of its mapping functions runs on a thread.
+    private readonly int _guardId = ComputeGuard.NewId();
 
     private volatile Node?[] _table;
 
@@ -866,14 +888,22 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
 
     private static int LogicalCell(long[] cells, int probe) => (probe & (cells.Length / CounterCellStride - 1)) * CounterCellStride;
 
+    /// <summary>Creates an empty map with the default table size (16 bins), like the JDK's no-arg constructor.</summary>
+    public ConcurrentHashMap()
+    {
+        _table = new Node?[DefaultCapacity];
+        _sizeCtl = DefaultCapacity - (DefaultCapacity >>> 2); // 0.75 load factor threshold
+    }
+
     /// <summary>
-    /// Creates the map. <paramref name="initialCapacity"/> presizes the bin array (fewer resizes).
-    /// <paramref name="concurrencyLevel"/> is an optional lower bound on the initial bin count;
-    /// since locking is per-bin it only nudges the initial
-    /// size and imposes no fixed cap on concurrent writers.
+    /// Creates the map. <paramref name="initialCapacity"/> is the number of entries the map holds
+    /// before its first resize: like the JDK, the table is sized to <c>1 + initialCapacity / 0.75</c>
+    /// bins, rounded up to a power of two. <paramref name="concurrencyLevel"/> is an optional lower
+    /// bound on that estimate; since locking is per-bin it only nudges the initial size and imposes no
+    /// fixed cap on concurrent writers.
     /// </summary>
     public ConcurrentHashMap(
-        int initialCapacity = DefaultCapacity,
+        int initialCapacity,
         int concurrencyLevel = 1,
         IEqualityComparer<TKey>? comparer = null)
     {
@@ -882,7 +912,8 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
         // Storing null for the default comparer lets the JIT devirtualize/inline equality for value
         // types on the hot path (the Dictionary<TKey,TValue> pattern), avoiding interface dispatch.
         _comparer = ReferenceEquals(comparer, EqualityComparer<TKey>.Default) ? null : comparer;
-        int cap = TableSizeFor(Math.Max(initialCapacity, concurrencyLevel));
+        long size = (long)(1.0 + Math.Max(initialCapacity, concurrencyLevel) / LoadFactor);
+        int cap = size >= MaximumCapacity ? MaximumCapacity : TableSizeFor((int)size);
         _table = new Node?[cap];
         _sizeCtl = cap - (cap >>> 2); // 0.75 load factor threshold
     }
@@ -925,6 +956,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     private Node?[] HelpTransfer(Node?[] tab, ForwardingNode f)
     {
         Node?[] nextTab = f.NextTable;
+        if (ComputeGuard.IsActive(_guardId))
+        {
+            // Inside one of this map's mapping functions the transfer could reach the bin this thread
+            // holds; continue on the new table without helping.
+            return nextTab;
+        }
         int rs = ResizeStamp(tab.Length);
         while (nextTab == _nextTable && _table == tab)
         {
@@ -1292,7 +1329,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     Node? replacement = null;
                     try
                     {
-                        val = mappingFunction(key);
+                        val = Apply(mappingFunction, key);
                         if (val != null)
                         {
                             replacement = new Node(h, key, val, null);
@@ -1369,10 +1406,14 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     }
                     else
                     {
-                        result = mappingFunction(key);
+                        result = Apply(mappingFunction, key);
                         if (result != null)
                         {
-                            tb.PutTreeVal(h, key, result, this);
+                            // A node already present means the callback inserted this key itself.
+                            if (tb.PutTreeVal(h, key, result, this) != null)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             inserted = true;
                         }
                     }
@@ -1396,7 +1437,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                             {
                                 throw new InvalidOperationException("Recursive update");
                             }
-                            result = mappingFunction(key);
+                            result = Apply(mappingFunction, key);
                             if (result != null)
                             {
                                 if (e.Next != null)
@@ -1427,6 +1468,48 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                 AddCount(1, 2);
             }
             return result;
+        }
+    }
+
+    // Mapping functions run through these helpers, which mark the function as running for
+    // ComputeGuard. Keeping the guard's try/finally out of the large callers spares them an extra
+    // exception-handling region, which would make the JIT keep their locals on the stack.
+    private TValue? Apply(Func<TKey, TValue?> mappingFunction, TKey key)
+    {
+        ComputeGuard.Frames frames = ComputeGuard.Enter(_guardId);
+        try
+        {
+            return mappingFunction(key);
+        }
+        finally
+        {
+            frames.Exit();
+        }
+    }
+
+    private TValue? Apply(Func<TKey, TValue?, TValue?> remappingFunction, TKey key, TValue? value)
+    {
+        ComputeGuard.Frames frames = ComputeGuard.Enter(_guardId);
+        try
+        {
+            return remappingFunction(key, value);
+        }
+        finally
+        {
+            frames.Exit();
+        }
+    }
+
+    private TValue? Apply<TState>(PresentRemapper<TState> remapper, TValue value, ref TState state)
+    {
+        ComputeGuard.Frames frames = ComputeGuard.Enter(_guardId);
+        try
+        {
+            return remapper(value, ref state);
+        }
+        finally
+        {
+            frames.Exit();
         }
     }
 
@@ -1471,7 +1554,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     TreeNode? p = tb.Root?.FindTreeNode(h, key, this);
                     if (p != null)
                     {
-                        val = remapper(p.Value, ref state);
+                        val = Apply(remapper, p.Value, ref state);
                         if (val != null)
                         {
                             Volatile.Write(ref p.Value, val);
@@ -1494,7 +1577,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     {
                         if (e.Hash == h && KeyEquals(e.Key, key))
                         {
-                            val = remapper(e.Value, ref state);
+                            val = Apply(remapper, e.Value, ref state);
                             if (val != null)
                             {
                                 Volatile.Write(ref e.Value, val);
@@ -1568,7 +1651,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     Node? replacement = null;
                     try
                     {
-                        computed = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
+                        computed = Apply((Func<TKey, TValue?, TValue?>)remapping, key, null);
                         if (computed != null)
                         {
                             replacement = new Node(h, key, computed, null);
@@ -1609,9 +1692,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     TreeNode? p = root?.FindTreeNode(h, key, this);
                     if (p != null)
                     {
-                        val = onlyIfPresent
-                            ? ((Func<TKey, TValue, TValue?>)remapping)(key, p.Value)
-                            : ((Func<TKey, TValue?, TValue?>)remapping)(key, p.Value);
+                        val = Apply((Func<TKey, TValue?, TValue?>)remapping, key, p.Value);
                         if (val != null)
                         {
                             Volatile.Write(ref p.Value, val);
@@ -1627,11 +1708,15 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     }
                     else if (!onlyIfPresent)
                     {
-                        val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
+                        val = Apply((Func<TKey, TValue?, TValue?>)remapping, key, null);
                         if (val != null)
                         {
+                            // A node already present means the callback inserted this key itself.
+                            if (tb.PutTreeVal(h, key, val, this) != null)
+                            {
+                                throw new InvalidOperationException("Recursive update");
+                            }
                             delta = 1;
-                            tb.PutTreeVal(h, key, val, this);
                         }
                     }
                 }
@@ -1644,9 +1729,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     {
                         if (e.Hash == h && KeyEquals(e.Key, key))
                         {
-                            val = onlyIfPresent
-                                ? ((Func<TKey, TValue, TValue?>)remapping)(key, e.Value)
-                                : ((Func<TKey, TValue?, TValue?>)remapping)(key, e.Value);
+                            val = Apply((Func<TKey, TValue?, TValue?>)remapping, key, e.Value);
                             if (val != null)
                             {
                                 Volatile.Write(ref e.Value, val);
@@ -1675,7 +1758,7 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                             }
                             if (!onlyIfPresent)
                             {
-                                val = ((Func<TKey, TValue?, TValue?>)remapping)(key, null);
+                                val = Apply((Func<TKey, TValue?, TValue?>)remapping, key, null);
                                 if (val != null)
                                 {
                                     if (e.Next != null)
@@ -1704,7 +1787,9 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             }
             if (delta != 0)
             {
-                AddCount(delta, -1);
+                // Like the JDK, pass the bin length so an insert into a long bin checks the resize
+                // threshold even once counter cells exist (AddCount skips the check for check <= 1).
+                AddCount(delta, binCount);
             }
             return val;
         }
@@ -1908,6 +1993,12 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
             {
                 break;
             }
+            if (ComputeGuard.IsActive(_guardId))
+            {
+                // A write from inside one of this map's mapping functions: the transfer could reach
+                // the bin this thread holds. The outer operation's own AddCount resizes afterwards.
+                break;
+            }
             Node?[] tab = _table;
             int n = tab.Length;
             if (n >= MaximumCapacity)
@@ -1992,6 +2083,13 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
     /// </summary>
     private void TreeifyBin(Node?[] tab, int index)
     {
+        if (ComputeGuard.IsActive(_guardId))
+        {
+            // A write from inside one of this map's mapping functions: converting (or resizing) could
+            // replace the bin the outer operation holds and is about to update. A later write to the
+            // bin treeifies it.
+            return;
+        }
         int n = tab.Length;
         if (n < MinTreeifyCapacity)
         {
@@ -2184,10 +2282,11 @@ internal sealed class ConcurrentHashMap<TKey, TValue>
                     {
                         continue; // head changed under us; re-read
                     }
-                    if (f.Hash == ReservedHash)
-                    {
-                        throw new InvalidOperationException("Recursive update");
-                    }
+                    // A reservation is only seen here by the thread running its mapping function (any
+                    // other thread waits on the lock above until the slot is replaced), and that thread
+                    // never transfers: ComputeGuard defers its resizes. Throwing here instead would
+                    // unwind with this worker still registered in _sizeCtl, stranding the resize.
+                    Debug.Assert(f.Hash != ReservedHash, "a mapping function's own thread must not transfer its bin");
                     if (f is TreeBin tb)
                     {
                         // Split the tree by (hash & n): each half becomes a fresh TreeBin (allocating

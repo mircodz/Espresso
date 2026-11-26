@@ -46,7 +46,10 @@ public sealed class EspressoBuilder<K, V>
 
     internal EspressoBuilder() { }
 
-    /// <summary>Sets the minimum total size for the internal data structures.</summary>
+    /// <summary>
+    /// Sets the minimum total size for the internal data structures: the cache's hash table holds this
+    /// many entries before it first resizes, so a large enough estimate avoids expensive resizing later.
+    /// </summary>
     public EspressoBuilder<K, V> InitialCapacity(int initialCapacity)
     {
         Common.RequireState(_initialCapacity == Unset);
